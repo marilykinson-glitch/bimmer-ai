@@ -208,17 +208,22 @@ function draw(cv, G, t, v, act) {
         : 'ĐỖ SỐ P — CHỐT AN TOÀN MỞ';
     cv.text(gateLabel, W - 44, top + 32, 15, gateColor, { literal: true, align: 'right', font: 'bold' });
 
-    // Conversation Bubble
+    // Conversation Bubble (color-coded by hardware execution truth: amber on fail/block, green on verified actuation)
     const bubY = top + 60, bubH = 106;
+    const actsList = Array.isArray(turn.actions) ? turn.actions : [];
+    const hasFailOrBlock = actsList.some((a) => a && (!a.ok || a.blocked));
+    const hasOkAction = !hasFailOrBlock && actsList.some((a) => a && a.ok);
+    const bubBorder = hasFailOrBlock ? (t.warn || '#ffb020') : (hasOkAction ? (t.go || '#2fd27a') : '#38bdf8');
+    const aiTextColor = hasFailOrBlock ? '#fde68a' : t.text;
     cv.roundRect(rx, bubY, rw, bubH, 14, G.withAlpha('#ffffff', 0.055));
-    cv.strokeRoundRect(rx, bubY, rw, bubH, 14, 1.3, G.withAlpha('#38bdf8', 0.45));
+    cv.strokeRoundRect(rx, bubY, rw, bubH, 14, 1.4, G.withAlpha(bubBorder, 0.65));
 
     const whoTag = turn.speakerZone === 'passenger' ? '[GHẾ PHỤ]' : '[GHẾ TÀI]';
     const userLine = turn.transcript ? (whoTag + ' "' + turn.transcript + '"') : (whoTag + ' Nhấn "Nói lệnh AI" hoặc nút Mic trên vô-lăng để ra lệnh tiếng Việt');
     const aiLine = turn.replyVi || 'Sẵn sàng điều khiển điều hoà, đèn RGB, kính, rèm, cốp, ghế massage, van bô, YouTube TV và khám xe.';
 
     cv.text(fit(cv, userLine, 16, { literal: true, font: 'bold' }, rw - 32), rx + 18, bubY + 32, 16, '#93c5fd', { literal: true, font: 'bold' });
-    cv.text(fit(cv, 'AI: ' + aiLine, 18, { literal: true, font: 'bold' }, rw - 32), rx + 18, bubY + 66, 18, t.text, { literal: true, font: 'bold' });
+    cv.text(fit(cv, 'AI: ' + aiLine, 18, { literal: true, font: 'bold' }, rw - 32), rx + 18, bubY + 66, 18, aiTextColor, { literal: true, font: 'bold' });
     if (v.deferredCount > 0) {
         cv.text('Đang canh tự động mở van bô khi dầu máy chạm 75°C…', rx + 18, bubY + 92, 14, t.warn || '#ffb020', { literal: true, font: 'label' });
     }
@@ -247,7 +252,8 @@ function draw(cv, G, t, v, act) {
         accent: (!tel.doorsLocked || tel.trunkOpen) ? (t.warn || '#ffb020') : (t.go || '#2fd27a'),
         headline: (tel.doorsLocked !== false ? 'Cửa KHOÁ' : 'Cửa MỞ') + (tel.trunkOpen ? ' · Cốp MỞ' : '') + ' · ' + exText,
         line1: 'Kính: ' + (winOpen ? ('Mở ' + winOpen + '%') : 'Kín') + ' · Rèm: ' + (tel.blindsOpen === false ? 'Đóng' : 'Mở'),
-        line2: 'Dầu ' + (tel.oilTempC != null ? tel.oilTempC : 86) + '°C · Bình ' + (tel.battery12v != null ? tel.battery12v : 12.6) + 'V',
+        line2: 'Dầu ' + (tel.oilTempC != null ? tel.oilTempC : 86) + '°C · Bình ' + (tel.battery12v != null ? tel.battery12v : 12.6) + 'V' +
+            (tel.fuelPercent != null ? (' · Xăng ' + tel.fuelPercent + '%') : ''),
         onTap: act.healthCheck,
     });
 

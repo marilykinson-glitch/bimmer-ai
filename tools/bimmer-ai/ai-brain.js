@@ -401,6 +401,8 @@ function buildSystemPrompt(telemetry, speakerZone, ownerName) {
         'TRẠNG THÁI XE HIỆN TẠI:',
         '- Tốc độ: ' + (t.speedKmh || 0) + ' km/h | Cần số: ' + (t.gear || 'P') + ' | Vòng tua: ' + (t.rpm || 0) + ' rpm',
         '- Nhiệt độ dầu máy: ' + (t.oilTempC || 0) + '°C | Nước làm mát: ' + (t.coolantTempC || 0) + '°C | Bình 12V: ' + (t.battery12v || 12.6) + 'V',
+        '- Xăng: ' + (t.fuelPercent != null ? t.fuelPercent : 68) + '% (~' + (t.rangeKm || 420) + ' km)' + (t.odometerKm ? (' | ODO: ' + t.odometerKm + ' km') : ''),
+        '- Chốt cửa: ' + (t.doorsLocked !== false ? 'Đang khoá' : 'Đang mở') + ' | Cốp sau: ' + (t.trunkOpen ? 'Đang mở' : 'Đang đóng'),
         '- Điều hoà: Tài ' + (t.climate && t.climate.tempDriverC) + '°C / Phụ ' + (t.climate && t.climate.tempPassengerC) + '°C, gió mức ' + (t.climate && t.climate.fanLevel),
         '- Đèn nội thất: ' + (t.ambient && t.ambient.name) + ' (' + (t.ambient && t.ambient.brightness) + '%) | Van bô: ' + (t.exhaustMode || 'oem'),
         '- Giới hạn tốc độ VietMap hiện tại: ' + ((t.vietmap && t.vietmap.speedLimitKmh) || 60) + ' km/h',
@@ -845,12 +847,13 @@ async function processAssistantTurn(params) {
         });
     }
 
-    // Ensure safety blocks or deferred oil guards ALWAYS override optimistic LLM text!
-    const blockedOrDeferred = results.filter((r) => r.blocked || r.deferred);
+    // CRITICAL TRUTH GATE: Never let optimistic pre-execution LLM `replyVi` lie when ANY tool failed (`!r.ok`),
+    // was blocked by `SafetyGate`, deferred for cold oil, or ran `scan_vehicle_health` with exact live sensor numbers!
+    const mustUseHardwareTruth = results.some((r) => !r.ok || r.blocked || r.deferred || r.tool === 'scan_vehicle_health');
     const executedSummaries = results.map((r) => r.summaryVi).filter(Boolean);
 
     let finalReply = aiReply;
-    if (blockedOrDeferred.length > 0) {
+    if (mustUseHardwareTruth && executedSummaries.length > 0) {
         finalReply = executedSummaries.join(' ');
     } else if (!finalReply && executedSummaries.length > 0) {
         finalReply = executedSummaries.join(' ');

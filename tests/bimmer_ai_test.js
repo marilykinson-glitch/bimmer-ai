@@ -758,6 +758,81 @@ async function runAllTests() {
         await new Promise((r) => jsonGem.close(r));
     });
 
+    await step('v0.5.2 Hardware Truth Gate: Never report success when liveCar rejects trunk, mirror, nav, reading light or 1CR', async () => {
+        const tmpMis = fs.mkdtempSync(path.join(os.tmpdir(), 'bimmer-ai-truth-'));
+        const vcLive = new VehicleBus.VehicleController({
+            comfortSock: path.join(tmpMis, 'missing-comfort.sock'),
+            ridetubeSock: path.join(tmpMis, 'missing-ridetube.sock'),
+            bimmerlinkRun: path.join(tmpMis, 'missing-bimmerlink'),
+        });
+        vcLive.state.liveCar = true; // Simulate real MGU SP18 car where unsupported proxies are absent
+
+        // Mock Gemini optimistically claiming "Đã mở cốp sau cho đại ca!" before hardware execution
+        const optGem = http.createServer((req, res) => {
+            req.on('data', () => {});
+            req.on('end', () => {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    candidates: [{
+                        content: {
+                            parts: [{
+                                text: JSON.stringify({
+                                    speechDetected: true,
+                                    transcript: 'Mở cốp sau cho anh',
+                                    wakeOnly: false,
+                                    toolCalls: [{ name: 'control_locks_trunk', args: { action: 'open_trunk' } }],
+                                    replyVi: 'Dạ đại ca, em đã mở cốp sau ngay!',
+                                }),
+                            }],
+                        },
+                    }],
+                }));
+            });
+        });
+        await new Promise((r) => optGem.listen(0, '127.0.0.1', r));
+        const wavSample = AudioIO.buildStereoWav(new Array(1600).fill(0.3), new Array(1600).fill(0.02), 16000);
+
+        const trunkTurn = await AiBrain.processAssistantTurn({
+            audioWavBase64: wavSample.toString('base64'),
+            audioMimeType: 'audio/wav',
+            wakeMode: false,
+            speakerZone: 'driver',
+            apiKey: 'TRUTH_KEY',
+            vehicleController: vcLive,
+            uplinkOpts: { baseUrl: 'http://127.0.0.1:' + optGem.address().port, noSetuid: true },
+        });
+        assert.strictEqual(trunkTurn.actions.length, 1);
+        assert.strictEqual(trunkTurn.actions[0].ok, false);
+        assert.strictEqual(vcLive.state.trunkOpen, false);
+        // MUST override Gemini's optimistic "đã mở cốp sau ngay" with real BDC hardware rejection!
+        assert.ok(trunkTurn.replyVi.indexOf('Cốp sau chưa mở') >= 0);
+        assert.ok(trunkTurn.replyVi.indexOf('đã mở cốp sau ngay') < 0);
+
+        // Verify all other unavailable liveCar operations return `ok: false` and do NOT mutate state
+        const mirRes = await vcLive.invokeTool('control_mirrors', { action: 'fold' }, 'driver');
+        assert.strictEqual(mirRes.ok, false);
+        assert.strictEqual(vcLive.state.mirrorsFolded, false);
+
+        const navRes = await vcLive.invokeTool('navigate_to', { destination: 'Chợ Bến Thành' }, 'driver');
+        assert.strictEqual(navRes.ok, false);
+        assert.strictEqual(vcLive.state.navigationTarget, '');
+
+        const rdRes = await vcLive.invokeTool('set_ambient_light', { readingLight: true }, 'driver');
+        assert.strictEqual(rdRes.ok, false);
+        assert.strictEqual(vcLive.state.ambient.readingLight, false);
+        assert.ok(rdRes.summaryVi.indexOf('Chưa thực hiện') >= 0);
+
+        const blRes = await vcLive.invokeTool('control_1cr_valet', { action: 'start_1cr' }, 'driver');
+        assert.strictEqual(blRes.ok, false);
+        assert.strictEqual(vcLive.state.climate1crActive, false);
+
+        const camRes = await vcLive.invokeTool('control_camera_360', { view: '360' }, 'driver');
+        assert.strictEqual(camRes.ok, false);
+        assert.strictEqual(vcLive.state.cameraView, 'off');
+
+        await new Promise((r) => optGem.close(r));
+    });
+
     console.log('\nALL ' + passed + ' TEST SUITES PASSED!');
 }
 

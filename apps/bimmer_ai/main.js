@@ -26,7 +26,7 @@ const SCENES = ['chill đêm', 'hạ nhiệt', 'rạp phim', 'thể thao', 'mặ
 mgu.run({
     async start(ctx) {
         const { ui, log } = ctx;
-        const version = (ctx.spec && ctx.spec.version) ? ('Bản ' + ctx.spec.version) : 'Bản 0.5.1';
+        const version = (ctx.spec && ctx.spec.version) ? ('Bản ' + ctx.spec.version) : 'Bản 0.5.2';
         let status = null, readAt = 0, cmdId = Date.now();
         let viewMode = 'main', sceneIdx = 0, animTick = 0;
 

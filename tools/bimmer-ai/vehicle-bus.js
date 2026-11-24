@@ -657,9 +657,18 @@ class VehicleController {
             if (!v) return;
             if (f === 'statusCarSpeed2' && v.speedVehicleCentreOfGravity !== undefined && v.speedVehicleCentreOfGravity !== 65535) {
                 this.patchTelemetry({ speedKmh: +(v.speedVehicleCentreOfGravity * 0.015625).toFixed(1) });
-            } else if (f === 'statusZVStatus' && typeof v.statusCentralLockingSystem === 'number') {
-                if (v.statusCentralLockingSystem === 1) this.patchTelemetry({ doorsLocked: false });
-                else if (v.statusCentralLockingSystem === 2 || v.statusCentralLockingSystem === 3) this.patchTelemetry({ doorsLocked: true });
+            } else if (f === 'statusZVStatus') {
+                const patch = {};
+                if (typeof v.statusCentralLockingSystem === 'number') {
+                    if (v.statusCentralLockingSystem === 1) patch.doorsLocked = false;
+                    else if (v.statusCentralLockingSystem === 2 || v.statusCentralLockingSystem === 3) patch.doorsLocked = true;
+                }
+                if (v.statusContactBootLid === 1 || v.statusContactBootLid === 'HK_IST_OFFEN') {
+                    patch.trunkOpen = true;
+                } else if (v.statusContactBootLid === 0 || v.statusContactBootLid === 'HK_IST_GESCHLOSSEN') {
+                    patch.trunkOpen = false;
+                }
+                if (Object.keys(patch).length > 0) this.patchTelemetry(patch);
             }
         });
 
@@ -757,7 +766,7 @@ class VehicleController {
             }
         });
 
-        await bindService('sp18Climate1', 'de.bmw.infotainment.climate.Climate', ['acSpecialFunction', 'seatAutoClimateDR'], []);
+        await bindService('sp18Climate1', 'de.bmw.infotainment.climate.Climate', ['acSpecialFunction', 'seatAutoClimateDR', 'seatAutoClimatePS'], []);
         await bindService('sp18Comfort2', 'de.bmw.infotainment.misc.ComfortFunction2', ['seatMassageFL', 'seatMassageFR'], []);
         await bindService('sp18WheelHeat', 'de.bmw.body.steeringwheelcomfort.SteeringWheelClimate', [], ['requestHeating']);
         await bindService('sp18Ambient', 'de.bmw.infotainment.misc.ComfortFunctionIuK', ['ambientLightInteriorColour', 'statusAmbientLightInteriorColour'], []);
@@ -765,6 +774,7 @@ class VehicleController {
         await bindService('sp18SunRoof', 'de.bmw.body.doorsandwindows.SunProtectionRoofWindows', ['operationSHDMDS', 'controlShadowingPanoramicRoof'], []);
         await bindService('sp18RoofSys', 'de.bmw.infrastructure.ControlRoofsystem', ['controlRoofSystem'], []);
         await bindService('sp18LockGw', 'de.bmw.body.centrallockingsystem.CentralLockingSystemGW', ['requestCentralLockingSystem'], []);
+        await bindService('sp18DrivingExcitement', 'de.bmw.infotainment.drivingexcitement.DrivingExcitement', ['controlFESDriveStrategy'], []);
 
         // 5. SP21 Method Interfaces (auto-used when available on iDrive 8 / SP21)
         await bindService('climateMaster', 'de.bmw.infotainment.climate.climatemaster.ClimateMaster',
@@ -1079,19 +1089,23 @@ class VehicleController {
                     if (r21.ok) anyBusOk = true;
                 }
                 if (args.fanLevel !== undefined) {
-                    this.state.climate.fanLevel = args.fanLevel;
                     const lv = Math.max(1, Math.min(5, args.fanLevel));
-                    sp18Front.operationIntensityDR = lv;
-                    sp18Front.operationIntensityPS = lv;
-                    sp18Front.operationManualBlowerLevelDR = lv;
-                    sp18Front.operationManualBlowerLevelPS = lv;
+                    if (opZone === 1 || opZone === 0) {
+                        sp18Front.operationIntensityDR = 'KLIMASTIL_' + lv;
+                        sp18Front.operationManualBlowerLevelDR = 'STUFE_' + lv;
+                    }
+                    if (opZone === 2 || opZone === 0) {
+                        sp18Front.operationIntensityPS = 'KLIMASTIL_' + lv;
+                        sp18Front.operationManualBlowerLevelPS = 'STUFE_' + lv;
+                    }
                     sp18FrontTouched = true;
                     const r21 = await this.callMethodIfAvailable('climateMaster', 'requestAirBlowLevel', {
                         clientGroupId: 0,
-                        airBlowLevel: [{ configuredManLevel: args.fanLevel, gradientIntensity: 0, operationZone: 1, saveLUM: true }],
+                        airBlowLevel: [{ configuredManLevel: lv, gradientIntensity: 0, operationZone: opZone === 2 ? 2 : 1, saveLUM: true }],
                     });
                     if (r21.ok) anyBusOk = true;
-                    changes.push('mức gió ' + args.fanLevel);
+                    this.state.climate.fanLevel = lv;
+                    changes.push('mức gió ' + lv);
                 }
                 if (args.freshAir !== undefined) {
                     this.state.climate.freshAir = !!args.freshAir;
@@ -1137,90 +1151,116 @@ class VehicleController {
                 const side = args.seat || zoneDefault;
                 const zones = side === 'both' ? [1, 2] : [side === 'passenger' ? 2 : 1];
                 const label = side === 'passenger' ? 'ghế phụ' : (side === 'both' ? '2 ghế trước' : 'ghế tài');
-                const notes = [];
-                let anyOk = !this.state.liveCar;
+                const okNotes = [];
+                const failNotes = [];
 
                 if (args.gentlemanMove) {
-                    const rg = await sendComfortOp(this.opts.comfortSock, { op: 'gentleman' });
-                    if (rg.ok) anyOk = true;
-                    notes.push('dịch gọn ghế phụ (Gentleman)');
+                    const rg = !this.state.liveCar ? { ok: true } : await sendComfortOp(this.opts.comfortSock, { op: 'gentleman' });
+                    if (rg.ok) okNotes.push('dịch gọn ghế phụ (Gentleman)');
+                    else failNotes.push('chưa kết nối dịch vụ iteriodev-comfort để dịch ghế Gentleman');
                 }
                 if (args.memorySlot !== undefined) {
                     const slot = Math.max(0, Math.min(2, (Number(args.memorySlot) || 1) - 1));
-                    const rm = await sendComfortOp(this.opts.comfortSock, {
+                    const rm = !this.state.liveCar ? { ok: true } : await sendComfortOp(this.opts.comfortSock, {
                         op: 'memory',
                         seat: side === 'passenger' ? 'passenger' : 'driver',
                         slot,
                         save: false,
                     });
-                    if (rm.ok) anyOk = true;
-                    notes.push('gọi vị trí nhớ ghế số ' + (slot + 1));
+                    if (rm.ok) okNotes.push('gọi vị trí nhớ ghế số ' + (slot + 1));
+                    else failNotes.push('chưa kết nối dịch vụ iteriodev-comfort để gọi nhớ ghế số ' + (slot + 1));
                 }
 
                 if (args.heatingLevel !== undefined || args.coolingLevel !== undefined) {
                     const hLv = args.heatingLevel !== undefined ? Math.max(0, Math.min(3, Math.round(Number(args.heatingLevel) || 0))) : 255;
                     const cLv = args.coolingLevel !== undefined ? Math.max(0, Math.min(3, Math.round(Number(args.coolingLevel) || 0))) : 255;
                     const sp18Seats = {};
+                    let seatHwOk = !this.state.liveCar;
+
                     if (side === 'driver' || side === 'both') {
-                        if (hLv !== 255) { this.state.climate.seatHeatDriver = hLv; sp18Seats.operationFunctionStageSeatHeaterDR = hLv; }
-                        if (cLv !== 255) { this.state.climate.seatCoolDriver = cLv; sp18Seats.operationFunctionStageSeatClimateDR = cLv; }
-                        const rAuto = await this.setFieldIfAvailable('sp18Climate1', 'seatAutoClimateDR', {
+                        if (hLv !== 255) sp18Seats.oPFunctionStageSeatHeaterAICDriver = 'STUFE_' + hLv;
+                        if (cLv !== 255) sp18Seats.oPFunctionStageSeatClimateAICDriver = 'STUFE_' + cLv;
+                        const rAutoDr = await this.setFieldIfAvailable('sp18Climate1', 'seatAutoClimateDR', {
                             operationSeatHeaterStageDRS: hLv !== 255 ? ('STUFE_' + hLv) : 'SIGNAL_UNGUELTIG',
                             operationSeatHeaterActivationDRS: hLv !== 255 ? (hLv > 0 ? 'SITZHEIZUNGSFUNKTION_AN' : 'SITZHEIZUNGSFUNKTION_AUS') : 'SIGNAL_UNGUELTIG',
                             operationSeatVentilationStageDRS: cLv !== 255 ? ('STUFE_' + cLv) : 'SIGNAL_UNGUELTIG',
                             operationSeatVentilationActivationDRS: cLv !== 255 ? (cLv > 0 ? 'SITZLUEFTUNGSFUNKTION_AN' : 'SITZLUEFTUNGSFUNKTION_AUS') : 'SIGNAL_UNGUELTIG',
                         });
-                        if (rAuto.ok) anyOk = true;
+                        if (rAutoDr.ok) seatHwOk = true;
                     }
                     if (side === 'passenger' || side === 'both') {
-                        if (hLv !== 255) { this.state.climate.seatHeatPassenger = hLv; sp18Seats.operationFunctionStageSeatHeaterPS = hLv; }
-                        if (cLv !== 255) { this.state.climate.seatCoolPassenger = cLv; sp18Seats.operationFunctionStageSeatClimatePS = cLv; }
+                        if (hLv !== 255) sp18Seats.oPFunctionStageSeatHeaterAICPassenger = 'STUFE_' + hLv;
+                        if (cLv !== 255) sp18Seats.oPFunctionStageSeatClimateAICPassenger = 'STUFE_' + cLv;
+                        const rAutoPs = await this.setFieldIfAvailable('sp18Climate1', 'seatAutoClimatePS', {
+                            operationSeatHeaterStagePSS: hLv !== 255 ? ('STUFE_' + hLv) : 'SIGNAL_UNGUELTIG',
+                            operationSeatHeaterActivationPSS: hLv !== 255 ? (hLv > 0 ? 'SITZHEIZUNGSFUNKTION_AN' : 'SITZHEIZUNGSFUNKTION_AUS') : 'SIGNAL_UNGUELTIG',
+                            operationSeatVentilationStagePSS: cLv !== 255 ? ('STUFE_' + cLv) : 'SIGNAL_UNGUELTIG',
+                            operationSeatVentilationActivationPSS: cLv !== 255 ? (cLv > 0 ? 'SITZLUEFTUNGSFUNKTION_AN' : 'SITZLUEFTUNGSFUNKTION_AUS') : 'SIGNAL_UNGUELTIG',
+                        });
+                        if (rAutoPs.ok) seatHwOk = true;
                     }
                     if (Object.keys(sp18Seats).length > 0) {
                         const rStrat = await this.setFieldIfAvailable('sp18Climate2', 'operationStratificationSeatHeating', sp18Seats);
-                        if (rStrat.ok) anyOk = true;
+                        if (rStrat.ok) seatHwOk = true;
                     }
                     if (hLv !== 255) {
                         const r21 = await this.callMethodIfAvailable('climateMaster', 'requestSeatClimateSeatHeating', {
                             clientGroupId: 0,
                             seatClimateHeating: zones.map((z) => ({ configuredIntensityLevel: hLv, operationZone: z, saveLUM: true })),
                         });
-                        if (r21.ok) anyOk = true;
-                        notes.push(hLv > 0 ? ('bật sưởi ' + label + ' mức ' + hLv) : ('tắt sưởi ' + label));
+                        if (r21.ok) seatHwOk = true;
+                        if (seatHwOk) {
+                            if (side === 'driver' || side === 'both') this.state.climate.seatHeatDriver = hLv;
+                            if (side === 'passenger' || side === 'both') this.state.climate.seatHeatPassenger = hLv;
+                            okNotes.push(hLv > 0 ? ('bật sưởi ' + label + ' mức ' + hLv) : ('tắt sưởi ' + label));
+                        } else {
+                            failNotes.push('cổng sưởi ' + label + ' không phản hồi');
+                        }
                     }
                     if (cLv !== 255) {
                         const r21 = await this.callMethodIfAvailable('climateMaster', 'requestSeatClimateSeatCooling', {
                             clientGroupId: 0,
                             seatClimateCooling: zones.map((z) => ({ configuredIntensityLevel: cLv, operationZone: z, saveLUM: true })),
                         });
-                        if (r21.ok) anyOk = true;
-                        notes.push(cLv > 0 ? ('bật làm mát ' + label + ' mức ' + cLv) : ('tắt làm mát ' + label));
+                        if (r21.ok) seatHwOk = true;
+                        if (seatHwOk) {
+                            if (side === 'driver' || side === 'both') this.state.climate.seatCoolDriver = cLv;
+                            if (side === 'passenger' || side === 'both') this.state.climate.seatCoolPassenger = cLv;
+                            okNotes.push(cLv > 0 ? ('bật làm mát ' + label + ' mức ' + cLv) : ('tắt làm mát ' + label));
+                        } else {
+                            failNotes.push('cổng quạt làm mát ' + label + ' không phản hồi');
+                        }
                     }
                 }
                 if (args.massage !== undefined) {
                     const on = !!args.massage;
+                    let msgOk = !this.state.liveCar;
                     if (side === 'driver' || side === 'both') {
-                        this.state.climate.massageDriver = on;
                         const r = await this.setFieldIfAvailable('sp18Comfort2', 'seatMassageFL', {
                             operationMassageFLH: on ? 'MASSAGE_ACTIVE' : 'MASSAGE_INACTIVE',
                             operationPneumaticSeatFLHIntensity: 'STUFE_2',
                             operationPneumaticSeatFLHProgram: 'PROGRAMM_1',
                         });
-                        if (r.ok) anyOk = true;
+                        if (!this.state.liveCar || r.ok) {
+                            this.state.climate.massageDriver = on;
+                            msgOk = true;
+                        }
                     }
                     if (side === 'passenger' || side === 'both') {
-                        this.state.climate.massagePassenger = on;
                         const r = await this.setFieldIfAvailable('sp18Comfort2', 'seatMassageFR', {
                             operationMassageFRH: on ? 'MASSAGE_ACTIVE' : 'MASSAGE_INACTIVE',
                             operationPneumaticSeatFRHIntensity: 'STUFE_2',
                             operationPneumaticSeatFRHProgram: 'PROGRAMM_1',
                         });
-                        if (r.ok) anyOk = true;
+                        if (!this.state.liveCar || r.ok) {
+                            this.state.climate.massagePassenger = on;
+                            msgOk = true;
+                        }
                     }
-                    notes.push((on ? 'bật massage ' : 'tắt massage ') + label);
+                    if (msgOk) okNotes.push((on ? 'bật massage ' : 'tắt massage ') + label);
+                    else failNotes.push('không tìm thấy mô-đun massage ' + label);
                 }
                 if (args.wheelHeat !== undefined) {
-                    this.state.climate.wheelHeat = !!args.wheelHeat;
                     const r18 = await this.callMethodIfAvailable('sp18WheelHeat', 'requestHeating', {
                         requestor: [0, 0, 0, 0, 1],
                         heating: !!args.wheelHeat,
@@ -1230,57 +1270,58 @@ class VehicleController {
                         steeringWheelHeating: args.wheelHeat ? 3 : 0,
                         saveLUM: true,
                     });
-                    if (r18.ok || r21.ok) anyOk = true;
-                    notes.push(args.wheelHeat ? 'bật sưởi vô-lăng' : 'tắt sưởi vô-lăng');
+                    const whOk = !this.state.liveCar || r18.ok || r21.ok;
+                    if (whOk) {
+                        this.state.climate.wheelHeat = !!args.wheelHeat;
+                        okNotes.push(args.wheelHeat ? 'bật sưởi vô-lăng' : 'tắt sưởi vô-lăng');
+                    } else {
+                        failNotes.push('xe không trang bị hoặc khoá cổng sưởi vô-lăng');
+                    }
                 }
                 this.emitTelemetry();
-                return { ok: anyOk, summaryVi: (anyOk ? 'Đã ' : 'Không tìm thấy mô-đun ') + (notes.join(', ') || ('cập nhật ' + label)) + '.' };
+                const allOk = failNotes.length === 0 && okNotes.length > 0;
+                const partsMsg = [];
+                if (okNotes.length) partsMsg.push('Đã ' + okNotes.join(', ') + '.');
+                if (failNotes.length) partsMsg.push('Lưu ý: ' + failNotes.join('; ') + '.');
+                return { ok: allOk, summaryVi: partsMsg.join(' ') || ('Không thể cập nhật ' + label + '.') };
             }
 
             case 'set_ambient_light': {
-                const notes = [];
+                const okNotes = [];
+                const failNotes = [];
                 const comfortPatch = {};
                 const sp18Amb = {};
                 let sp18Touched = false;
-                let anyOk = !this.state.liveCar;
+                let ambHwOk = !this.state.liveCar;
 
                 if (args.on !== undefined) {
-                    this.state.ambient.on = !!args.on;
                     comfortPatch.on = !!args.on;
                     sp18Amb.controlModeAmbientePanoramicRoofInteriorLighting = args.on ? 'EIN' : 'AUS';
                     if (!args.on) sp18Amb.controlMenuAmbientePanoramicRoofInteriorLighting = 'AMBIENTEBELEUCHTUNG_AUS';
                     sp18Touched = true;
-                    notes.push(args.on ? 'bật đèn viền nội thất' : 'tắt đèn viền nội thất');
                 }
                 if (args.brightness !== undefined) {
                     const b = Math.max(5, Math.min(100, Math.round(Number(args.brightness))));
-                    this.state.ambient.brightness = b;
                     comfortPatch.bright = b;
                     sp18Amb.controlBrightnessValueBrightnessOffsetAmbientePanoramicRoofInteriorLighting = b;
                     sp18Touched = true;
-                    notes.push('chỉnh độ sáng đèn viền ' + b + '%');
                 }
+                let parsedColor = null;
                 if (args.color) {
-                    const c = parseHexColor(args.color);
-                    if (c) {
-                        this.state.ambient.on = true;
-                        this.state.ambient.preset = c.key;
-                        this.state.ambient.name = c.name;
-                        this.state.ambient.hex = c.hex;
+                    parsedColor = parseHexColor(args.color);
+                    if (parsedColor) {
                         sp18Amb.controlModeAmbientePanoramicRoofInteriorLighting = 'EIN';
-                        sp18Amb.controlMenuAmbientePanoramicRoofInteriorLighting = 'FARBAUSWAHL_' + (c.menuIdx || 7);
+                        sp18Amb.controlMenuAmbientePanoramicRoofInteriorLighting = 'FARBAUSWAHL_' + (parsedColor.menuIdx || 7);
                         sp18Touched = true;
-                        if (c.isOem) {
+                        if (parsedColor.isOem) {
                             comfortPatch.on = false;
                         } else if (args.zone && args.zone !== 'all') {
-                            this.state.ambient.zone = String(args.zone);
                             comfortPatch.on = true;
                             comfortPatch.zones = {};
-                            comfortPatch.zones[args.zone] = { rgb: [c.r, c.g, c.b] };
+                            comfortPatch.zones[args.zone] = { rgb: [parsedColor.r, parsedColor.g, parsedColor.b] };
                         } else {
-                            this.state.ambient.zone = 'all';
                             comfortPatch.on = true;
-                            comfortPatch.rgb = [c.r, c.g, c.b];
+                            comfortPatch.rgb = [parsedColor.r, parsedColor.g, parsedColor.b];
                             comfortPatch.zones = {
                                 'dash': null,
                                 'dash.line': null,
@@ -1293,27 +1334,57 @@ class VehicleController {
                                 'roof': null,
                             };
                         }
-                        notes.push('đổi đèn viền sang ' + c.name + (args.zone && args.zone !== 'all' ? (' vùng ' + args.zone) : ''));
                     }
                 }
                 if (sp18Touched) {
                     const r18 = await this.setFieldIfAvailable('sp18Ambient', 'ambientLightInteriorColour', sp18Amb);
-                    if (r18.ok) anyOk = true;
+                    if (r18.ok) ambHwOk = true;
                 }
                 if (Object.keys(comfortPatch).length > 0) {
                     const rc = await sendComfortOp(this.opts.comfortSock, { op: 'ambient', settings: comfortPatch });
-                    if (rc.ok) anyOk = true;
+                    if (rc.ok) ambHwOk = true;
+                }
+                if (sp18Touched) {
+                    if (ambHwOk) {
+                        if (args.on !== undefined) {
+                            this.state.ambient.on = !!args.on;
+                            okNotes.push(args.on ? 'bật đèn viền nội thất' : 'tắt đèn viền nội thất');
+                        }
+                        if (args.brightness !== undefined) {
+                            const b = Math.max(5, Math.min(100, Math.round(Number(args.brightness))));
+                            this.state.ambient.brightness = b;
+                            okNotes.push('chỉnh độ sáng đèn viền ' + b + '%');
+                        }
+                        if (parsedColor) {
+                            this.state.ambient.on = true;
+                            this.state.ambient.preset = parsedColor.key;
+                            this.state.ambient.name = parsedColor.name;
+                            this.state.ambient.hex = parsedColor.hex;
+                            this.state.ambient.zone = (args.zone && args.zone !== 'all') ? String(args.zone) : 'all';
+                            okNotes.push('đổi đèn viền sang ' + parsedColor.name + (args.zone && args.zone !== 'all' ? (' vùng ' + args.zone) : ''));
+                        }
+                    } else {
+                        failNotes.push('cổng điều khiển đèn viền nội thất không phản hồi');
+                    }
                 }
                 if (args.readingLight !== undefined) {
-                    this.state.ambient.readingLight = !!args.readingLight;
                     const rf = args.readingLight
                         ? await this.callMethodIfAvailable('flexLight', 'setReadingLight', { position: zoneDefault === 'passenger' ? 2 : 1, enable: true })
                         : await this.callMethodIfAvailable('flexLight', 'deactivateAllReadingLights', {});
-                    if (rf.ok) anyOk = true;
-                    notes.push(args.readingLight ? 'bật đèn đọc sách' : 'tắt đèn đọc sách');
+                    const rdOk = !this.state.liveCar || rf.ok;
+                    if (rdOk) {
+                        this.state.ambient.readingLight = !!args.readingLight;
+                        okNotes.push(args.readingLight ? 'bật đèn đọc sách' : 'tắt đèn đọc sách');
+                    } else {
+                        failNotes.push('đèn đọc sách trên BMW iDrive 7 dùng nút vật lý trên cụm trần xe, không bật/tắt qua phần mềm được');
+                    }
                 }
                 this.emitTelemetry();
-                return { ok: anyOk, summaryVi: 'Đã ' + (notes.join(', ') || 'cập nhật đèn nội thất') + '.' };
+                const allOk = failNotes.length === 0 && okNotes.length > 0;
+                const msgParts = [];
+                if (okNotes.length) msgParts.push('Đã ' + okNotes.join(', ') + '.');
+                if (failNotes.length) msgParts.push('Chưa thực hiện: ' + failNotes.join('; ') + '.');
+                return { ok: allOk, summaryVi: msgParts.join(' ') || 'Không thực hiện được lệnh đèn nội thất.' };
             }
 
             case 'control_windows_roof': {
@@ -1322,7 +1393,7 @@ class VehicleController {
                 let anyOk = !this.state.liveCar;
 
                 if (target === 'sunroof') {
-                    this.state.sunroof = action === 'open' ? 'open' : (action === 'vent' || action === 'tilt' ? 'tilt' : 'closed');
+                    const nextSunroof = action === 'open' ? 'open' : (action === 'vent' || action === 'tilt' ? 'tilt' : 'closed');
                     const shdEnum = action === 'open' ? 'MAUT_AUF__S__AUF_2' : (action === 'vent' || action === 'tilt' ? 'HEBEN' : 'MAUT_ZU__S__ZU_2');
                     const r1 = await this.setFieldIfAvailable('sp18SunRoof', 'operationSHDMDS', { operationSwitchSHDMDS: shdEnum });
                     const r2 = await this.setFieldIfAvailable('sp18RoofSys', 'controlRoofSystem', {
@@ -1330,23 +1401,24 @@ class VehicleController {
                         controlSHD1: action === 'open' ? 100 : (action === 'vent' || action === 'tilt' ? 20 : 0),
                     });
                     if (r1.ok || r2.ok) anyOk = true;
+                    if (anyOk) this.state.sunroof = nextSunroof;
                     this.emitTelemetry();
                     return {
                         ok: anyOk,
                         summaryVi: anyOk
-                            ? ('Đã ' + (this.state.sunroof === 'open' ? 'mở cửa sổ trời.' : (this.state.sunroof === 'tilt' ? 'hé cửa sổ trời.' : 'đóng cửa sổ trời.')))
+                            ? ('Đã ' + (nextSunroof === 'open' ? 'mở cửa sổ trời.' : (nextSunroof === 'tilt' ? 'hé cửa sổ trời.' : 'đóng cửa sổ trời.')))
                             : 'Xe không mở cổng điều khiển cửa sổ trời qua SOME/IP.',
                     };
                 }
                 if (target === 'blinds') {
                     const open = action === 'open';
-                    this.state.blindsOpen = open;
                     const r18 = await this.setFieldIfAvailable('sp18RoofSys', 'controlRoofSystem', {
                         controlFrontESH2: open ? 'PANORAMA_OPEN' : 'POSITION',
                         controlFrontESH1: open ? 100 : 0,
                     });
                     const r21 = await this.callMethodIfAvailable('sunBlinds', open ? 'openSideAndRearBlinds' : 'closeSideAndRearBlinds', { displaySource: 6 });
                     if (r18.ok || r21.ok) anyOk = true;
+                    if (anyOk) this.state.blindsOpen = open;
                     this.emitTelemetry();
                     return {
                         ok: anyOk,
@@ -1369,7 +1441,6 @@ class VehicleController {
                 }
                 for (let i = 0; i < keys.length; i++) {
                     const k = keys[i];
-                    this.state.windows[k] = pct;
                     if (!anyOk) {
                         const r18 = await this.callMethodIfAvailable('windowLifter', 'moveWindow', {
                             windowId: WINDOW_ID_SP18[k],
@@ -1385,12 +1456,15 @@ class VehicleController {
                     });
                     if (r21.ok) anyOk = true;
                 }
+                if (anyOk) {
+                    for (let j = 0; j < keys.length; j++) this.state.windows[keys[j]] = pct;
+                }
                 this.emitTelemetry();
                 return {
                     ok: anyOk,
                     summaryVi: anyOk
                         ? ('Đã gửi lệnh ' + (pct === 0 ? 'đóng ' : ('hạ ' + pct + '% ')) + (keys.length === 4 ? 'toàn bộ kính.' : 'kính cửa.'))
-                        : 'Cổng nâng hạ kính SOME/IP không phản hồi.',
+                        : 'Hộp điều khiển kính cửa trên xe từ chối lệnh nâng/hạ kính qua màn hình.',
                 };
             }
 
@@ -1433,23 +1507,35 @@ class VehicleController {
                         ok: verified,
                         summaryVi: verified
                             ? (wantLock ? 'Đã khoá chốt toàn bộ cửa xe.' : 'Đã mở chốt cửa xe (xe đang đỗ P an toàn).')
-                            : 'Hộp thân xe BDC trên BMW iDrive 7 (SP18) từ chối khoá/mở chốt từ màn hình khi máy đang nổ hoặc chìa khoá nằm trong cabin.',
+                            : 'Chốt cửa chưa đổi — hộp thân xe BDC trên BMW iDrive 7 khoá lệnh chốt/mở từ màn hình khi chìa khoá hoặc người lái đang nổ máy trong xe.',
                     };
                 }
                 if (action === 'open_trunk') {
+                    if (this.state.liveCar && this.state.trunkOpen === true) {
+                        return { ok: true, summaryVi: 'Cốp sau hiện đang mở sẵn rồi.' };
+                    }
                     const r21 = await this.callMethodIfAvailable('locks', 'requestOpenBootlid', { requesterID: 3 });
-                    await this.setFieldIfAvailable('vehicle2', 'remoteControlDoor', {
+                    const rV2 = await this.setFieldIfAvailable('vehicle2', 'remoteControlDoor', {
                         requestZVRemoteServiceDoor: 'HECKKLAPPE',
                         requestZVRemoteServiceControl: 'OEFFNEN',
                     });
-                    const ok = !this.state.liveCar || r21.ok;
-                    if (ok) this.state.trunkOpen = true;
+                    let verified = !this.state.liveCar || r21.ok;
+                    if (this.state.liveCar && !verified && rV2.ok && (await this.isProxyAvailable('vehicle2'))) {
+                        await new Promise((r) => setTimeout(r, 850));
+                        try {
+                            const zv = await this.proxies.vehicle2.getValue('statusZVStatus', 1500);
+                            if (zv && (zv.statusContactBootLid === 1 || zv.statusContactBootLid === 'HK_IST_OFFEN')) {
+                                verified = true;
+                            }
+                        } catch (e) {}
+                    }
+                    if (verified) this.state.trunkOpen = true;
                     this.emitTelemetry();
                     return {
-                        ok,
-                        summaryVi: ok
-                            ? 'Đã gửi lệnh mở cốp sau.'
-                            : 'Trên dòng BMW iDrive 7 (SP18), hộp BDC khoá quyền bật cốp điện từ màn hình khi chìa khoá/người lái đang nổ máy trong xe (chỉ mở bằng nút cốp hoặc chìa khoá).',
+                        ok: verified,
+                        summaryVi: verified
+                            ? 'Đã mở cốp điện phía sau.'
+                            : 'Cốp sau chưa mở — trên BMW iDrive 7 (SP18), hộp BDC khoá quyền bật cốp từ màn hình khi đang nổ máy trong xe (đại ca bấm nút mở cốp bên hông cửa tài nhé).',
                     };
                 }
                 return { ok: false, summaryVi: 'Không rõ thao tác cửa/cốp.' };
@@ -1467,7 +1553,9 @@ class VehicleController {
                 this.emitTelemetry();
                 return {
                     ok,
-                    summaryVi: ok ? (fold ? 'Đã gập gương chiếu hậu.' : 'Đã mở gương chiếu hậu.') : 'Đầu MGU iDrive 7 (SP18) không nối dây lệnh gập gương rời qua SOME/IP.',
+                    summaryVi: ok
+                        ? (fold ? 'Đã gập gương chiếu hậu.' : 'Đã mở gương chiếu hậu.')
+                        : 'Gương chưa gập — trên BMW iDrive 7 (SP18), gập gương đi dây LIN thẳng cụm công tắc cửa tài, không mở qua phần mềm MGU.',
                 };
             }
 
@@ -1476,34 +1564,42 @@ class VehicleController {
                 let anyOk = !this.state.liveCar;
 
                 if (args.volumePercent !== undefined) {
-                    this.state.media.volumePercent = args.volumePercent;
-                    this.state.media.muted = args.volumePercent === 0;
                     const rv = await this.callMethodIfAvailable('audioCmd', 'setVolume', {
                         sinkID: 1,
                         volume: args.volumePercent,
                     });
-                    if (rv.ok && rv.response && (rv.response.amError === 'E_OK' || rv.response.amError === 0)) {
+                    if (!this.state.liveCar || (rv.ok && rv.response && (rv.response.amError === 'E_OK' || rv.response.amError === 0))) {
+                        this.state.media.volumePercent = args.volumePercent;
+                        this.state.media.muted = args.volumePercent === 0;
                         anyOk = true;
                     }
                 }
                 if (act === 'mute' || act === 'unmute') {
-                    this.state.media.muted = act === 'mute';
                     const rm = await this.callMethodIfAvailable('audioCmd', 'setSinkMuteState', {
                         sinkID: 1,
                         muteState: act === 'mute' ? 'MS_MUTED' : 'MS_UNMUTED',
                     });
                     const ok = !this.state.liveCar || (rm.ok && rm.response && (rm.response.amError === 'E_OK' || rm.response.amError === 0));
+                    if (ok) this.state.media.muted = act === 'mute';
                     this.emitTelemetry();
-                    return { ok, summaryVi: act === 'mute' ? 'Đã tắt tiếng loa xe.' : 'Đã bật lại tiếng loa xe.' };
+                    return {
+                        ok,
+                        summaryVi: ok
+                            ? (act === 'mute' ? 'Đã tắt tiếng loa xe.' : 'Đã bật lại tiếng loa xe.')
+                            : 'Bộ quản lý âm thanh trên xe chưa phản hồi lệnh tắt/bật tiếng.',
+                    };
                 }
                 if (act === 'youtube_search_play' && args.query) {
                     const q = String(args.query).trim();
-                    this.state.media.playing = true;
-                    this.state.media.source = 'YouTube TV';
-                    this.state.media.title = q;
-                    if (this.state.liveCar) {
+                    if (!this.state.liveCar) {
+                        this.state.media.playing = true;
+                        this.state.media.source = 'YouTube TV';
+                        this.state.media.title = q;
+                    } else {
                         const yt = await this.searchAndPlayRideTube(q);
                         if (yt.ok && yt.item) {
+                            this.state.media.playing = true;
+                            this.state.media.source = 'YouTube TV';
                             this.state.media.title = yt.item.title || q;
                             anyOk = true;
                         }
@@ -1513,11 +1609,10 @@ class VehicleController {
                         ok: anyOk,
                         summaryVi: anyOk
                             ? ('Đang phát "' + this.state.media.title + '" trên YouTube TV.')
-                            : 'Không tìm được video trên RideTube (kiểm tra kết nối mgu-uplink).',
+                            : 'Chưa phát được "' + q + '" trên YouTube TV (kiểm tra ứng dụng RideTube hoặc kết nối mạng).',
                     };
                 }
                 if (act === 'pause' || act === 'stop') {
-                    this.state.media.playing = false;
                     if (this.rtSock) {
                         const yt = await this.sendRideTubeCmd({ cmd: act === 'stop' ? 'stop' : 'pause' });
                         if (yt.ok) anyOk = true;
@@ -1529,11 +1624,11 @@ class VehicleController {
                         await this.callMethodIfAvailable(players[i], 'sendButtonEvent', { button: btnEnum, action: 'RELEASE' });
                         if (rp.ok) anyOk = true;
                     }
+                    if (anyOk) this.state.media.playing = false;
                     this.emitTelemetry();
-                    return { ok: anyOk, summaryVi: 'Đã tạm dừng phát nhạc.' };
+                    return { ok: anyOk, summaryVi: anyOk ? 'Đã tạm dừng phát nhạc.' : 'Không tìm thấy nguồn nhạc đang phát để tạm dừng.' };
                 }
                 if (act === 'next' || act === 'previous' || act === 'play') {
-                    this.state.media.playing = true;
                     if (act === 'play' && this.rtSock) {
                         const yt = await this.sendRideTubeCmd({ cmd: 'resume' });
                         if (yt.ok) anyOk = true;
@@ -1545,75 +1640,110 @@ class VehicleController {
                         await this.callMethodIfAvailable(players[i], 'sendButtonEvent', { button: btnEnum, action: 'RELEASE' });
                         if (rp.ok) anyOk = true;
                     }
-                    if (act === 'next') this.state.media.title = 'Bài tiếp theo';
-                    if (act === 'previous') this.state.media.title = 'Bài trước đó';
+                    if (anyOk) {
+                        this.state.media.playing = true;
+                        if (act === 'next') this.state.media.title = 'Bài tiếp theo';
+                        if (act === 'previous') this.state.media.title = 'Bài trước đó';
+                    }
                     this.emitTelemetry();
                     return {
                         ok: anyOk,
-                        summaryVi: act === 'next' ? 'Đã chuyển sang bài tiếp theo.'
-                            : (act === 'previous' ? 'Đã lùi về bài trước.'
-                                : ('Đã gửi lệnh phát nhạc' + (args.volumePercent !== undefined ? (' ở mức âm lượng ' + args.volumePercent + '%') : '') + '.')),
+                        summaryVi: anyOk
+                            ? (act === 'next' ? 'Đã chuyển sang bài tiếp theo.'
+                                : (act === 'previous' ? 'Đã lùi về bài trước.'
+                                    : ('Đã gửi lệnh phát nhạc' + (args.volumePercent !== undefined ? (' ở mức âm lượng ' + args.volumePercent + '%') : '') + '.')))
+                            : 'Không tìm thấy nguồn phát nhạc khả dụng (CarPlay / Bluetooth / Media).',
                     };
                 }
                 this.emitTelemetry();
-                return { ok: anyOk, summaryVi: 'Đã chỉnh âm lượng loa xe mức ' + this.state.media.volumePercent + '%.' };
+                return {
+                    ok: anyOk,
+                    summaryVi: anyOk
+                        ? ('Đã chỉnh âm lượng loa xe mức ' + this.state.media.volumePercent + '%.')
+                        : 'Không chỉnh được mức âm lượng loa xe.',
+                };
             }
 
             case 'set_exhaust_flap': {
                 const mode = args.mode || 'oem';
-                this.state.exhaustMode = mode;
+                const soundEnum = mode === 'open' ? 'MOTORSOUND_SPORTLICH'
+                    : (mode === 'close' ? 'MOTORSOUND_ZURUECKHALTEND' : 'MOTORSOUND_FES_ABHAENGIG');
+                const rSound = await this.setFieldIfAvailable('sp18DrivingExcitement', 'controlFESDriveStrategy', {
+                    operationAdjustEngineSoundVehicle: soundEnum,
+                });
+                const ok = !this.state.liveCar || rSound.ok;
+                if (ok) this.state.exhaustMode = mode;
                 this.emitTelemetry();
-                const label = mode === 'open' ? 'MỞ van bô thể thao' : (mode === 'close' ? 'ĐÓNG êm van bô' : 'trả van bô về chế độ ZIN theo xe');
-                return { ok: true, summaryVi: 'Đã ghi nhận chế độ ' + label + ' (nhiệt độ dầu máy ' + this.state.oilTempC + '°C).' };
+                const label = mode === 'open' ? 'MỞ thể thao (Sporty)' : (mode === 'close' ? 'ĐÓNG êm (Reduced)' : 'ZIN theo chế độ lái');
+                return {
+                    ok,
+                    summaryVi: ok
+                        ? ('Đã chuyển chế độ âm thanh động cơ / van bô sang ' + label + ' (dầu máy ' + this.state.oilTempC + '°C).')
+                        : 'Van bô thể thao trên BMW M5 nối thẳng hộp DME — đại ca bấm nút ống xả vật lý cạnh cần số nhé.',
+                };
             }
 
             case 'control_camera_360': {
                 const view = String(args.view || '360').toLowerCase();
-                this.state.cameraView = view === 'off' ? 'off' : view;
                 const rc = view === 'off'
                     ? await this.callMethodIfAvailable('parkCam', 'requestParkingClosedown', {})
                     : await this.callMethodIfAvailable('parkCam', 'hmiSelectCamera', { camera: 1 });
+                const ok = !this.state.liveCar || rc.ok;
+                if (ok) this.state.cameraView = view === 'off' ? 'off' : view;
                 this.emitTelemetry();
                 return {
-                    ok: !this.state.liveCar || rc.ok,
-                    summaryVi: (!this.state.liveCar || rc.ok)
+                    ok,
+                    summaryVi: ok
                         ? (view === 'off' ? 'Đã đóng màn hình camera.' : ('Đã bật camera ' + view.toUpperCase() + ' trên màn hình.'))
-                        : 'Cổng Parkmenu camera không khả dụng.',
+                        : 'Camera 360 trên BMW iDrive 7 chỉ kích hoạt qua nút Park (P) cạnh cần số hoặc khi vào số R.',
                 };
             }
 
             case 'navigate_to': {
                 const dest = String(args.destination || '').trim();
-                this.state.navigationTarget = dest;
-                this.emitTelemetry();
-                return { ok: true, summaryVi: 'Đã ghi nhận điểm đến "' + dest + '" cho lộ trình dẫn đường.' };
+                if (!this.state.liveCar) {
+                    this.state.navigationTarget = dest;
+                    this.emitTelemetry();
+                    return { ok: true, summaryVi: 'Đã ghi nhận điểm đến "' + dest + '" cho lộ trình dẫn đường.' };
+                }
+                return {
+                    ok: false,
+                    summaryVi: 'Đầu MGU chưa hỗ trợ đẩy thẳng địa chỉ "' + dest + '" vào bản đồ gốc — đại ca tìm trên Google Maps / VietMap CarPlay nhé.',
+                };
             }
 
             case 'control_1cr_valet': {
                 const act = String(args.action || 'status').toLowerCase();
+                const hasBimmerLink = !this.state.liveCar || fs.existsSync(path.join(this.opts.bimmerlinkRun, 'status.json'));
+                if (!hasBimmerLink) {
+                    return {
+                        ok: false,
+                        summaryVi: 'Xe hiện chưa cài hoặc chưa bật dịch vụ Bimmer-Link (Option 1CR / Valet / Telegram).',
+                    };
+                }
                 const cmdPath = path.join(this.opts.bimmerlinkRun, 'app', 'command.json');
                 if (act === 'start_1cr') {
-                    this.state.climate1crActive = true;
                     const ok = !this.state.liveCar || writeAtomicSafe(cmdPath, JSON.stringify({ id: Date.now(), cmd: 'start1cr', arg: {} }));
+                    if (ok) this.state.climate1crActive = true;
                     this.emitTelemetry();
-                    return { ok, summaryVi: ok ? 'Đã gửi lệnh kích hoạt làm mát / đề nổ từ xa Option 1CR qua Bimmer-Link.' : 'Chưa tìm thấy dịch vụ Bimmer-Link.' };
+                    return { ok, summaryVi: ok ? 'Đã gửi lệnh kích hoạt làm mát / đề nổ từ xa Option 1CR qua Bimmer-Link.' : 'Không ghi được lệnh sang Bimmer-Link.' };
                 }
                 if (act === 'stop_1cr') {
-                    this.state.climate1crActive = false;
                     const ok = !this.state.liveCar || writeAtomicSafe(cmdPath, JSON.stringify({ id: Date.now(), cmd: 'stop1cr', arg: {} }));
+                    if (ok) this.state.climate1crActive = false;
                     this.emitTelemetry();
-                    return { ok, summaryVi: 'Đã tắt chế độ làm mát / đề nổ 1CR.' };
+                    return { ok, summaryVi: ok ? 'Đã tắt chế độ làm mát / đề nổ 1CR.' : 'Không ghi được lệnh sang Bimmer-Link.' };
                 }
                 if (act === 'valet_on' || act === 'valet_off') {
                     const want = act === 'valet_on';
-                    this.state.valetEnabled = want;
-                    writeAtomicSafe(cmdPath, JSON.stringify({ id: Date.now(), cmd: 'valet_toggle', arg: { enabled: want } }));
+                    const ok = !this.state.liveCar || writeAtomicSafe(cmdPath, JSON.stringify({ id: Date.now(), cmd: 'valet_toggle', arg: { enabled: want } }));
+                    if (ok) this.state.valetEnabled = want;
                     this.emitTelemetry();
-                    return { ok: true, summaryVi: want ? 'Đã bật giám sát Valet & ghim vị trí xe.' : 'Đã tắt chế độ Valet.' };
+                    return { ok, summaryVi: ok ? (want ? 'Đã bật giám sát Valet & ghim vị trí xe.' : 'Đã tắt chế độ Valet.') : 'Không gửi được lệnh Valet sang Bimmer-Link.' };
                 }
                 if (act === 'snap_telegram') {
-                    writeAtomicSafe(cmdPath, JSON.stringify({ id: Date.now(), cmd: 'snap_now', arg: {} }));
-                    return { ok: true, summaryVi: 'Đang chụp trạng thái xe gửi về Telegram của đại ca.' };
+                    const ok = !this.state.liveCar || writeAtomicSafe(cmdPath, JSON.stringify({ id: Date.now(), cmd: 'snap_now', arg: {} }));
+                    return { ok, summaryVi: ok ? 'Đã gửi yêu cầu chụp trạng thái xe về Telegram qua Bimmer-Link.' : 'Không gửi được yêu cầu chụp sang Bimmer-Link.' };
                 }
                 return { ok: true, summaryVi: 'Trạng thái 1CR: ' + (this.state.climate1crActive ? 'Đang chạy' : 'Đang tắt') + '.' };
             }
@@ -1621,9 +1751,11 @@ class VehicleController {
             case 'scan_vehicle_health': {
                 const t = this.state;
                 const lowTyres = [];
-                Object.keys(t.tyresBar).forEach((k) => {
-                    if (t.tyresBar[k] < 2.1) lowTyres.push(k.toUpperCase() + ' (' + t.tyresBar[k] + ' bar)');
-                });
+                if (!t.liveCar || t.tyresLive) {
+                    Object.keys(t.tyresBar).forEach((k) => {
+                        if (t.tyresBar[k] < 2.1) lowTyres.push(k.toUpperCase() + ' (' + t.tyresBar[k] + ' bar)');
+                    });
+                }
                 const issues = [];
                 if (t.battery12v < 11.9) issues.push('Bình 12V hơi yếu (' + t.battery12v + 'V)');
                 if (lowTyres.length) issues.push('Lốp non hơi: ' + lowTyres.join(', '));
@@ -1642,41 +1774,56 @@ class VehicleController {
                 const scene = String(args.scene || 'chill_night').toLowerCase();
                 this.state.activeScene = scene;
                 if (scene === 'chill_night') {
-                    await this.executeDirect('set_ambient_light', { color: 'sunset_purple', brightness: 50 }, speakerZone);
-                    await this.executeDirect('set_climate', { tempC: 24.0, fanLevel: 2, zone: 'both' }, speakerZone);
-                    await this.executeDirect('control_media', { action: 'youtube_search_play', query: 'Lofi Chill Night Drive', volumePercent: 32 }, speakerZone);
+                    const rAmb = await this.executeDirect('set_ambient_light', { color: 'sunset_purple', brightness: 50 }, speakerZone);
+                    const rClim = await this.executeDirect('set_climate', { tempC: 24.0, fanLevel: 2, zone: 'both' }, speakerZone);
+                    const rYt = await this.executeDirect('control_media', { action: 'youtube_search_play', query: 'Lofi Chill Night Drive', volumePercent: 32 }, speakerZone);
                     this.emitTelemetry();
-                    return { ok: true, summaryVi: 'Đã bật kịch bản Chill đêm: đèn Tím hoàng hôn 50%, điều hoà 24°C và phát nhạc Lofi trên YouTube TV.' };
+                    return {
+                        ok: !!(rAmb.ok || rClim.ok),
+                        summaryVi: 'Kịch bản Chill đêm: ' + [rAmb.summaryVi, rClim.summaryVi, rYt.summaryVi].filter(Boolean).join(' '),
+                    };
                 }
                 if (scene === 'cool_down') {
-                    await this.executeDirect('set_climate', { maxAc: true }, speakerZone);
-                    await this.executeDirect('set_seat_comfort', { seat: 'both', coolingLevel: 3 }, speakerZone);
-                    await this.executeDirect('set_ambient_light', { color: 'ice_cyan', brightness: 85 }, speakerZone);
+                    const rClim = await this.executeDirect('set_climate', { maxAc: true }, speakerZone);
+                    const rSeat = await this.executeDirect('set_seat_comfort', { seat: 'both', coolingLevel: 3 }, speakerZone);
+                    const rAmb = await this.executeDirect('set_ambient_light', { color: 'ice_cyan', brightness: 85 }, speakerZone);
                     this.emitTelemetry();
-                    return { ok: true, summaryVi: 'Đã bật kịch bản Hạ nhiệt cấp tốc: Max AC, làm mát 2 ghế trước mức 3 và đổi đèn Xanh băng.' };
+                    return {
+                        ok: !!(rClim.ok || rSeat.ok),
+                        summaryVi: 'Kịch bản Hạ nhiệt cấp tốc: ' + [rClim.summaryVi, rSeat.summaryVi, rAmb.summaryVi].filter(Boolean).join(' '),
+                    };
                 }
                 if (scene === 'cinema_park') {
                     this.preCinemaBackup = { ambient: Object.assign({}, this.state.ambient) };
-                    await this.executeDirect('set_climate', { tempC: 23.0, fanLevel: 2, zone: 'both' }, speakerZone);
-                    await this.executeDirect('set_seat_comfort', { seat: 'driver', massage: true }, speakerZone);
-                    await this.executeDirect('set_ambient_light', { color: 'amber', brightness: 25 }, speakerZone);
-                    await this.executeDirect('control_media', { action: 'youtube_search_play', query: args.query || 'Top Trending Vietnam', volumePercent: 40 }, speakerZone);
+                    const rClim = await this.executeDirect('set_climate', { tempC: 23.0, fanLevel: 2, zone: 'both' }, speakerZone);
+                    const rSeat = await this.executeDirect('set_seat_comfort', { seat: 'driver', massage: true }, speakerZone);
+                    const rAmb = await this.executeDirect('set_ambient_light', { color: 'amber', brightness: 25 }, speakerZone);
+                    const rYt = await this.executeDirect('control_media', { action: 'youtube_search_play', query: args.query || 'Top Trending Vietnam', volumePercent: 40 }, speakerZone);
                     this.emitTelemetry();
-                    return { ok: true, summaryVi: 'Đã bật kịch bản Rạp phim tại chỗ (số P): điều hoà 23°C, bật massage ghế tài, đèn Hổ phách 25% và mở YouTube TV.' };
+                    return {
+                        ok: !!(rClim.ok || rAmb.ok),
+                        summaryVi: 'Kịch bản Rạp phim tại chỗ (số P): ' + [rClim.summaryVi, rSeat.summaryVi, rAmb.summaryVi, rYt.summaryVi].filter(Boolean).join(' '),
+                    };
                 }
                 if (scene === 'focus_sport') {
-                    await this.executeDirect('set_ambient_light', { color: 'm_red', brightness: 90 }, speakerZone);
-                    await this.executeDirect('set_seat_comfort', { seat: 'driver', coolingLevel: 2 }, speakerZone);
+                    const rAmb = await this.executeDirect('set_ambient_light', { color: 'm_red', brightness: 90 }, speakerZone);
+                    const rSeat = await this.executeDirect('set_seat_comfort', { seat: 'driver', coolingLevel: 2 }, speakerZone);
                     const exRes = await this.invokeTool('set_exhaust_flap', { mode: 'open' }, speakerZone);
                     this.emitTelemetry();
-                    return { ok: true, summaryVi: 'Đã bật kịch bản Thể thao: đèn Đỏ M-Red 90%, làm mát ghế tài. ' + exRes.summaryVi };
+                    return {
+                        ok: !!(rAmb.ok || rSeat.ok),
+                        summaryVi: 'Kịch bản Thể thao: ' + [rAmb.summaryVi, rSeat.summaryVi, exRes.summaryVi].filter(Boolean).join(' '),
+                    };
                 }
                 if (scene === 'normal' || scene === 'reset') {
                     this.state.activeScene = 'none';
-                    await this.executeDirect('set_ambient_light', { color: 'oem', brightness: 70 }, speakerZone);
-                    await this.executeDirect('set_climate', { maxAc: false, tempC: 23.5, fanLevel: 2, zone: 'both' }, speakerZone);
+                    const rAmb = await this.executeDirect('set_ambient_light', { color: 'oem', brightness: 70 }, speakerZone);
+                    const rClim = await this.executeDirect('set_climate', { maxAc: false, tempC: 23.5, fanLevel: 2, zone: 'both' }, speakerZone);
                     this.emitTelemetry();
-                    return { ok: true, summaryVi: 'Đã đưa đèn và điều hoà về lại chế độ lái tiêu chuẩn.' };
+                    return {
+                        ok: !!(rAmb.ok || rClim.ok),
+                        summaryVi: 'Về mặc định: ' + [rAmb.summaryVi, rClim.summaryVi].filter(Boolean).join(' '),
+                    };
                 }
                 return { ok: false, summaryVi: 'Chưa nhận diện được kịch bản yêu cầu.' };
             }

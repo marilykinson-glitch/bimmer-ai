@@ -28,7 +28,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.5.1';
+const VERSION = '0.5.2';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -408,8 +408,11 @@ class BimmerAiDaemon {
         // 1. Morning / Drive Startup Briefing when engine starts (`engineRunning` transitions true)
         if (this.settings.startupBriefing && t.engineRunning && !this.greetedDrive) {
             this.greetedDrive = true;
+            const tailMetric = (!t.liveCar || t.tyresLive)
+                ? (', 4 lốp đều ' + t.tyresBar.fl + ' bar')
+                : (', nước mát ' + t.coolantTempC + '°C, xăng ' + t.fuelPercent + '%');
             const brief = 'Chào ' + this.settings.ownerName + '! Bình 12V đạt ' + t.battery12v + 'V, dầu máy ' + t.oilTempC +
-                '°C, 4 lốp đều ' + t.tyresBar.fl + ' bar. Chúc thượng lộ bình an!';
+                '°C' + tailMetric + '. Chúc thượng lộ bình an!';
             this.lastTurn = {
                 at: now,
                 engine: 'copilot',
