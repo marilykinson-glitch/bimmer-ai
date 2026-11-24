@@ -26,9 +26,10 @@ const Up = require('./uplink');
 const SafetyGate = require('./safety-gate');
 const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
+const AsdSynth = require('./asd-synth');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.5.2';
+const VERSION = '0.6.0';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -80,6 +81,7 @@ function defaultSettings() {
         duckVolumePercent: 20,
         startupBriefing: true,
         vietmapCoPilot: true,
+        asd: AsdSynth.normalizeAsdConfig({ enabled: false, engine: 'm5_v8', volumePercent: 75, modeFollow: true, burbles: true }),
         guards: SafetyGate.defaultGuards(),
     };
 }
@@ -110,6 +112,7 @@ function normalizeSettings(raw) {
         duckVolumePercent: Math.max(5, Math.min(50, Math.round(Number(r.duckVolumePercent) || d.duckVolumePercent))),
         startupBriefing: r.startupBriefing !== false,
         vietmapCoPilot: r.vietmapCoPilot !== false,
+        asd: AsdSynth.normalizeAsdConfig(r.asd),
         guards: SafetyGate.normalizeGuards(r.guards),
     };
 }
@@ -272,9 +275,21 @@ class BimmerAiDaemon {
         this.vehicle = new VehicleBus.VehicleController({
             onTelemetry: () => this.onVehicleStateChanged(),
             onPttEvent: (ev) => this.onSteeringWheelPtt(ev),
+            onAsdCommand: (args) => this.applyAsdCommand(args),
             onLog: (m) => this.log(m),
         });
         this.vehicle.setGuards(this.settings.guards);
+
+        this.asd = new AsdSynth.ActiveSoundController(Object.assign({
+            connectAmRoute: (r) => this.vehicle.connectAudioRoute(r),
+            disconnectAmRoute: (cid) => this.vehicle.disconnectAudioRoute(cid),
+            getTelemetry: () => this.vehicle.state,
+            shouldMute: () => !!(this.vehicle.state.callActive || this.assistantState === 'listening'),
+            onStateChange: () => this.writeStatusFile(),
+            onLog: (m) => this.log(m),
+        }, this.cfg.asdOpts || {}));
+        this.asd.config = AsdSynth.normalizeAsdConfig(this.settings.asd);
+        this.vehicle.state.asd = this.asd.getStatus();
 
         this.wakeMonitor = new AudioIO.WakeWordMonitor({
             outFile: path.join(this.cfg.run, 'vad_utt.wav'),
@@ -341,8 +356,13 @@ class BimmerAiDaemon {
     saveSettings(patch) {
         const merged = Object.assign({}, this.settings, patch || {});
         if (patch && patch.guards) merged.guards = Object.assign({}, this.settings.guards, patch.guards);
+        if (patch && patch.asd) merged.asd = Object.assign({}, this.settings.asd, patch.asd);
         this.settings = normalizeSettings(merged);
         this.vehicle.setGuards(this.settings.guards);
+        if (this.asd) {
+            this.asd.configure(this.settings.asd);
+            this.vehicle.state.asd = this.asd.getStatus();
+        }
         if (this.wakeMonitor) {
             this.wakeMonitor.setSwapChannels(this.settings.swapMicChannels);
             this.wakeMonitor.tick().catch(() => {});
@@ -350,6 +370,49 @@ class BimmerAiDaemon {
         writeAtomic(this.settingsFile, JSON.stringify(this.settings, null, 2) + '\n', 0o600);
         this.writeStatusFile();
         return this.publicSettings();
+    }
+
+    async applyAsdCommand(rawArgs) {
+        const a = (rawArgs && typeof rawArgs === 'object') ? rawArgs : {};
+        const patch = {};
+        if (a.enabled !== undefined) {
+            patch.enabled = !!a.enabled;
+        } else if (a.engine || a.revDemo) {
+            patch.enabled = true;
+        }
+        if (a.engine) {
+            const engKey = String(a.engine).trim().toLowerCase();
+            if (AsdSynth.ENGINE_PROFILES[engKey]) patch.engine = engKey;
+        }
+        if (a.volumePercent !== undefined) patch.volumePercent = Number(a.volumePercent);
+        if (a.modeFollow !== undefined) patch.modeFollow = !!a.modeFollow;
+        if (a.burbles !== undefined) patch.burbles = !!a.burbles;
+
+        if (Object.keys(patch).length > 0) {
+            this.saveSettings({ asd: patch });
+        }
+        if (a.revDemo && this.asd) {
+            this.asd.triggerRevDemo();
+        }
+        if (this.asd) {
+            await this.asd.syncLifecycle();
+        }
+        const st = this.asd ? this.asd.getStatus() : AsdSynth.normalizeAsdConfig(this.settings.asd);
+        this.vehicle.state.asd = st;
+        this.writeStatusFile();
+
+        let summaryVi = '';
+        if (!st.enabled) {
+            summaryVi = 'Đã tắt giả lập âm thanh ống xả B&W — xe quay về âm thanh êm nguyên bản.';
+        } else if (a.revDemo) {
+            summaryVi = 'Đang nẹt pô thử tiếng ' + st.engineName + ' qua dàn loa B&W (âm lượng ' + st.volumePercent + '%).';
+        } else {
+            const modeTxt = st.modeFollow
+                ? ('ăn theo chế độ ' + st.effectiveModeLabel + ' · ' + st.modeGainPercent + '%')
+                : 'mở gắt cố định';
+            summaryVi = 'Đã bật giả lập âm thanh ống xả B&W: ' + st.engineName + ' (âm lượng ' + st.volumePercent + '%, ' + modeTxt + ').';
+        }
+        return { ok: true, asd: st, summaryVi };
     }
 
     publicSettings() {
@@ -372,6 +435,12 @@ class BimmerAiDaemon {
 
     getPublicState() {
         const netInfo = this.portalUrl();
+        const asdStatus = this.asd ? this.asd.getStatus() : null;
+        this.vehicle.state.asd = asdStatus;
+        const asdEngines = AsdSynth.ENGINE_ORDER.map((id) => {
+            const p = AsdSynth.ENGINE_PROFILES[id];
+            return { id: p.id, name: p.name, shortName: p.shortName, badge: p.badge };
+        });
         return {
             at: Date.now(),
             version: VERSION,
@@ -385,6 +454,8 @@ class BimmerAiDaemon {
             activeSpeakerZone: this.activeSpeakerZone,
             micLevels: this.micLevels,
             settings: this.publicSettings(),
+            asd: asdStatus,
+            asdEngines,
             audioProbe: this.audioProbe,
             telemetry: this.vehicle.state,
             guards: this.vehicle.guards,
@@ -481,10 +552,11 @@ class BimmerAiDaemon {
             Up.warmup(this.uplinkOpts).catch(() => {});
         }
 
-        // Release continuous VAD stream before opening one-shot PTT capture
+        // Release continuous VAD stream & mute B&W ASD speakers before opening one-shot PTT capture
         if (this.wakeMonitor) await this.wakeMonitor.killWorker();
 
         this.assistantState = 'listening';
+        if (this.asd) await this.asd.syncLifecycle();
         this.writeStatusFile();
         this.vehicle.pulseIpaLight('listenDriver').catch(() => {});
         try {
@@ -733,6 +805,15 @@ class BimmerAiDaemon {
             this.saveSettings({ guards: g });
             return { ok: true };
         }
+        if (cmd === 'asd_toggle') {
+            return this.applyAsdCommand({ enabled: !(this.asd && this.asd.config.enabled) });
+        }
+        if (cmd === 'asd_set') {
+            return this.applyAsdCommand(arg || {});
+        }
+        if (cmd === 'asd_rev_demo') {
+            return this.applyAsdCommand({ revDemo: true });
+        }
         if (cmd === 'next_ip') {
             this.ipIdx++;
             this.writeStatusFile();
@@ -830,8 +911,19 @@ class BimmerAiDaemon {
             try {
                 const body = await this.readBodyJson(req);
                 this.vehicle.patchTelemetry(body);
+                if (this.asd) await this.asd.syncLifecycle();
                 this.writeStatusFile();
                 return sendJson(200, { ok: true, state: this.getPublicState() });
+            } catch (e) {
+                return sendJson(400, { ok: false, error: e.message });
+            }
+        }
+
+        if (pathname === '/api/asd' && req.method === 'POST') {
+            try {
+                const body = await this.readBodyJson(req);
+                const result = await this.applyAsdCommand(body);
+                return sendJson(200, { ok: true, result, state: this.getPublicState() });
             } catch (e) {
                 return sendJson(400, { ok: false, error: e.message });
             }
@@ -932,6 +1024,7 @@ class BimmerAiDaemon {
             Up.warmup(this.uplinkOpts).catch(() => {});
         }
         if (this.wakeMonitor) this.wakeMonitor.start();
+        if (this.asd) this.asd.start();
         this.log('listening on ' + this.portalUrl().url);
         return this;
     }
@@ -942,6 +1035,7 @@ class BimmerAiDaemon {
             clearTimeout(this.unduckTimer);
             this.unduckTimer = null;
         }
+        if (this.asd) await this.asd.stop();
         if (this.wakeMonitor) await this.wakeMonitor.stop();
         Up.close(this.uplinkOpts);
         if (this.vehicle && typeof this.vehicle.closeRideTube === 'function') {

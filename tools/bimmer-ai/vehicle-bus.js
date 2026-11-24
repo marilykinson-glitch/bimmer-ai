@@ -141,6 +141,52 @@ function encodeSp18TempByte(tempC, observedRaw) {
     return Math.max(32, Math.min(56, Math.round(tempC * 2)));
 }
 
+function decodeFesDriveMode(raw) {
+    if (raw === null || raw === undefined || raw === 0 || raw === 61 || raw === 62 || raw === 63 || raw === 255) return null;
+    const s = String(raw).toUpperCase();
+    if (/UNGUELTIG|UNBEFUELLT|INITIALISIERUNG|NICHT_VERFUEGBAR|RESERVIERT|FEHLER/.test(s)) return null;
+    if (raw === 2 || raw === 23 || raw === 28 || /SPORT_EXPERT|SPORT_PLUS|RACE|TRACK/.test(s)) return 'sport_plus';
+    if (raw === 1 || raw === 3 || raw === 16 || /SPORT/.test(s)) return 'sport';
+    if (raw === 7 || raw === 8 || raw === 9 || /ECO_PRO|\bECO\b/.test(s)) return 'eco_pro';
+    if (raw === 10 || /ADAPTIVE/.test(s)) return 'adaptive';
+    if (raw === 4 || raw === 5 || raw === 6 || /COMFORT/.test(s)) return 'comfort';
+    return null;
+}
+
+function decodeSp18Gear(field, v, currentGear) {
+    if (!v || typeof v !== 'object') return null;
+    if (field === 'DataPowerTrain2' && v.statusGearSelectionDrive !== undefined) {
+        const x = v.statusGearSelectionDrive;
+        const n = typeof x === 'number'
+            ? x
+            : ({ N: 1, R: 2, P: 3, NP: 4 }[x] || (/^_\d$/.test(String(x)) ? (4 + Number(String(x).slice(1))) : 0));
+        if (n === 1) return 'N';
+        if (n === 2) return 'R';
+        if (n === 3) return 'P';
+        if (n >= 5 && n <= 13) {
+            const curPrefix = /^[SM]/i.test(String(currentGear || '')) ? String(currentGear).charAt(0).toUpperCase() : 'D';
+            return curPrefix + (n - 4);
+        }
+        return null;
+    }
+    if (field === 'statusGearboxDrive') {
+        const st = v.statusActualStageDrive;
+        const g = v.statusActualGearDrive;
+        const stage = { P: 'P', R: 'R', N: 'N', D: 'D', S: 'S', M: 'M', 1: 'P', 2: 'R', 3: 'N', 4: 'D', 5: 'S', 6: 'M' }[st];
+        const gearNum = typeof g === 'number'
+            ? (g >= 3 && g <= 12 ? (g - 2) : null)
+            : (/^G\d+$/.test(String(g)) ? Number(String(g).slice(1)) : null);
+        if (stage) {
+            return ((stage === 'D' || stage === 'S' || stage === 'M') && gearNum) ? (stage + gearNum) : stage;
+        }
+        if (v.gearboxSelectorPosition !== undefined) {
+            const sel = String(v.gearboxSelectorPosition).toUpperCase();
+            if (/^[PRNDSM]/.test(sel)) return sel.charAt(0);
+        }
+    }
+    return null;
+}
+
 function createInitialTelemetry() {
     return {
         liveCar: false,
@@ -149,6 +195,9 @@ function createInitialTelemetry() {
         speedKmh: 0,
         rpm: 0,
         gear: 'P',
+        driveMode: 'comfort',
+        torqueNm: 0,
+        pedalPct: 0,
         engineRunning: false,
         coolantTempC: 84,
         oilTempC: 86,
@@ -159,6 +208,7 @@ function createInitialTelemetry() {
         rangeKm: 420,
         odometerKm: 0,
         tyresBar: { fl: 2.4, fr: 2.4, rl: 2.5, rr: 2.5 },
+        tyresLive: false,
         doorsLocked: true,
         trunkOpen: false,
         mirrorsFolded: false,
@@ -288,6 +338,7 @@ class VehicleController {
             vietmapRun: VIETMAP_RUN,
             onTelemetry: null,
             onPttEvent: null,
+            onAsdCommand: null,
             onLog: null,
         }, opts || {});
 
@@ -299,6 +350,7 @@ class VehicleController {
         this.proxyIfaceMap = {};
         this.observedTempRaw = null;
         this.lockSeq = 1;
+        this.lastTpmsPollAt = 0;
         this.preCinemaBackup = null;
         this.pttDownAt = 0;
         this.pttLongFired = false;
@@ -352,12 +404,45 @@ class VehicleController {
                 this.state[k] = val;
             }
         });
-        if (typeof this.state.rpm === 'number') this.state.engineRunning = this.state.rpm >= 400;
+        if (typeof this.state.rpm === 'number' && patch.engineRunning === undefined) {
+            this.state.engineRunning = this.state.rpm >= 400;
+        }
         this.emitTelemetry();
         return this.state;
     }
 
+    applyTpmsPressureStruct(v) {
+        if (!v || typeof v !== 'object') return;
+        const map = [
+            ['fl', 'actualValuePressureTyreFLH'],
+            ['fr', 'actualValuePressureTyreFRH'],
+            ['rl', 'actualValuePressureTyreRLH'],
+            ['rr', 'actualValuePressureTyreRRH'],
+        ];
+        let anyValid = false;
+        for (let i = 0; i < map.length; i++) {
+            const raw = v[map[i][1]];
+            if (typeof raw === 'number' && raw > 0 && raw < 65532) {
+                this.state.tyresBar[map[i][0]] = +(raw * 0.1).toFixed(1);
+                anyValid = true;
+            }
+        }
+        if (anyValid) {
+            this.state.tyresLive = true;
+            this.emitTelemetry();
+        }
+    }
+
     pollCompanionApps() {
+        const now = Date.now();
+        if (this.proxies.tpms && (now - this.lastTpmsPollAt) > 25000) {
+            this.lastTpmsPollAt = now;
+            try {
+                this.proxies.tpms.getValue('statusTyrePressure', 2000)
+                    .then((v) => this.applyTpmsPressureStruct(v))
+                    .catch(() => {});
+            } catch (e) {}
+        }
         const bl = readJsonSafe(path.join(this.opts.bimmerlinkRun, 'status.json'));
         if (bl && bl.telemetry) {
             if (bl.telemetry.climate1cr) this.state.climate1crActive = !!bl.telemetry.climate1cr.active;
@@ -634,8 +719,8 @@ class VehicleController {
             });
         };
 
-        // 1. Core Driving, Thermal & Central Locking Telemetry (`CDS`, `Vehicle2`, `VehicleInformation`)
-        await bindService('cds', 'de.bmw.infotainment.vehicle.CDS', ['statusEngineSpeed2', 'statusEngineTemperature'], [], (f, v) => {
+        // 1. Core Driving, Thermal & Central Locking Telemetry (`CDS`, `Vehicle2`, `VehicleInformation`, `FES`, `AcceleratorPedal`, `TPMS`)
+        await bindService('cds', 'de.bmw.infotainment.vehicle.CDS', ['statusEngineSpeed2', 'statusEngineTemperature', 'statusEngineStatus'], [], (f, v) => {
             if (!v) return;
             if (f === 'statusEngineSpeed2' && v.actualValueRPMEngineCrankshaft !== undefined && v.actualValueRPMEngineCrankshaft !== 65535) {
                 const rpm = v.actualValueRPMEngineCrankshaft * 0.25;
@@ -645,6 +730,10 @@ class VehicleController {
                 if (v.temperatureEngineDrive !== undefined && v.temperatureEngineDrive !== 255) p.coolantTempC = v.temperatureEngineDrive - 48;
                 if (v.temperatureEngineOilDrive !== undefined && v.temperatureEngineOilDrive !== 255) p.oilTempC = v.temperatureEngineOilDrive - 48;
                 this.patchTelemetry(p);
+            } else if (f === 'statusEngineStatus' && v.statusEngineRunDrive !== undefined) {
+                const er = v.statusEngineRunDrive;
+                if (er === 2 || er === 'MOTOR_LAEUFT') this.patchTelemetry({ engineRunning: true });
+                else if (er === 0 || er === 'MOTOR_AUS') this.patchTelemetry({ engineRunning: false });
             }
         });
 
@@ -672,11 +761,36 @@ class VehicleController {
             }
         });
 
-        await bindService('vehInfo', 'de.bmw.infrastructure.VehicleInformation', ['statusGearboxDrive'], [], (f, v) => {
-            if (v && v.gearboxSelectorPosition !== undefined) {
-                const g = String(v.gearboxSelectorPosition).toUpperCase();
-                if (/^[PRNDSM]/.test(g)) this.patchTelemetry({ gear: g.charAt(0) });
+        await bindService('vehInfo', 'de.bmw.infrastructure.VehicleInformation', ['DataPowerTrain2', 'statusGearboxDrive'], [], (f, v) => {
+            const g = decodeSp18Gear(f, v, this.state.gear);
+            if (g) this.patchTelemetry({ gear: g });
+        });
+
+        await bindService('fes', 'de.bmw.infotainment.drivingexcitement.FES', [
+            'statusFESVehicleDynamicSwitchHMI',
+            'statusActualValueTorque2',
+            'controlFESDriveStrategy',
+        ], [], (f, v) => {
+            if (!v) return;
+            if (f === 'statusFESVehicleDynamicSwitchHMI' && v.actualValueModeDrivingExperience !== undefined) {
+                const dm = decodeFesDriveMode(v.actualValueModeDrivingExperience);
+                if (dm) this.patchTelemetry({ driveMode: dm });
+            } else if (f === 'statusActualValueTorque2' && typeof v.actualValueTorqueCrankshaft === 'number' && v.actualValueTorqueCrankshaft < 4095) {
+                this.patchTelemetry({ torqueNm: +(v.actualValueTorqueCrankshaft * 0.5 - 1023.5).toFixed(1) });
             }
+        });
+
+        await bindService('pedal', 'de.bmw.powertrain.AcceleratorPedal', ['AngleAcceleratorPedal'], [], (f, v) => {
+            if (v && typeof v.actualValueAngleAcceleratorPedal === 'number') {
+                const pct = v.actualValueAngleAcceleratorPedal * 0.025;
+                if (pct >= -2 && pct <= 102) {
+                    this.patchTelemetry({ pedalPct: Math.max(0, Math.min(100, Math.round(pct))) });
+                }
+            }
+        });
+
+        await bindService('tpms', 'de.bmw.infotainment.vehicle.TPMS', ['statusTyrePressure'], [], (f, v) => {
+            if (f === 'statusTyrePressure') this.applyTpmsPressureStruct(v);
         });
 
         // 2. Steering wheel Push-To-Talk button (`SteeringWheelPushButton.statusPTTButton1`)
@@ -1668,7 +1782,10 @@ class VehicleController {
                 const mode = args.mode || 'oem';
                 const soundEnum = mode === 'open' ? 'MOTORSOUND_SPORTLICH'
                     : (mode === 'close' ? 'MOTORSOUND_ZURUECKHALTEND' : 'MOTORSOUND_FES_ABHAENGIG');
-                const rSound = await this.setFieldIfAvailable('sp18DrivingExcitement', 'controlFESDriveStrategy', {
+                const rFes = await this.setFieldIfAvailable('fes', 'controlFESDriveStrategy', {
+                    operationAdjustEngineSoundVehicle: soundEnum,
+                });
+                const rSound = rFes.ok ? rFes : await this.setFieldIfAvailable('sp18DrivingExcitement', 'controlFESDriveStrategy', {
                     operationAdjustEngineSoundVehicle: soundEnum,
                 });
                 const ok = !this.state.liveCar || rSound.ok;
@@ -1679,7 +1796,38 @@ class VehicleController {
                     ok,
                     summaryVi: ok
                         ? ('Đã chuyển chế độ âm thanh động cơ / van bô sang ' + label + ' (dầu máy ' + this.state.oilTempC + '°C).')
-                        : 'Van bô thể thao trên BMW M5 nối thẳng hộp DME — đại ca bấm nút ống xả vật lý cạnh cần số nhé.',
+                        : 'Van bô vật lý trên xe nối thẳng hộp DME (nếu muốn nghe giả lập tiếng pô qua dàn loa B&W, đại ca nói "Bật giả lập tiếng pô" nhé!).',
+                };
+            }
+
+            case 'control_engine_sound': {
+                const fesEnum = args.enabled === false
+                    ? 'MOTORSOUND_ZURUECKHALTEND'
+                    : (args.modeFollow === false ? 'MOTORSOUND_SPORTLICH' : 'MOTORSOUND_FES_ABHAENGIG');
+                this.setFieldIfAvailable('fes', 'controlFESDriveStrategy', {
+                    operationAdjustEngineSoundVehicle: fesEnum,
+                }).catch(() => {});
+
+                if (typeof this.opts.onAsdCommand === 'function') {
+                    const res = await this.opts.onAsdCommand(args);
+                    this.emitTelemetry();
+                    return res;
+                }
+                const prev = this.state.asd || { enabled: false, engine: 'm5_v8', volumePercent: 75, modeFollow: true, burbles: true };
+                const next = Object.assign({}, prev);
+                if (args.enabled !== undefined) next.enabled = !!args.enabled;
+                else if (args.engine || args.revDemo) next.enabled = true;
+                if (args.engine) next.engine = String(args.engine).toLowerCase();
+                if (args.volumePercent !== undefined) next.volumePercent = Number(args.volumePercent);
+                if (args.modeFollow !== undefined) next.modeFollow = !!args.modeFollow;
+                if (args.burbles !== undefined) next.burbles = !!args.burbles;
+                this.state.asd = next;
+                this.emitTelemetry();
+                return {
+                    ok: true,
+                    summaryVi: next.enabled
+                        ? ('Đã bật giả lập âm thanh ống xả B&W (' + next.engine.toUpperCase() + ', âm lượng ' + next.volumePercent + '%).')
+                        : 'Đã tắt giả lập âm thanh ống xả B&W.',
                 };
             }
 
@@ -1840,6 +1988,8 @@ module.exports = {
     coerceByDataRef,
     decodeSp18TempByte,
     encodeSp18TempByte,
+    decodeFesDriveMode,
+    decodeSp18Gear,
     createInitialTelemetry,
     loadIFConfigGenerator,
     VehicleController,

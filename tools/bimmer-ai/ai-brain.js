@@ -122,11 +122,26 @@ const TOOL_DECLARATIONS = [
     },
     {
         name: 'set_exhaust_flap',
-        description: 'Điều khiển van bô thể thao: open (mở van bô nổ giòn), close (đóng êm), hoặc oem (zin theo xe). Tự động chờ dầu máy đạt 75°C nếu máy còn nguội.',
+        description: 'Điều khiển van bô thể thao vật lý: open (mở van bô nổ giòn), close (đóng êm), hoặc oem (zin theo xe). Tự động chờ dầu máy đạt 75°C nếu máy còn nguội.',
         parameters: {
             type: 'OBJECT',
             properties: {
                 mode: { type: 'STRING', description: 'open, close, hoặc oem' },
+            },
+        },
+    },
+    {
+        name: 'control_engine_sound',
+        description: 'Bật/tắt giả lập âm thanh ống xả & động cơ thể thao qua dàn loa Bowers & Wilkins (Active Sound Design - ASD), đổi tiếng động cơ (m5_v8, m3_s58, amg_v8, gt3_flat6, v10_na, iconic_m), chỉnh âm lượng pô (15-100%), bật/tắt tự ăn theo chế độ lái (Sport to hơn Comfort/Eco Pro), bật/tắt nổ lụp bụp nhả ga (burbles), hoặc nẹt pô thử (revDemo).',
+        parameters: {
+            type: 'OBJECT',
+            properties: {
+                enabled: { type: 'BOOLEAN', description: 'true = bật giả lập tiếng pô ra loa B&W, false = tắt hoàn toàn' },
+                engine: { type: 'STRING', description: 'Mã động cơ: m5_v8 (BMW M5 V8), m3_s58 (BMW M3/M4 I6), amg_v8 (AMG 4.0 V8), gt3_flat6 (Porsche 911 GT3), v10_na (Siêu xe V10), iconic_m (BMW IconicSounds M)' },
+                volumePercent: { type: 'NUMBER', description: 'Âm lượng tiếng pô giả lập từ 15 đến 100 (%)' },
+                modeFollow: { type: 'BOOLEAN', description: 'true = tự động to/gắt hơn khi sang chế độ Sport/Sport+ và êm dịu ở Comfort/Eco Pro' },
+                burbles: { type: 'BOOLEAN', description: 'true = bật tiếng nổ lụp bụp (burbles/pop & bang) khi nhả ga ở Sport' },
+                revDemo: { type: 'BOOLEAN', description: 'true = nẹt pô thử 2 nhịp ra loa B&W ngay lập tức' },
             },
         },
     },
@@ -326,8 +341,38 @@ function parseOfflineVietnameseIntents(rawText, speakerZone) {
         calls.push({ name: 'control_mirrors', args: { action: 'unfold' } });
     }
 
-    // 7. Exhaust Flap
-    if (/\b(van\s*bo|po\s*xe|tieng\s*bo|mo\s*bo|dong\s*bo)\b/.test(s)) {
+    // 7. B&W Active Sound Design (ASD Multi-Engine Synthesis) vs Physical Exhaust Flap
+    const hasEngineSoundKeyword = /\b(gia\s+lap|asd|iconic|net\s+po|net\s+bo|ro\s+ga|lup\s+bup|burble|tieng\s+po|tieng\s+bo|tieng\s+dong\s+co|am\s+thanh\s+ong\s+xa|am\s+thanh\s+dong\s+co|po\s+b\s*&\s*w|po\s+bw|po\s+loa|doi\s+tieng\s+po|tieng\s+(?:m5|m3|m4|amg|porsche|gt3|v10|v8))\b/.test(s);
+    if (hasEngineSoundKeyword) {
+        const asdArgs = {};
+        if (/\b(tat|ngung|off)\b/.test(s) && !/\btat\s+(?:lup\s+bup|burble|theo\s+che\s+do)\b/.test(s)) {
+            asdArgs.enabled = false;
+        } else if (/\b(bat|mo|on|kich\s+hoat|doi|chuyen|chon)\b/.test(s)) {
+            asdArgs.enabled = true;
+        }
+        if (/\b(net\s+po|net\s+bo|ro\s+ga|nghe\s+thu|test\s+po)\b/.test(s)) {
+            asdArgs.revDemo = true;
+            asdArgs.enabled = true;
+        }
+        if (/\b(m3|m4|s58|i6)\b/.test(s)) asdArgs.engine = 'm3_s58';
+        else if (/\b(amg|c63|g63|merc|mercedes|biturbo)\b/.test(s)) asdArgs.engine = 'amg_v8';
+        else if (/\b(gt3|porsche|911|boxer|flat\s*6)\b/.test(s)) asdArgs.engine = 'gt3_flat6';
+        else if (/\b(v10|lambo|lamborghini|huracan|r8|sieu\s+xe)\b/.test(s)) asdArgs.engine = 'v10_na';
+        else if (/\b(iconic|zimmer|vien\s+tuong)\b/.test(s)) asdArgs.engine = 'iconic_m';
+        else if (/\b(m5|s63|v8)\b/.test(s)) asdArgs.engine = 'm5_v8';
+
+        if (asdArgs.engine && asdArgs.enabled === undefined) asdArgs.enabled = true;
+        if (/\b(lup\s+bup|burble|no\s+bo|pop)\b/.test(s)) {
+            asdArgs.burbles = !/\b(tat|khong)\s+(?:lup\s+bup|burble|no\s+bo)\b/.test(s);
+        }
+        if (/\b(an\s+theo|theo\s+che\s+do\s+lai)\b/.test(s)) {
+            asdArgs.modeFollow = !/\b(tat|khong)\b/.test(s);
+        }
+        const asdVol = /(\d{2,3})\s*%/.exec(s) || /\b(?:am\s+luong|muc)\s*(\d{2,3})\b/.exec(s);
+        if (asdVol) asdArgs.volumePercent = Number(asdVol[1]);
+        if (Object.keys(asdArgs).length === 0) asdArgs.enabled = true;
+        calls.push({ name: 'control_engine_sound', args: asdArgs });
+    } else if (/\b(van\s*bo|van\s*po|mo\s*bo|dong\s*bo|po\s*xe)\b/.test(s)) {
         const mode = /\b(dong|em)\b/.test(s) ? 'close' : (/\bzin|oem\b/.test(s) ? 'oem' : 'open');
         calls.push({ name: 'set_exhaust_flap', args: { mode } });
     }
@@ -348,13 +393,13 @@ function parseOfflineVietnameseIntents(rawText, speakerZone) {
         calls.push({ name: 'control_media', args: { action: 'next' } });
     } else if (/\b(lui\s+bai|bai\s+truoc)\b/.test(s)) {
         calls.push({ name: 'control_media', args: { action: 'previous' } });
-    } else if (/\b(tat\s+tieng|cam\s+tieng|mute)\b/.test(s)) {
+    } else if (!hasEngineSoundKeyword && /\b(tat\s+tieng|cam\s+tieng|mute)\b/.test(s)) {
         calls.push({ name: 'control_media', args: { action: 'mute' } });
-    } else if (/\b(bat\s+tieng|mo\s+tieng|unmute)\b/.test(s)) {
+    } else if (!hasEngineSoundKeyword && /\b(bat\s+tieng|mo\s+tieng|unmute)\b/.test(s)) {
         calls.push({ name: 'control_media', args: { action: 'unmute' } });
     }
     const volM = /\b(?:am\s+luong|volume|loa\s+muc)\s*(\d{1,3})\s*%?/.exec(s);
-    if (volM) {
+    if (volM && !hasEngineSoundKeyword) {
         calls.push({ name: 'control_media', args: { action: 'volume', volumePercent: Number(volM[1]) } });
     }
 
@@ -399,12 +444,12 @@ function buildSystemPrompt(telemetry, speakerZone, ownerName) {
         'PHONG CÁCH: Tự nhiên, lanh lợi, ngắn gọn (tối đa 1-2 câu súc tích để tài xế tập trung lái xe), hiểu tiếng lóng Việt Nam.',
         'NGƯỜI ĐANG NÓI (xác định từ cặp Mic trần 2 vùng): ' + who + '. Nếu họ kêu nóng/lạnh/bật sưởi ghế mà không nói bên nào, ưu tiên chỉnh đúng vùng ghế của người đang nói (' + (speakerZone === 'passenger' ? 'passenger' : 'driver') + ').',
         'TRẠNG THÁI XE HIỆN TẠI:',
-        '- Tốc độ: ' + (t.speedKmh || 0) + ' km/h | Cần số: ' + (t.gear || 'P') + ' | Vòng tua: ' + (t.rpm || 0) + ' rpm',
+        '- Tốc độ: ' + (t.speedKmh || 0) + ' km/h | Cần số: ' + (t.gear || 'P') + ' | Chế độ lái: ' + String(t.driveMode || 'comfort').toUpperCase() + ' | Vòng tua: ' + (t.rpm || 0) + ' rpm',
         '- Nhiệt độ dầu máy: ' + (t.oilTempC || 0) + '°C | Nước làm mát: ' + (t.coolantTempC || 0) + '°C | Bình 12V: ' + (t.battery12v || 12.6) + 'V',
         '- Xăng: ' + (t.fuelPercent != null ? t.fuelPercent : 68) + '% (~' + (t.rangeKm || 420) + ' km)' + (t.odometerKm ? (' | ODO: ' + t.odometerKm + ' km') : ''),
         '- Chốt cửa: ' + (t.doorsLocked !== false ? 'Đang khoá' : 'Đang mở') + ' | Cốp sau: ' + (t.trunkOpen ? 'Đang mở' : 'Đang đóng'),
         '- Điều hoà: Tài ' + (t.climate && t.climate.tempDriverC) + '°C / Phụ ' + (t.climate && t.climate.tempPassengerC) + '°C, gió mức ' + (t.climate && t.climate.fanLevel),
-        '- Đèn nội thất: ' + (t.ambient && t.ambient.name) + ' (' + (t.ambient && t.ambient.brightness) + '%) | Van bô: ' + (t.exhaustMode || 'oem'),
+        '- Đèn nội thất: ' + (t.ambient && t.ambient.name) + ' (' + (t.ambient && t.ambient.brightness) + '%) | Giả lập pô B&W (ASD): ' + (t.asd && t.asd.enabled ? ('ĐANG BẬT (' + (t.asd.engineShort || t.asd.engine) + ', ' + t.asd.volumePercent + '%)') : 'ĐANG TẮT'),
         '- Giới hạn tốc độ VietMap hiện tại: ' + ((t.vietmap && t.vietmap.speedLimitKmh) || 60) + ' km/h',
         'QUY TẮC: Khi người dùng yêu cầu bất kỳ thao tác điều khiển xe nào, BẮT BUỘC gọi đúng tool tương ứng (có thể gọi nhiều tool cùng lúc trong 1 lượt). Nếu nhận đầu vào bằng file âm thanh giọng nói, hãy tự nghe hiểu câu tiếng Việt đó và thực thi luôn.',
     ].join('\n');
@@ -466,6 +511,7 @@ const COMPACT_TOOL_GUIDE = [
     '- control_mirrors(action:"fold|unfold")',
     '- control_media(action:"play|pause|next|previous|mute|unmute|volume|youtube_search_play", query:str, volumePercent:0..85)',
     '- set_exhaust_flap(mode:"open|close|oem")',
+    '- control_engine_sound(enabled:bool, engine:"m5_v8|m3_s58|amg_v8|gt3_flat6|v10_na|iconic_m", volumePercent:15..100, modeFollow:bool, burbles:bool, revDemo:bool)',
     '- control_camera_360(view:"360|front|rear|side|off")',
     '- navigate_to(destination:str)',
     '- control_1cr_valet(action:"start_1cr|stop_1cr|valet_on|valet_off|snap_telegram")',
@@ -849,7 +895,7 @@ async function processAssistantTurn(params) {
 
     // CRITICAL TRUTH GATE: Never let optimistic pre-execution LLM `replyVi` lie when ANY tool failed (`!r.ok`),
     // was blocked by `SafetyGate`, deferred for cold oil, or ran `scan_vehicle_health` with exact live sensor numbers!
-    const mustUseHardwareTruth = results.some((r) => !r.ok || r.blocked || r.deferred || r.tool === 'scan_vehicle_health');
+    const mustUseHardwareTruth = results.some((r) => !r.ok || r.blocked || r.deferred || r.tool === 'scan_vehicle_health' || r.tool === 'control_engine_sound');
     const executedSummaries = results.map((r) => r.summaryVi).filter(Boolean);
 
     let finalReply = aiReply;

@@ -833,6 +833,197 @@ async function runAllTests() {
         await new Promise((r) => optGem.close(r));
     });
 
+    await step('v0.6.0 B&W Active Sound Design (ASD): 6 Engines, Driving-Mode Scaling, Overlay Stream, Mic Mute & HMI UI', async () => {
+        const AsdSynth = require('../tools/bimmer-ai/asd-synth');
+        const Module = require('module');
+        const origLoad = Module._load;
+        Module._load = function (reqId, parent, isMain) {
+            if (reqId === './kit/qr') return { draw: () => 180 };
+            return origLoad.apply(this, [reqId, parent, isMain]);
+        };
+        let UI;
+        try {
+            UI = require('../apps/bimmer_ai/ui');
+        } finally {
+            Module._load = origLoad;
+        }
+
+        const pcmRms = (int16) => {
+            let sum = 0;
+            for (let i = 0; i < int16.length; i++) sum += int16[i] * int16[i];
+            return Math.sqrt(sum / Math.max(1, int16.length));
+        };
+
+        // 1. All 6 engine profiles synthesize clean non-zero PCM audio
+        AsdSynth.ENGINE_ORDER.forEach((engId) => {
+            const dsp = new AsdSynth.AsdDspCore(24000);
+            const cfg = AsdSynth.normalizeAsdConfig({ enabled: true, engine: engId, volumePercent: 80, modeFollow: true, burbles: true });
+            let block = null;
+            for (let b = 0; b < 4; b++) {
+                block = dsp.renderBlock(960, cfg, { rpm: 3200, gear: 'D3', driveMode: 'sport', torqueNm: 190 }, 0);
+            }
+            const rms = pcmRms(block);
+            assert.ok(rms > 800, 'Expected audible RMS for engine ' + engId + ', got ' + rms);
+        });
+
+        // 2. Driving-mode automatic loudness scaling: SPORT+ > SPORT > COMFORT > ECO PRO, and OFF -> 0 RMS
+        const measureModeRms = (driveMode, enabled) => {
+            const dsp = new AsdSynth.AsdDspCore(24000);
+            const cfg = AsdSynth.normalizeAsdConfig({ enabled, engine: 'm5_v8', volumePercent: 80, modeFollow: true, burbles: false });
+            let blk = null;
+            for (let k = 0; k < 5; k++) {
+                blk = dsp.renderBlock(960, cfg, { rpm: 3100, gear: 'D4', driveMode, torqueNm: 175 }, 0);
+            }
+            return pcmRms(blk);
+        };
+        const rmsEco = measureModeRms('eco_pro', true);
+        const rmsComfort = measureModeRms('comfort', true);
+        const rmsSport = measureModeRms('sport', true);
+        const rmsSportPlus = measureModeRms('sport_plus', true);
+        const rmsOff = measureModeRms('sport', false);
+
+        assert.strictEqual(rmsOff, 0);
+        assert.ok(rmsComfort > rmsEco * 1.4, 'Comfort (' + rmsComfort + ') must be louder than Eco Pro (' + rmsEco + ')');
+        assert.ok(rmsSport > rmsComfort * 1.4, 'Sport (' + rmsSport + ') must be louder than Comfort (' + rmsComfort + ')');
+        assert.ok(rmsSportPlus > rmsSport * 1.05, 'Sport+ (' + rmsSportPlus + ') must be louder than Sport (' + rmsSport + ')');
+
+        // Shifting selector to S/M while in Comfort automatically engages Sport exhaust character
+        assert.strictEqual(AsdSynth.resolveEffectiveDriveMode({ driveMode: 'comfort', gear: 'S3' }), 'sport');
+
+        // 3. SP18 FES Driving Mode & Gearbox wire decoders
+        assert.strictEqual(VehicleBus.decodeFesDriveMode('SPORT_DYNAMIC'), 'sport');
+        assert.strictEqual(VehicleBus.decodeFesDriveMode(2), 'sport_plus');
+        assert.strictEqual(VehicleBus.decodeFesDriveMode(4), 'comfort');
+        assert.strictEqual(VehicleBus.decodeFesDriveMode(7), 'eco_pro');
+        assert.strictEqual(VehicleBus.decodeFesDriveMode(10), 'adaptive');
+        assert.strictEqual(VehicleBus.decodeSp18Gear('DataPowerTrain2', { statusGearSelectionDrive: 7 }, 'D'), 'D3');
+        assert.strictEqual(VehicleBus.decodeSp18Gear('statusGearboxDrive', { statusActualStageDrive: 4, statusActualGearDrive: 'G5' }, 'D'), 'D5');
+
+        // 4. End-to-End Daemon + Mock SmartXbar `--play-loop` Stream + Mic Mute + Voice NLU
+        const tmpAsd = fs.mkdtempSync(path.join(os.tmpdir(), 'bimmer-ai-asd-'));
+        const fakeSmartxDir = path.join(tmpAsd, 'smartx');
+        fs.mkdirSync(fakeSmartxDir);
+        fs.writeFileSync(path.join(fakeSmartxDir, 'smartx_HAD_Speech_CF_24_MONO_p'), '');
+
+        const byteCounterFile = path.join(tmpAsd, 'pcm_bytes.txt');
+        const mockPlayHelper = path.join(tmpAsd, 'mock_play.js');
+        fs.writeFileSync(mockPlayHelper, [
+            'const fs = require("fs");',
+            'let total = 0;',
+            'console.log(JSON.stringify({ event: "play_ready", device: process.argv[3] }));',
+            'process.stdin.on("data", (c) => {',
+            '  total += c.length;',
+            '  fs.writeFileSync(' + JSON.stringify(byteCounterFile) + ', String(total));',
+            '});',
+            'process.on("SIGTERM", () => process.exit(0));',
+        ].join('\n'));
+
+        const routedCalls = [];
+        const dm = new BimmerAiDaemon({
+            run: path.join(tmpAsd, 'run'),
+            state: path.join(tmpAsd, 'state'),
+            oap: path.join(tmpAsd, 'oap'),
+            host: '127.0.0.1',
+            port: 0,
+            simMode: true,
+            noNft: true,
+            quiet: true,
+            asdOpts: {
+                mguPython: process.execPath,
+                smartxHelper: mockPlayHelper,
+                smartxDir: fakeSmartxDir,
+                connectAmRoute: async (r) => { routedCalls.push(r); return { connId: 77, created: true }; },
+            },
+        });
+        await dm.start();
+        dm.saveSettings({ ttsEnabled: false });
+        dm.vehicle.patchTelemetry({ rpm: 2400, gear: 'D3', speedKmh: 48, driveMode: 'sport', media: { playing: true, muted: false, volumePercent: 40 } });
+
+        // Turn ON Porsche GT3 engine sound via natural Vietnamese voice command
+        const onTurn = await dm.handleVoiceOrTextTurn({
+            text: 'Bật giả lập tiếng pô Porsche GT3 âm lượng 85%',
+            speakerZone: 'driver',
+        });
+        assert.strictEqual(onTurn.actions.length, 1);
+        assert.strictEqual(onTurn.actions[0].tool, 'control_engine_sound');
+        assert.strictEqual(dm.asd.config.enabled, true);
+        assert.strictEqual(dm.asd.config.engine, 'gt3_flat6');
+        assert.strictEqual(dm.asd.config.volumePercent, 85);
+        assert.ok(routedCalls.length >= 1 && routedCalls[0].sourceID === 292 && routedCalls[0].sinkID === 1);
+
+        await new Promise((r) => setTimeout(r, 180));
+        assert.strictEqual(dm.asd.getStatus().streaming, true);
+        const streamedBytes = Number(fs.readFileSync(byteCounterFile, 'utf8') || '0');
+        assert.ok(streamedBytes >= 1920, 'Expected live PCM bytes streamed to B&W overlay sink, got ' + streamedBytes);
+
+        // Entering ceiling-mic `listening` state MUST immediately tear down B&W speaker stream!
+        dm.assistantState = 'listening';
+        await dm.asd.syncLifecycle();
+        assert.strictEqual(dm.asd.getStatus().streaming, false);
+        dm.assistantState = 'idle';
+        await dm.asd.syncLifecycle();
+        assert.strictEqual(dm.asd.getStatus().streaming, true);
+
+        // "Tắt tiếng pô" MUST turn off ASD cleanly WITHOUT muting CarPlay/Media!
+        const offTurn = await dm.handleVoiceOrTextTurn({
+            text: 'Tắt tiếng pô',
+            speakerZone: 'driver',
+        });
+        assert.strictEqual(offTurn.actions.length, 1);
+        assert.strictEqual(offTurn.actions[0].tool, 'control_engine_sound');
+        assert.strictEqual(dm.asd.config.enabled, false);
+        assert.strictEqual(dm.asd.getStatus().streaming, false);
+        assert.strictEqual(dm.vehicle.state.media.muted, false);
+
+        // Settings file persisted `gt3_flat6` + `85%`
+        const savedDisk = JSON.parse(fs.readFileSync(path.join(tmpAsd, 'state', 'settings.json'), 'utf8'));
+        assert.strictEqual(savedDisk.asd.engine, 'gt3_flat6');
+        assert.strictEqual(savedDisk.asd.volumePercent, 85);
+
+        // 5. HMI `ui.js` ASD Cockpit screen registers all 6 engine cards + Power + Rev Demo + ModeFollow + Burbles
+        const asdTargets = {};
+        const mockCv = {
+            clear: () => {},
+            roundRect: () => {},
+            strokeRoundRect: () => {},
+            fillRect: () => {},
+            circle: () => {},
+            text: () => {},
+            textWidth: (s) => String(s || '').length * 8,
+            target: (_x, _y, _w, _h, fn, key) => { asdTargets[key] = fn; },
+        };
+        const mockG = {
+            TOP: 64,
+            MARGIN: 24,
+            withAlpha: (c) => c,
+            frame: () => {},
+            stripes: () => {},
+            button: (_cv, _t, _x, _y, _w, _h, _lbl, fn, opts) => { if (opts && opts.key) asdTargets[opts.key] = fn; },
+            pageBottom: () => 500,
+        };
+        let pickedEng = '';
+        UI.draw(mockCv, mockG, { bg: '#000', text: '#fff', dim: '#888' }, {
+            viewMode: 'asd',
+            asd: dm.asd.getStatus(),
+            telemetry: dm.vehicle.state,
+        }, {
+            asdSelectEngine: (id) => { pickedEng = id; },
+            asdToggle: () => {},
+            asdRevDemo: () => {},
+            asdToggleModeFollow: () => {},
+            asdToggleBurbles: () => {},
+        });
+        AsdSynth.ENGINE_ORDER.forEach((id) => {
+            assert.strictEqual(typeof asdTargets['asdEng_' + id], 'function');
+        });
+        assert.strictEqual(typeof asdTargets.asdBtnPower, 'function');
+        assert.strictEqual(typeof asdTargets.asdBtnRev, 'function');
+        asdTargets.asdEng_amg_v8();
+        assert.strictEqual(pickedEng, 'amg_v8');
+
+        await dm.stop();
+    });
+
     console.log('\nALL ' + passed + ' TEST SUITES PASSED!');
 }
 

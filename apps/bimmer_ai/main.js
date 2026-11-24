@@ -1,13 +1,12 @@
 'use strict';
 /**
- * main.js - iDrive 7 60fps App Entry Point for Bimmer AI (`apps/bimmer_ai`, `v0.3.3`).
+ * main.js - iDrive 7 60fps App Entry Point for Bimmer AI (`apps/bimmer_ai`, `v0.6.0`).
  *
  * Key architecture:
  *   1. Instant `<1ms` Unix domain socket IPC (`/run/bimmer-ai/ctl.sock`, `0666`) with automatic fallback
  *      to `/run/bimmer-ai/app/command.json` and `<dataDir>/command.json`.
- *   2. Immediate `<16ms` optimistic visual feedback on screen (`ĐANG NGHE MIC TRẦN…` / `Đang xử lý…`)
- *      the exact frame the driver taps `Nói lệnh AI`, the Voice Orb, a card, or a header tab.
- *   3. Full support for touch + iDrive rotary controller + header tabs (`ctx.onTab`) + layout changes (`ctx.onLayout`).
+ *   2. Immediate `<16ms` optimistic visual feedback on screen (`ĐANG NGHE MIC TRẦN…`, `Pô B&W (ASD)` selection, etc.).
+ *   3. Full support for touch + iDrive rotary controller + 3 header tabs (`Trợ lý Bimmer AI`, `Pô B&W (ASD)`, `Quyền an toàn`).
  *
  * Node 8 compatible.
  */
@@ -22,11 +21,19 @@ const UI = require('./ui');
 const RUN = process.env.BA_RUN || '/run/bimmer-ai';
 const STALE_MS = 8000;
 const SCENES = ['chill đêm', 'hạ nhiệt', 'rạp phim', 'thể thao', 'mặc định'];
+const SHORT_NAMES = {
+    m5_v8: 'M5 V8 S63',
+    m3_s58: 'M3/M4 I6 S58',
+    amg_v8: 'AMG V8 4.0',
+    gt3_flat6: '911 GT3 F6',
+    v10_na: 'Supercar V10',
+    iconic_m: 'IconicSounds M',
+};
 
 mgu.run({
     async start(ctx) {
         const { ui, log } = ctx;
-        const version = (ctx.spec && ctx.spec.version) ? ('Bản ' + ctx.spec.version) : 'Bản 0.5.2';
+        const version = (ctx.spec && ctx.spec.version) ? ('Bản ' + ctx.spec.version) : 'Bản 0.6.0';
         let status = null, readAt = 0, cmdId = Date.now();
         let viewMode = 'main', sceneIdx = 0, animTick = 0;
 
@@ -37,6 +44,8 @@ mgu.run({
         let pendingTurn = null;
         let optimisticHandsFree = null;
         let optimisticHandsFreeUntil = 0;
+        let optimisticAsd = null;
+        let optimisticAsdUntil = 0;
 
         const localGuards = {
             locksAndTrunk: true,
@@ -46,14 +55,26 @@ mgu.run({
             mediaAndYoutube: true,
             exhaustAndDiag: true,
         };
+        const localAsd = {
+            enabled: false,
+            engine: 'm5_v8',
+            engineShort: 'M5 V8 S63',
+            volumePercent: 75,
+            modeFollow: true,
+            burbles: true,
+            effectiveMode: 'comfort',
+            effectiveModeLabel: 'COMFORT',
+            modeGainPercent: 65,
+            revDemoActive: false,
+        };
         let localTurn = {
             speakerZone: 'driver',
-            transcript: 'Chế độ chill đêm rồi mở nhạc Lofi trên YouTube đi',
-            replyVi: 'Đã bật kịch bản Chill đêm: đèn Tím hoàng hôn 50%, điều hoà 24°C và phát nhạc Lofi trên YouTube TV.',
+            transcript: 'Bật giả lập tiếng pô BMW M5 V8',
+            replyVi: 'Sẵn sàng! Chạm tab "Pô B&W (ASD)" hoặc đọc lệnh để bật/tắt 6 tiếng động cơ ăn theo chế độ lái.',
         };
 
         function readStatus(now) {
-            if (now - readAt < 250) return;
+            if (now - readAt < 220) return;
             readAt = now;
             let s = null;
             try { s = JSON.parse(fs.readFileSync(path.join(RUN, 'status.json'), 'utf8')); } catch (e) { s = null; }
@@ -70,6 +91,22 @@ mgu.run({
                     pendingState = '';
                 }
             }
+        }
+
+        function currentAsdState() {
+            const base = (status && status.asd) || localAsd;
+            return Object.assign({}, base, optimisticAsd || {});
+        }
+
+        function patchOptimisticAsd(patch, holdMs) {
+            const cur = currentAsdState();
+            const next = Object.assign({}, cur, patch || {});
+            if (next.engine && SHORT_NAMES[next.engine]) {
+                next.engineShort = SHORT_NAMES[next.engine];
+            }
+            Object.assign(localAsd, next);
+            optimisticAsd = next;
+            optimisticAsdUntil = Date.now() + (holdMs || 1800);
         }
 
         function setOptimistic(stateName, userText, aiText, holdMs) {
@@ -106,7 +143,6 @@ mgu.run({
             const payload = JSON.stringify(msgObj);
             const sockPath = path.join(RUN, 'ctl.sock');
 
-            // 1. Primary `<1ms` Unix socket dispatch; only write fallback file if socket is absent or errors
             if (fs.existsSync(sockPath)) {
                 try {
                     let sent = false;
@@ -150,6 +186,51 @@ mgu.run({
                         replyVi: 'Xe sạch lỗi! Bình 12V đạt 12.6V, dầu máy 86°C, 4 lốp cân đều 2.4 bar.',
                     };
                 }
+                return repaint();
+            },
+            openAsd: () => {
+                viewMode = viewMode === 'asd' ? 'main' : 'asd';
+                return repaint();
+            },
+            asdToggle: () => {
+                const cur = currentAsdState();
+                patchOptimisticAsd({ enabled: !cur.enabled }, 2000);
+                send('asd_set', { enabled: !cur.enabled });
+                return repaint();
+            },
+            asdSelectEngine: (engineId) => {
+                const cur = currentAsdState();
+                const sameAndOn = (cur.engine === engineId && cur.enabled);
+                patchOptimisticAsd({
+                    enabled: true,
+                    engine: engineId,
+                    revDemoActive: sameAndOn ? true : cur.revDemoActive,
+                }, sameAndOn ? 3200 : 2000);
+                send('asd_set', sameAndOn ? { enabled: true, engine: engineId, revDemo: true } : { enabled: true, engine: engineId });
+                return repaint();
+            },
+            asdRevDemo: () => {
+                patchOptimisticAsd({ enabled: true, revDemoActive: true }, 3800);
+                send('asd_rev_demo', {});
+                return repaint();
+            },
+            asdSetVolume: (vol) => {
+                patchOptimisticAsd({ volumePercent: vol }, 2000);
+                send('asd_set', { volumePercent: vol });
+                return repaint();
+            },
+            asdToggleModeFollow: () => {
+                const cur = currentAsdState();
+                const nextVal = !(cur.modeFollow !== false);
+                patchOptimisticAsd({ modeFollow: nextVal }, 2000);
+                send('asd_set', { modeFollow: nextVal });
+                return repaint();
+            },
+            asdToggleBurbles: () => {
+                const cur = currentAsdState();
+                const nextVal = !(cur.burbles !== false);
+                patchOptimisticAsd({ burbles: nextVal }, 2000);
+                send('asd_set', { burbles: nextVal });
                 return repaint();
             },
             cycleScene: () => {
@@ -223,6 +304,10 @@ mgu.run({
                 optimisticHandsFreeUntil = 0;
                 optimisticHandsFree = null;
             }
+            if (optimisticAsdUntil > 0 && now > optimisticAsdUntil) {
+                optimisticAsdUntil = 0;
+                optimisticAsd = null;
+            }
             animTick++;
             const s = status;
             const hostOf = (u) => String(u || '').replace(/^http:\/\//, '').replace(/\/\?pin=\d+$/, '');
@@ -244,9 +329,12 @@ mgu.run({
                 activeSpeakerZone: s ? s.activeSpeakerZone : 'driver',
                 micLevels: (s && s.micLevels) || { leftDb: -32, rightDb: -54 },
                 settings: mergedSettings,
+                asd: currentAsdState(),
                 telemetry: (s && s.telemetry) || {
                     speedKmh: 0,
+                    rpm: 820,
                     gear: 'P',
+                    driveMode: 'comfort',
                     oilTempC: 86,
                     battery12v: 12.6,
                     doorsLocked: true,
@@ -273,18 +361,19 @@ mgu.run({
         if (ctx.onLayout) ctx.onLayout(repaint);
         if (ctx.onTab) {
             ctx.onTab((idx) => {
-                viewMode = idx === 1 ? 'guards' : 'main';
+                viewMode = idx === 1 ? 'asd' : (idx === 2 ? 'guards' : 'main');
                 return repaint();
             });
         }
 
-        ['BTN_MIC', 'BTN_SCENE', 'BTN_HEALTH', 'BTN_GUARDS'].forEach((b) => { if (ctx.hideButton) ctx.hideButton(b); });
+        ['BTN_MIC', 'BTN_ASD', 'BTN_SCENE', 'BTN_HEALTH', 'BTN_GUARDS'].forEach((b) => { if (ctx.hideButton) ctx.hideButton(b); });
         ui.onClick('BTN_MIC', acts.triggerMic);
+        ui.onClick('BTN_ASD', acts.openAsd);
         ui.onClick('BTN_SCENE', acts.cycleScene);
         ui.onClick('BTN_HEALTH', acts.healthCheck);
         ui.onClick('BTN_GUARDS', acts.toggleView);
 
         await render();
-        log.info('bimmer_ai v0.3.3 ready');
+        log.info('bimmer_ai v0.6.0 ready');
     },
 });

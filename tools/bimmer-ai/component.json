@@ -1,9 +1,9 @@
 {
   "id": "bimmer-ai",
   "kind": "tool",
-  "version": "0.5.2",
-  "title": "Trợ lý AI Tiếng Việt (Bimmer AI)",
-  "description": "Bộ não AI Tiếng Việt chạy trực tiếp trên đầu BMW MGU (iDrive 7): thu giọng nói từ cặp Mic trần zin 2 vùng qua Intel SmartXbar / libasound & nút Mic vô-lăng, kết hợp xử lý lệnh tức thời Offline (<5ms) và Gemini Multimodal/Function Calling qua mgu-uplink. Điều khiển chuẩn SOME/IP điều hoà, đèn nội thất RGB (iteriodev-comfort & IpaInteriorLight), cửa kính, rèm, cốp, ghế, YouTube TV (RideTube), đề nổ 1CR (Bimmer-Link), VietMap và chốt chặn an toàn cứng.",
+  "version": "0.6.0",
+  "title": "Trợ lý AI Tiếng Việt & Pô B&W ASD (Bimmer AI)",
+  "description": "Bộ não AI Tiếng Việt & Bộ tổng hợp Âm thanh Ống xả Bowers & Wilkins (6 động cơ ăn theo chế độ lái Sport/Comfort/Eco Pro) chạy trực tiếp trên đầu BMW MGU (iDrive 7): thu giọng nói từ Mic trần zin 2 vùng & nút vô-lăng, xử lý Offline (<5ms) + Gemini Multimodal, phát pô B&W kênh Overlay không ngắt nhạc CarPlay, điều khiển điều hoà, đèn RGB, kính, rèm, ghế, YouTube TV và đọc lỗi xe.",
   "license": "GPL-3.0-or-later",
   "mguHmi": [
     "ID7"
@@ -28,6 +28,10 @@
     },
     {
       "path": "audio-io.js",
+      "mode": "0644"
+    },
+    {
+      "path": "asd-synth.js",
       "mode": "0644"
     },
     {

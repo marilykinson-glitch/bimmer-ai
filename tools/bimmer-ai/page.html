@@ -133,6 +133,20 @@
   }
   .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); }
   .dot.off { background: var(--red); }
+
+  .asd-top { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 12px; }
+  .btn-asd-on { background: linear-gradient(135deg, #f97316, #ea580c); color: #fff; }
+  .btn-asd-off { background: var(--card2); color: var(--text); border: 1px solid var(--border); }
+  .btn-rev { background: rgba(249, 115, 22, 0.16); color: #fb923c; border: 1px solid rgba(249, 115, 22, 0.55); }
+  .eng-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin-bottom: 12px; }
+  @media (max-width: 520px) { .eng-grid { grid-template-columns: 1fr; } }
+  .eng-card {
+    padding: 10px 12px; border-radius: 12px; background: var(--card2); border: 1px solid var(--border);
+    cursor: pointer; transition: all 0.15s;
+  }
+  .eng-card.sel { border-color: #f97316; background: rgba(249, 115, 22, 0.14); box-shadow: 0 0 14px rgba(249, 115, 22, 0.22); }
+  .eng-title { font-size: 13.5px; font-weight: 700; color: #fff; display: flex; justify-content: space-between; gap: 6px; }
+  .eng-badge { font-size: 10.5px; color: #fb923c; font-weight: 800; }
 </style>
 </head>
 <body>
@@ -171,13 +185,13 @@
         </div>
 
         <div class="chips">
+          <span class="chip" onclick="quickAsk('Bật giả lập tiếng pô BMW M5 V8', 'driver')">🔊 Bật Pô BMW M5 V8</span>
+          <span class="chip" onclick="quickAsk('Đổi tiếng pô sang Porsche GT3 rồi nẹt pô thử', 'driver')">🏎️ Pô Porsche GT3 + Nẹt thử</span>
+          <span class="chip" onclick="quickAsk('Tắt tiếng pô giả lập', 'driver')">🔇 Tắt Pô B&W</span>
           <span class="chip" onclick="quickAsk('Đổi đèn viền sang màu tím độ sáng 90%', 'driver')">🟣 Đổi đèn Tím 90%</span>
           <span class="chip" onclick="quickAsk('Chỉnh điều hoà 22 độ mức gió 3', 'driver')">❄️ Điều hoà 22°C + Gió 3</span>
           <span class="chip" onclick="quickAsk('Lạnh quá tăng nhiệt độ với bật sưởi ghế cho em', 'passenger')">🔥 [Ghế Phụ] Tăng nhiệt + Sưởi</span>
-          <span class="chip" onclick="quickAsk('Bật massage ghế tài và làm mát ghế mức 2', 'driver')">💺 Massage + Mát ghế</span>
           <span class="chip" onclick="quickAsk('Âm lượng 30% rồi mở nhạc Lofi trên YouTube đi', 'driver')">🎵 Loa 30% + YouTube Lofi</span>
-          <span class="chip" onclick="quickAsk('Hé cửa sổ trời ra', 'driver')">🌤️ Hé cửa sổ trời</span>
-          <span class="chip" onclick="quickAsk('Hạ kính tài 20%', 'driver')">🪟 Hạ kính tài 20%</span>
           <span class="chip" onclick="quickAsk('Khám sức khoẻ xe xem bình 12V với xăng dầu ổn không', 'driver')">🩺 Khám sức khoẻ xe</span>
         </div>
 
@@ -185,6 +199,32 @@
           <div class="reply-user" id="lastTranscript">[GHẾ TÀI] Chưa có câu lệnh mới</div>
           <div class="reply-ai" id="lastReply">Sẵn sàng nhận lệnh tiếng Việt!</div>
           <div class="action-tags" id="actionTags"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2 style="color:#fb923c">🔊 Giả lập Âm thanh Ống xả Bowers &amp; Wilkins (B&amp;W ASD)</h2>
+        <div class="asd-top">
+          <div style="display:flex;gap:8px;flex-wrap:wrap">
+            <button class="btn btn-asd-off" id="btnAsdPower" onclick="toggleAsdPower()">BẬT PÔ B&amp;W</button>
+            <button class="btn btn-rev" onclick="sendAsd({ revDemo: true })">🔥 Nẹt Pô Thử</button>
+          </div>
+          <span class="badge info" id="asdModeBadge">COMFORT · 65%</span>
+        </div>
+        <div class="eng-grid" id="asdEngineGrid"></div>
+        <div class="slider-row">
+          <span style="width:148px">Âm lượng pô: <b id="lblAsdVol">75</b>%</span>
+          <input type="range" id="asdVolSlider" min="15" max="100" step="5" value="75" oninput="document.getElementById('lblAsdVol').textContent=this.value" onchange="sendAsd({ volumePercent: Number(this.value) })">
+        </div>
+        <div style="display:flex;flex-wrap:wrap;gap:14px;font-size:13px;margin-top:4px">
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="chkAsdModeFollow" checked onchange="sendAsd({ modeFollow: this.checked })">
+            <span>Ăn theo chế độ lái (<b>Sport</b> tự to &amp; gắt hơn Comfort)</span>
+          </label>
+          <label style="display:flex;align-items:center;gap:6px;cursor:pointer">
+            <input type="checkbox" id="chkAsdBurbles" checked onchange="sendAsd({ burbles: this.checked })">
+            <span>Nổ lụp bụp khi nhả ga (Burbles)</span>
+          </label>
         </div>
       </div>
 
@@ -209,9 +249,20 @@
           <select id="simGear" onchange="pushSim()">
             <option value="P">P (Đỗ xe)</option>
             <option value="D">D (Đang tiến)</option>
+            <option value="S3">S3 (Số thể thao)</option>
             <option value="R">R (Số lùi)</option>
             <option value="N">N (Mo)</option>
           </select>
+          <span>Chế độ lái:</span>
+          <select id="simDriveMode" onchange="pushSim()">
+            <option value="eco_pro">ECO PRO (Êm 35%)</option>
+            <option value="comfort" selected>COMFORT (Vừa 65%)</option>
+            <option value="adaptive">ADAPTIVE (72%)</option>
+            <option value="sport">SPORT (To gắt 118%)</option>
+            <option value="sport_plus">SPORT+ (Cực gắt 138%)</option>
+          </select>
+        </div>
+        <div class="slider-row">
           <span>Cuộc gọi ĐT:</span>
           <select id="simCall" onchange="pushSim()">
             <option value="0">Không gọi</option>
@@ -283,8 +334,19 @@
     climateAndSeats: 'Điều hoà & Ghế',
     ambientAndLights: 'Đèn viền RGB',
     mediaAndYoutube: 'Nhạc & YouTube',
-    exhaustAndDiag: 'Van bô & Khám xe'
+    exhaustAndDiag: 'Pô B&W, Van bô & Khám xe'
   };
+
+  function sendAsd(patch) {
+    api('/api/asd', 'POST', patch || {}).then(function(r) {
+      if (r && r.state) renderState(r.state);
+    });
+  }
+
+  function toggleAsdPower() {
+    var cur = !!(latestState && latestState.asd && latestState.asd.enabled);
+    sendAsd({ enabled: !cur });
+  }
 
   function api(path, method, body) {
     var sep = path.indexOf('?') >= 0 ? '&' : '?';
@@ -395,6 +457,7 @@
 
   function pushSim() {
     var gear = document.getElementById('simGear').value;
+    var drvMode = document.getElementById('simDriveMode').value;
     var spd = Number(document.getElementById('simSpeed').value);
     if (spd > 0 && gear === 'P') { gear = 'D'; document.getElementById('simGear').value = 'D'; }
     var oil = Number(document.getElementById('simOil').value);
@@ -402,8 +465,9 @@
     var call = document.getElementById('simCall').value === '1';
     api('/api/sim/telemetry', 'POST', {
       gear: gear,
+      driveMode: drvMode,
       speedKmh: spd,
-      rpm: spd > 0 ? Math.min(6200, 900 + spd * 32) : (gear === 'P' ? 0 : 750),
+      rpm: spd > 0 ? Math.min(6200, 900 + spd * 32) : (gear === 'P' ? 0 : 780),
       oilTempC: oil,
       callActive: call,
       vietmap: { speedLimitKmh: vm, cameraAheadM: spd > vm ? 300 : 0 }
@@ -513,9 +577,44 @@
       'Kính T:' + t.windows.fl + '% P:' + t.windows.fr + '% · Rèm ' + (t.blindsOpen ? 'Mở' : 'Kéo') + ' · Trời ' + t.sunroof;
     document.getElementById('stMedia').textContent =
       (m.playing ? ('▶ ' + m.title) : '⏸ Đang dừng') + ' (' + m.source + ' · ' + (m.muted ? 'Mute' : (m.volumePercent + '%')) + ')';
+    var asd = s.asd || { enabled: false, engine: 'm5_v8', engineShort: 'M5 V8 S63', volumePercent: 75, modeFollow: true, burbles: true, effectiveModeLabel: 'COMFORT', modeGainPercent: 65 };
+    var pwrBtn = document.getElementById('btnAsdPower');
+    if (pwrBtn) {
+      pwrBtn.className = 'btn ' + (asd.enabled ? 'btn-asd-on' : 'btn-asd-off');
+      pwrBtn.textContent = asd.enabled ? ('🟢 ĐANG BẬT: ' + (asd.engineShort || 'PÔ B&W') + ' (Bấm để TẮT)') : '⚪ PÔ B&W ĐANG TẮT (Bấm để BẬT)';
+    }
+    var asdBadge = document.getElementById('asdModeBadge');
+    if (asdBadge) {
+      asdBadge.textContent = (asd.modeFollow ? ((asd.effectiveModeLabel || 'COMFORT') + ' · ' + (asd.modeGainPercent || 65) + '%') : 'CỐ ĐỊNH 118%');
+      asdBadge.className = 'badge ' + ((asd.modeGainPercent || 65) >= 100 ? 'warn' : 'info');
+    }
+    var engList = s.asdEngines || [
+      { id: 'm5_v8', name: 'BMW M5 V8 4.4L Twin-Turbo', badge: 'V8 BITURBO' },
+      { id: 'm3_s58', name: 'BMW M3/M4 G80 I6 3.0L (S58)', badge: 'I6 M-POWER' },
+      { id: 'amg_v8', name: 'AMG C63/GT 4.0L V8 BiTurbo', badge: 'AMG V8' },
+      { id: 'gt3_flat6', name: 'Porsche 911 GT3 4.0L Boxer-6', badge: 'GT3 BOXER' },
+      { id: 'v10_na', name: 'Supercar 5.2L V10 NA', badge: 'V10 NA' },
+      { id: 'iconic_m', name: 'BMW IconicSounds M', badge: 'ICONIC M' }
+    ];
+    var egHtml = '';
+    engList.forEach(function(item) {
+      var isSel = asd.engine === item.id;
+      egHtml += '<div class="eng-card' + (isSel ? ' sel' : '') + '" onclick="sendAsd({ enabled: true, engine: \'' + item.id + '\' })">' +
+        '<div class="eng-title"><span>' + item.name + '</span><span class="eng-badge">' + (isSel && asd.enabled ? '● ĐANG PHÁT' : item.badge) + '</span></div>' +
+        '</div>';
+    });
+    var egEl = document.getElementById('asdEngineGrid');
+    if (egEl) egEl.innerHTML = egHtml;
+    if (document.activeElement !== document.getElementById('asdVolSlider')) {
+      document.getElementById('asdVolSlider').value = asd.volumePercent || 75;
+      document.getElementById('lblAsdVol').textContent = asd.volumePercent || 75;
+    }
+    document.getElementById('chkAsdModeFollow').checked = asd.modeFollow !== false;
+    document.getElementById('chkAsdBurbles').checked = asd.burbles !== false;
+
     document.getElementById('stExhaust').textContent =
-      'Bô: ' + t.exhaustMode.toUpperCase() + (s.deferredWatches && s.deferredWatches.length ? ' (Chờ 75°C)' : '') +
-      ' · Cam: ' + t.cameraView.toUpperCase() + (t.climate1crActive ? ' · 1CR NỔ' : '');
+      'Pô B&W: ' + (asd.enabled ? (asd.engineShort + ' (' + (asd.effectiveModeLabel || 'COMFORT') + ')') : 'TẮT') +
+      ' · Van: ' + t.exhaustMode.toUpperCase() + (t.climate1crActive ? ' · 1CR NỔ' : '');
 
     var gg = '';
     Object.keys(GUARD_LABELS).forEach(function(k) {
