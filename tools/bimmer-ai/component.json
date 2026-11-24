@@ -1,7 +1,7 @@
 {
   "id": "bimmer-ai",
   "kind": "tool",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "title": "Trợ lý AI Tiếng Việt (Bimmer AI)",
   "description": "Bộ não AI Tiếng Việt chạy trực tiếp trên đầu BMW MGU (iDrive 7): thu giọng nói từ cặp Mic trần zin 2 vùng qua Intel SmartXbar / libasound & nút Mic vô-lăng, kết hợp xử lý lệnh tức thời Offline (<5ms) và Gemini Multimodal/Function Calling qua mgu-uplink. Điều khiển chuẩn SOME/IP điều hoà, đèn nội thất RGB (iteriodev-comfort & IpaInteriorLight), cửa kính, rèm, cốp, ghế, YouTube TV (RideTube), đề nổ 1CR (Bimmer-Link), VietMap và chốt chặn an toàn cứng.",
   "license": "GPL-3.0-or-later",

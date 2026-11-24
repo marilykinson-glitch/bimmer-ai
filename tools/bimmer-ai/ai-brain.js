@@ -439,13 +439,27 @@ function extractWakeCommand(rawText) {
     return { matched: true, wakeOnly: false, remainder: stripped || remNorm };
 }
 
+const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+const GEMINI_FALLBACK_MODELS = [
+    'gemini-3.5-flash-lite',
+    'gemini-3-flash-preview',
+    'gemini-3.1-flash-lite',
+    'gemini-3.7-flash',
+    'gemini-3.8-flash',
+    'gemini-flash-lite-latest',
+    'gemini-flash-latest',
+];
+let lastHealthyGeminiModel = '';
+const retiredGeminiModels = {};
+
 /**
- * Call Gemini `generateContent` with Multimodal Audio/Text + Function Declarations over `mgu-uplink`.
+ * Call Gemini `generateContent` with Multimodal Audio/Text + Function Declarations over `mgu-uplink`,
+ * including automatic failover across `GEMINI_FALLBACK_MODELS` on 404 (retired model), 429, 503 (high demand), or timeout.
  */
 async function callGeminiApi(opts) {
     const apiKey = String(opts.apiKey || '').trim();
     if (!apiKey) throw new Error('Chưa nhập Gemini API Key');
-    const model = String(opts.model || 'gemini-2.5-flash').trim();
+    const requestedModel = String(opts.model || DEFAULT_GEMINI_MODEL).trim() || DEFAULT_GEMINI_MODEL;
     const sysText = buildSystemPrompt(opts.telemetry, opts.speakerZone, opts.ownerName);
     const wakeMode = !!opts.wakeMode;
 
@@ -486,39 +500,78 @@ async function callGeminiApi(opts) {
     });
     contents.push({ role: 'user', parts: userParts });
 
-    const genCfg = {
-        temperature: 0.3,
-        maxOutputTokens: 1024,
+    // Build ordered candidate models: requested model first (unless 404-retired), then last healthy, then fallback cascade
+    const modelQueue = [];
+    const pushModel = (m) => {
+        if (m && !retiredGeminiModels[m] && modelQueue.indexOf(m) < 0) modelQueue.push(m);
     };
-    if (/^gemini-2\.5/i.test(model)) {
-        genCfg.thinkingConfig = { thinkingBudget: 0 };
+    pushModel(requestedModel);
+    if (lastHealthyGeminiModel) pushModel(lastHealthyGeminiModel);
+    GEMINI_FALLBACK_MODELS.forEach(pushModel);
+    if (!modelQueue.length) modelQueue.push(DEFAULT_GEMINI_MODEL);
+
+    let res = null;
+    let activeModel = requestedModel;
+    let lastErrMsg = '';
+
+    for (let mi = 0; mi < modelQueue.length; mi++) {
+        const candModel = modelQueue[mi];
+        const genCfg = {
+            temperature: 0.25,
+            maxOutputTokens: 1536,
+        };
+        if (/^gemini-2\.5/i.test(candModel)) {
+            genCfg.thinkingConfig = { thinkingBudget: 0 };
+        }
+
+        const bodyObj = {
+            systemInstruction: { parts: [{ text: sysText }] },
+            contents,
+            tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
+            generationConfig: genCfg,
+        };
+
+        const apiPath = '/v1beta/models/' + encodeURIComponent(candModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
+        try {
+            const attempt = await Up.request(opts.uplinkOpts, {
+                host: 'generativelanguage.googleapis.com',
+                path: apiPath,
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(bodyObj),
+                timeoutMs: 11500,
+            });
+            if (attempt && attempt.status === 200) {
+                res = attempt;
+                activeModel = candModel;
+                lastHealthyGeminiModel = candModel;
+                break;
+            }
+            const st = attempt ? attempt.status : 0;
+            if (st === 404) retiredGeminiModels[candModel] = true;
+            let detail = attempt ? attempt.body.slice(0, 180) : 'empty';
+            try {
+                const j = JSON.parse(attempt.body);
+                if (j && j.error && j.error.message) detail = j.error.message;
+            } catch (e) {}
+            lastErrMsg = 'Gemini HTTP ' + st + ' (' + candModel + '): ' + detail;
+            // Hard auth error (invalid API key 400/401/403): stop immediately rather than cycling models
+            if ((st === 400 && /API key not valid|API_KEY_INVALID/i.test(detail)) || st === 401 || st === 403) {
+                throw new Error(lastErrMsg);
+            }
+            // Retryable model error (404 retired model, 429 quota, 500/502/503/504 demand spike): try next model!
+        } catch (err) {
+            if (/API key not valid|API_KEY_INVALID|HTTP 401|HTTP 403/i.test(err.message)) {
+                throw err;
+            }
+            lastErrMsg = err.message + ' (' + candModel + ')';
+        }
     }
-
-    const bodyObj = {
-        systemInstruction: { parts: [{ text: sysText }] },
-        contents,
-        tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
-        generationConfig: genCfg,
-    };
-
-    const apiPath = '/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey);
-    const res = await Up.request(opts.uplinkOpts, {
-        host: 'generativelanguage.googleapis.com',
-        path: apiPath,
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(bodyObj),
-        timeoutMs: 18000,
-    });
 
     if (!res || res.status !== 200) {
-        let detail = res ? res.body.slice(0, 180) : 'empty';
-        try {
-            const j = JSON.parse(res.body);
-            if (j && j.error && j.error.message) detail = j.error.message;
-        } catch (e) {}
-        throw new Error('Gemini HTTP ' + (res ? res.status : 0) + ': ' + detail);
+        throw new Error(lastErrMsg || 'Không kết nối được máy chủ Gemini');
     }
+    const model = activeModel;
 
     const parsed = JSON.parse(res.body);
     const cand = parsed && parsed.candidates && parsed.candidates[0];

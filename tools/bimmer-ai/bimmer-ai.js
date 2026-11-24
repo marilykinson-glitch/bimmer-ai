@@ -28,7 +28,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.4.2';
+const VERSION = '0.4.3';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -69,7 +69,7 @@ function writeAtomic(file, data, mode) {
 function defaultSettings() {
     return {
         apiKey: '',
-        model: 'gemini-2.5-flash',
+        model: 'gemini-3.5-flash-lite',
         ownerName: 'Đại ca',
         handsFreeWake: true,            // Always-on "Hey Bimmer" / "Ê Bimmer" ceiling-mic VAD listener
         pttTrigger: 'short_press',      // short_press | long_press | double_press | disabled
@@ -84,13 +84,22 @@ function defaultSettings() {
     };
 }
 
+function normalizeModelName(rawModel, fallback) {
+    const m = typeof rawModel === 'string' ? rawModel.trim() : '';
+    if (!m) return fallback;
+    if (/^gemini-(?:1\.5|2\.0|2\.5)-flash(?:-lite)?$/i.test(m)) {
+        return 'gemini-3.5-flash-lite';
+    }
+    return m;
+}
+
 function normalizeSettings(raw) {
     const d = defaultSettings();
     const r = raw && typeof raw === 'object' ? raw : {};
     const ptt = String(r.pttTrigger || d.pttTrigger);
     return {
         apiKey: typeof r.apiKey === 'string' ? r.apiKey.trim() : d.apiKey,
-        model: typeof r.model === 'string' && r.model.trim() ? r.model.trim() : d.model,
+        model: normalizeModelName(r.model, d.model),
         ownerName: typeof r.ownerName === 'string' && r.ownerName.trim() ? r.ownerName.trim().slice(0, 40) : d.ownerName,
         handsFreeWake: r.handsFreeWake !== false,
         pttTrigger: (ptt === 'short_press' || ptt === 'long_press' || ptt === 'double_press' || ptt === 'disabled') ? ptt : d.pttTrigger,

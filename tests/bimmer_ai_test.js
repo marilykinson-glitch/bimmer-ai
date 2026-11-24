@@ -343,8 +343,9 @@ async function runAllTests() {
         dm.pollHmiAppCommand();
         await new Promise((r) => setTimeout(r, 250));
 
-        assert.ok(capturedReqBody && capturedReqBody.generationConfig.thinkingConfig);
-        assert.strictEqual(capturedReqBody.generationConfig.thinkingConfig.thinkingBudget, 0);
+        assert.strictEqual(dm.settings.model, 'gemini-3.5-flash-lite'); // auto-migrated from retired 2.5-flash!
+        assert.ok(capturedReqBody && capturedReqBody.generationConfig);
+        assert.strictEqual(capturedReqBody.generationConfig.thinkingConfig, undefined); // no invalid thinkingBudget on 3.x!
         assert.ok(dm.lastTurn.replyVi.indexOf('INTERNAL_THOUGHT') < 0);
         // Offline NLU backup executed `set_climate` even though Gemini only emitted `[TRANSCRIPT: ...]` text!
         assert.strictEqual(dm.vehicle.state.climate.tempDriverC, 21);

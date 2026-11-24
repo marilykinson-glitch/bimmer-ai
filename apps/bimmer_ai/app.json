@@ -2,7 +2,7 @@
   "id": "bimmer_ai",
   "title": "Bimmer AI",
   "description": "Trợ lý ảo Jarvis Tiếng Việt chạy trực tiếp trên BMW iDrive 7 (MGU): nghe từ Mic trần zin 2 vùng (Ghế Tài & Ghế Phụ) + nút Mic vô-lăng, hiểu cả Offline trong hầm lẫn Online Gemini, điều khiển điều hoà, đèn nội thất RGB BDC, cửa kính, rèm, cốp, ghế massage, van bô, YouTube TV, 1CR và đọc lỗi xe kèm chốt chặn an toàn cứng.",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "vendor": "custom",
   "loggingId": "OAAI",
   "signals": {},
