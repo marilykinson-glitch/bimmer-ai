@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>Bimmer AI — Buồng lái Giọng nói & Cấu hình MGU</title>
+<style>
+  :root {
+    --bg: #070b14;
+    --card: #101726;
+    --card2: #162033;
+    --border: rgba(148, 163, 184, 0.18);
+    --text: #f1f5f9;
+    --dim: #94a3b8;
+    --cyan: #00d4ff;
+    --purple: #8a2be2;
+    --green: #2fd27a;
+    --amber: #ffb020;
+    --red: #ff2e4c;
+    --amb: #0066ff;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: radial-gradient(circle at top right, rgba(0, 212, 255, 0.10), transparent 45%), var(--bg);
+    color: var(--text);
+    padding: 16px;
+    line-height: 1.45;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; }
+  .topbar {
+    display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+    gap: 12px; padding: 14px 18px; background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; margin-bottom: 16px;
+    box-shadow: 0 0 28px rgba(0, 0, 0, 0.45);
+  }
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .orb {
+    width: 38px; height: 38px; border-radius: 50%;
+    background: conic-gradient(from 0deg, #00d4ff, #8a2be2, #ff1e38, #00d4ff);
+    display: flex; align-items: center; justify-content: center;
+    box-shadow: 0 0 18px rgba(0, 212, 255, 0.55);
+  }
+  .orb::after { content: ""; width: 22px; height: 22px; border-radius: 50%; background: var(--card); }
+  .brand h1 { font-size: 20px; letter-spacing: 1px; }
+  .badges { display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge {
+    font-size: 12px; font-weight: 700; padding: 5px 11px; border-radius: 999px;
+    border: 1px solid var(--border); background: var(--card2);
+  }
+  .badge.ok { color: var(--green); border-color: rgba(47, 210, 122, 0.45); }
+  .badge.warn { color: var(--amber); border-color: rgba(255, 176, 32, 0.45); }
+  .badge.info { color: var(--cyan); border-color: rgba(0, 212, 255, 0.45); }
+
+  .ambient-strip {
+    height: 8px; border-radius: 999px; margin-bottom: 16px;
+    background: var(--amb);
+    box-shadow: 0 0 22px var(--amb);
+    transition: all 0.35s ease;
+  }
+
+  .grid { display: grid; grid-template-columns: 1.15fr 0.85fr; gap: 16px; }
+  @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+
+  .panel {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 16px; padding: 16px; margin-bottom: 16px;
+  }
+  .panel h2 { font-size: 15px; text-transform: uppercase; letter-spacing: 0.8px; color: var(--cyan); margin-bottom: 12px; }
+
+  .voice-box { display: flex; flex-direction: column; gap: 12px; }
+  .zone-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .zone-btn {
+    flex: 1; min-width: 135px; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--border);
+    background: var(--card2); color: var(--dim); font-weight: 700; cursor: pointer; text-align: center;
+  }
+  .zone-btn.active { color: #fff; border-color: var(--cyan); background: rgba(0, 212, 255, 0.16); }
+
+  .cmd-row { display: flex; gap: 8px; }
+  .cmd-row input {
+    flex: 1; padding: 12px 14px; border-radius: 12px; border: 1px solid var(--border);
+    background: #0a101d; color: #fff; font-size: 15px; outline: none;
+  }
+  .cmd-row input:focus { border-color: var(--cyan); }
+  .btn {
+    padding: 11px 16px; border-radius: 12px; border: none; font-weight: 700; font-size: 14px;
+    cursor: pointer; transition: transform 0.1s, opacity 0.15s;
+  }
+  .btn:active { transform: scale(0.97); }
+  .btn-primary { background: linear-gradient(135deg, #00b4ff, #6d28d9); color: #fff; }
+  .btn-mic { background: rgba(0, 212, 255, 0.16); color: var(--cyan); border: 1px solid rgba(0, 212, 255, 0.5); }
+  .btn-mic.rec { background: var(--red); color: #fff; border-color: var(--red); animation: pulse 1s infinite; }
+  @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.65; } }
+
+  .chips { display: flex; flex-wrap: wrap; gap: 7px; }
+  .chip {
+    font-size: 12.5px; padding: 6px 11px; border-radius: 999px; background: var(--card2);
+    border: 1px solid var(--border); color: #cbd5e1; cursor: pointer;
+  }
+  .chip:hover { border-color: var(--cyan); color: #fff; }
+
+  .reply-card {
+    padding: 14px; border-radius: 12px; background: rgba(0, 212, 255, 0.06);
+    border: 1px solid rgba(0, 212, 255, 0.28);
+  }
+  .reply-user { font-size: 13px; color: #93c5fd; margin-bottom: 4px; font-weight: 600; }
+  .reply-ai { font-size: 16px; font-weight: 700; color: #fff; }
+  .action-tags { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
+  .act-tag { font-size: 11.5px; padding: 3px 9px; border-radius: 6px; background: rgba(47, 210, 122, 0.15); color: var(--green); }
+  .act-tag.blocked { background: rgba(255, 46, 76, 0.18); color: #ff6b81; }
+  .act-tag.deferred { background: rgba(255, 176, 32, 0.18); color: var(--amber); }
+
+  .twin-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; }
+  .stat-box {
+    padding: 11px 13px; border-radius: 12px; background: var(--card2); border: 1px solid var(--border);
+  }
+  .stat-label { font-size: 11.5px; color: var(--dim); text-transform: uppercase; }
+  .stat-val { font-size: 16px; font-weight: 700; margin-top: 3px; }
+
+  .slider-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; font-size: 13.5px; }
+  .slider-row input[type="range"] { flex: 1; accent-color: var(--cyan); }
+  .slider-row select, .field-row input, .field-row select {
+    padding: 8px 10px; border-radius: 8px; border: 1px solid var(--border);
+    background: #0a101d; color: #fff; font-size: 13.5px;
+  }
+  .field-row { display: flex; flex-direction: column; gap: 5px; margin-bottom: 10px; font-size: 13px; color: var(--dim); }
+
+  .guard-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; }
+  .guard-item {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 9px 11px; border-radius: 10px; background: var(--card2); border: 1px solid var(--border);
+    font-size: 13px; cursor: pointer;
+  }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--green); }
+  .dot.off { background: var(--red); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand">
+      <div class="orb"></div>
+      <div>
+        <h1>BIMMER AI · BMW MGU iDrive 7</h1>
+        <div style="font-size:12.5px;color:var(--dim)" id="subStatus">Đang đồng bộ trạng thái xe…</div>
+      </div>
+    </div>
+    <div class="badges">
+      <span class="badge info" id="engineBadge">Offline NLU</span>
+      <span class="badge ok" id="gateBadge">ĐỖ P AN TOÀN</span>
+      <span class="badge" id="micProbeBadge">Mic trần: Đang dò</span>
+    </div>
+  </div>
+
+  <div class="ambient-strip" id="ambientStrip"></div>
+
+  <div class="grid">
+    <div>
+      <div class="panel voice-box">
+        <h2>Ra lệnh Giọng nói Tiếng Việt (2 Vùng Mic Trần)</h2>
+        <div class="zone-row">
+          <button class="zone-btn active" id="zoneDriver" onclick="setZone('driver')">🎙️ Mic Ghế Tài (Trái)</button>
+          <button class="zone-btn" id="zonePassenger" onclick="setZone('passenger')">🎙️ Mic Ghế Phụ (Phải)</button>
+        </div>
+
+        <div class="cmd-row">
+          <button class="btn btn-mic" id="btnBrowserMic" onclick="toggleBrowserSpeech()">🎤 Nói</button>
+          <input id="cmdInput" placeholder="Nhập hoặc bấm Nói: ví dụ 'Trời nóng quá bật Max AC đổi đèn tím'..." onkeydown="if(event.key==='Enter')sendAsk()">
+          <button class="btn btn-primary" onclick="sendAsk()">Gửi AI</button>
+        </div>
+
+        <div class="chips">
+          <span class="chip" onclick="quickAsk('Trời nóng quá, bật Max AC, làm mát ghế rồi đổi đèn sang xanh băng', 'driver')">❄️ Hạ nhiệt + Đèn xanh băng</span>
+          <span class="chip" onclick="quickAsk('Lạnh quá tăng nhiệt độ với bật sưởi ghế cho em', 'passenger')">🔥 [Ghế Phụ] Kêu lạnh</span>
+          <span class="chip" onclick="quickAsk('Chế độ chill đêm rồi mở nhạc Lofi trên YouTube đi', 'driver')">🟣 Chill đêm + YouTube Lofi</span>
+          <span class="chip" onclick="quickAsk('Mở van bô cho nổ giòn thử coi', 'driver')">🏎️ Mở van bô (Check dầu 75°C)</span>
+          <span class="chip" onclick="quickAsk('Mở cốp với mở chốt cửa xe đi', 'driver')">🔓 Mở cốp & cửa (Test khoá tốc độ)</span>
+          <span class="chip" onclick="quickAsk('Chế độ rạp phim đợi vợ', 'driver')">🎬 Rạp phim (Số P)</span>
+          <span class="chip" onclick="quickAsk('Khám sức khoẻ xe xem bình 12V với áp suất lốp sao rồi', 'driver')">🩺 Khám sức khoẻ xe</span>
+        </div>
+
+        <div class="reply-card">
+          <div class="reply-user" id="lastTranscript">[GHẾ TÀI] Chưa có câu lệnh mới</div>
+          <div class="reply-ai" id="lastReply">Sẵn sàng nhận lệnh tiếng Việt!</div>
+          <div class="action-tags" id="actionTags"></div>
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Mô phỏng Trạng thái Xe Trực tiếp (Digital Twin)</h2>
+        <div class="twin-grid">
+          <div class="stat-box"><div class="stat-label">Điều hoà 2 vùng</div><div class="stat-val" id="stClimate">--</div></div>
+          <div class="stat-box"><div class="stat-label">Đèn viền RGB & Trần</div><div class="stat-val" id="stAmbient">--</div></div>
+          <div class="stat-box"><div class="stat-label">Cửa, Cốp & Gương</div><div class="stat-val" id="stLocks">--</div></div>
+          <div class="stat-box"><div class="stat-label">Kính, Rèm & Cửa trời</div><div class="stat-val" id="stWindows">--</div></div>
+          <div class="stat-box"><div class="stat-label">Nhạc & YouTube TV</div><div class="stat-val" id="stMedia">--</div></div>
+          <div class="stat-box"><div class="stat-label">Van bô, Cam & 1CR</div><div class="stat-val" id="stExhaust">--</div></div>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <h2>Thanh trượt Giả lập Tín hiệu Xe (Test Chốt An Toàn & Co-Pilot)</h2>
+        <div class="slider-row">
+          <span>Cần số:</span>
+          <select id="simGear" onchange="pushSim()">
+            <option value="P">P (Đỗ xe)</option>
+            <option value="D">D (Đang tiến)</option>
+            <option value="R">R (Số lùi)</option>
+            <option value="N">N (Mo)</option>
+          </select>
+          <span>Cuộc gọi ĐT:</span>
+          <select id="simCall" onchange="pushSim()">
+            <option value="0">Không gọi</option>
+            <option value="1">Đang gọi CarPlay</option>
+          </select>
+        </div>
+        <div class="slider-row">
+          <span style="width:135px">Tốc độ: <b id="lblSpd">0</b> km/h</span>
+          <input type="range" id="simSpeed" min="0" max="140" value="0" oninput="document.getElementById('lblSpd').textContent=this.value" onchange="pushSim()">
+        </div>
+        <div class="slider-row">
+          <span style="width:135px">Dầu máy: <b id="lblOil">86</b> °C</span>
+          <input type="range" id="simOil" min="40" max="115" value="86" oninput="document.getElementById('lblOil').textContent=this.value" onchange="pushSim()">
+        </div>
+        <div class="slider-row">
+          <span style="width:135px">Biển VietMap: <b id="lblVm">60</b></span>
+          <input type="range" id="simVm" min="40" max="120" step="10" value="60" oninput="document.getElementById('lblVm').textContent=this.value" onchange="pushSim()">
+        </div>
+      </div>
+
+      <div class="panel">
+        <h2>Quyền An Toàn Từng Nhóm (Safety Gate)</h2>
+        <div class="guard-grid" id="guardGrid"></div>
+      </div>
+
+      <div class="panel">
+        <h2>Cấu hình Gemini Online & Cổng Mic Trần ALSA</h2>
+        <div class="field-row">
+          <label>Gemini API Key (để trống vẫn chạy Offline NLU tức thời):</label>
+          <input type="password" id="cfgApiKey" placeholder="AIzaSy...">
+        </div>
+        <div class="field-row">
+          <label>Cách gọi trên vô-lăng & Tên xưng hô:</label>
+          <div style="display:flex;gap:8px">
+            <select id="cfgPtt" style="flex:1">
+              <option value="short_press">Nhấn 1 lần nút Mic vô-lăng</option>
+              <option value="double_press">Nhấn đúp nút Mic vô-lăng</option>
+              <option value="disabled">Tắt nút vô-lăng</option>
+            </select>
+            <input id="cfgOwner" placeholder="Đại ca" style="width:120px">
+          </div>
+        </div>
+        <div style="display:flex;gap:8px;margin-top:6px">
+          <button class="btn btn-primary" style="flex:1" onclick="saveCfg()">Lưu cấu hình</button>
+          <button class="btn btn-mic" onclick="probeMic()">Dò lại Mic ALSA</button>
+        </div>
+        <div id="alsaInfo" style="font-size:12px;color:var(--dim);margin-top:10px"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+  var PIN = (new URLSearchParams(location.search)).get('pin') || '';
+  var currentZone = 'driver';
+  var latestState = null;
+  var recObj = null;
+
+  var GUARD_LABELS = {
+    locksAndTrunk: 'Khoá cửa & Cốp',
+    windowsAndRoof: 'Kính & Rèm',
+    climateAndSeats: 'Điều hoà & Ghế',
+    ambientAndLights: 'Đèn viền RGB',
+    mediaAndYoutube: 'Nhạc & YouTube',
+    exhaustAndDiag: 'Van bô & Khám xe'
+  };
+
+  function api(path, method, body) {
+    var sep = path.indexOf('?') >= 0 ? '&' : '?';
+    return fetch(path + sep + 'pin=' + encodeURIComponent(PIN), {
+      method: method || 'GET',
+      headers: { 'Content-Type': 'application/json', 'x-bimmer-pin': PIN },
+      body: body ? JSON.stringify(body) : undefined
+    }).then(function(r) { return r.json(); });
+  }
+
+  function setZone(z) {
+    currentZone = z;
+    document.getElementById('zoneDriver').className = 'zone-btn' + (z === 'driver' ? ' active' : '');
+    document.getElementById('zonePassenger').className = 'zone-btn' + (z === 'passenger' ? ' active' : '');
+  }
+
+  function playTtsOrFallback(turn) {
+    if (turn && turn.ttsAudioBase64) {
+      try {
+        var audio = new Audio('data:audio/mpeg;base64,' + turn.ttsAudioBase64);
+        audio.play().catch(function() {});
+        return;
+      } catch (e) {}
+    }
+    if (turn && turn.replyVi && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+        var u = new SpeechSynthesisUtterance(turn.replyVi);
+        u.lang = 'vi-VN';
+        u.rate = 1.05;
+        window.speechSynthesis.speak(u);
+      } catch (e) {}
+    }
+  }
+
+  function sendAsk(overrideText, overrideZone) {
+    var inp = document.getElementById('cmdInput');
+    var txt = overrideText !== undefined ? overrideText : inp.value.trim();
+    if (!txt) return;
+    if (overrideText === undefined) inp.value = '';
+    var z = overrideZone || currentZone;
+    setZone(z);
+    document.getElementById('lastReply').textContent = 'Đang xử lý lệnh…';
+    api('/api/ask', 'POST', { text: txt, speakerZone: z }).then(function(res) {
+      if (res.ok) {
+        renderState(res.state);
+        playTtsOrFallback(res.turn);
+      }
+    });
+  }
+
+  function quickAsk(txt, z) { sendAsk(txt, z); }
+
+  function toggleBrowserSpeech() {
+    var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    var btn = document.getElementById('btnBrowserMic');
+    if (!SR) {
+      alert('Trình duyệt này không hỗ trợ Web Speech trực tiếp. Hãy gõ câu lệnh hoặc bấm các chip thử nhanh!');
+      return;
+    }
+    if (recObj) { recObj.stop(); recObj = null; btn.className = 'btn btn-mic'; btn.textContent = '🎤 Nói'; return; }
+    recObj = new SR();
+    recObj.lang = 'vi-VN';
+    recObj.interimResults = false;
+    btn.className = 'btn btn-mic rec';
+    btn.textContent = '🔴 Đang nghe...';
+    recObj.onresult = function(e) {
+      var transcript = e.results[0][0].transcript;
+      document.getElementById('cmdInput').value = transcript;
+      sendAsk(transcript, currentZone);
+    };
+    recObj.onend = function() { recObj = null; btn.className = 'btn btn-mic'; btn.textContent = '🎤 Nói'; };
+    recObj.onerror = function() { recObj = null; btn.className = 'btn btn-mic'; btn.textContent = '🎤 Nói'; };
+    recObj.start();
+  }
+
+  function pushSim() {
+    var gear = document.getElementById('simGear').value;
+    var spd = Number(document.getElementById('simSpeed').value);
+    if (spd > 0 && gear === 'P') { gear = 'D'; document.getElementById('simGear').value = 'D'; }
+    var oil = Number(document.getElementById('simOil').value);
+    var vm = Number(document.getElementById('simVm').value);
+    var call = document.getElementById('simCall').value === '1';
+    api('/api/sim/telemetry', 'POST', {
+      gear: gear,
+      speedKmh: spd,
+      rpm: spd > 0 ? Math.min(6200, 900 + spd * 32) : (gear === 'P' ? 0 : 750),
+      oilTempC: oil,
+      callActive: call,
+      vietmap: { speedLimitKmh: vm, cameraAheadM: spd > vm ? 300 : 0 }
+    }).then(function(r) { if (r.ok) renderState(r.state); });
+  }
+
+  function toggleGuardKey(k) {
+    if (!latestState) return;
+    var g = Object.assign({}, latestState.guards);
+    g[k] = !g[k];
+    api('/api/settings', 'POST', { guards: g }).then(function(r) { if (r.ok) renderState(r.state); });
+  }
+
+  function saveCfg() {
+    var body = {
+      pttTrigger: document.getElementById('cfgPtt').value,
+      ownerName: document.getElementById('cfgOwner').value
+    };
+    var keyVal = document.getElementById('cfgApiKey').value.trim();
+    if (keyVal) body.apiKey = keyVal;
+    api('/api/settings', 'POST', body).then(function(r) {
+      if (r.ok) {
+        document.getElementById('cfgApiKey').value = '';
+        renderState(r.state);
+      }
+    });
+  }
+
+  function probeMic() {
+    api('/api/audio/probe', 'POST', {}).then(function() { refresh(); });
+  }
+
+  function renderState(s) {
+    if (!s) return;
+    latestState = s;
+    var t = s.telemetry || {};
+    var c = t.climate || {};
+    var a = t.ambient || {};
+    var m = t.media || {};
+    var turn = s.lastTurn || {};
+
+    document.getElementById('ambientStrip').style.background = a.on === false ? '#1e293b' : (a.hex || '#0066ff');
+    document.getElementById('ambientStrip').style.boxShadow = a.on === false ? 'none' : ('0 0 24px ' + (a.hex || '#0066ff'));
+
+    document.getElementById('subStatus').textContent =
+      (s.simMode ? 'Chế độ Mô phỏng Trực tiếp trên Mac' : 'Đang chạy trên đầu BMW MGU') +
+      ' · Chủ xe: ' + (s.settings && s.settings.ownerName || 'Đại ca') +
+      (s.settings && s.settings.hasApiKey ? (' · Key: ' + s.settings.apiKeyMasked) : '');
+
+    var eb = document.getElementById('engineBadge');
+    eb.textContent = (s.settings && s.settings.hasApiKey) ? 'Gemini Multimodal + Offline' : 'Offline NLU (<5ms)';
+    eb.className = 'badge ' + ((s.settings && s.settings.hasApiKey) ? 'ok' : 'info');
+
+    var moving = (t.speedKmh || 0) > 2 || (t.gear && t.gear !== 'P');
+    var gb = document.getElementById('gateBadge');
+    gb.textContent = moving ? ('ĐANG LÁI (' + t.gear + ' · ' + Math.round(t.speedKmh) + ' km/h) — KHOÁ CỬA/CỐP') : 'ĐỖ P AN TOÀN';
+    gb.className = 'badge ' + (moving ? 'warn' : 'ok');
+
+    var ap = s.audioProbe || {};
+    document.getElementById('micProbeBadge').textContent = ap.hasAlsaCapture ? ('Mic ALSA: ' + ap.recommendedDevice) : 'Mic: Trình duyệt / Mô phỏng';
+    document.getElementById('alsaInfo').textContent = ap.hasAlsaCapture
+      ? ('Đã tìm thấy ' + ap.captureStreams.length + ' luồng thu ALSA. Khuyên dùng: ' + ap.recommendedDevice)
+      : 'Trên Mac dùng nút 🎤 Nói (trình duyệt). Khi cài lên đầu BMW MGU sẽ tự bắt luồng /proc/asound/pcm của cặp Mic trần.';
+
+    var who = turn.speakerZone === 'passenger' ? '[GHẾ PHỤ]' : '[GHẾ TÀI]';
+    document.getElementById('lastTranscript').textContent = who + ' ' + (turn.transcript || '');
+    document.getElementById('lastReply').textContent = turn.replyVi || '';
+
+    var tagsHtml = '';
+    (turn.actions || []).forEach(function(act) {
+      var cls = act.blocked ? 'act-tag blocked' : (act.deferred ? 'act-tag deferred' : 'act-tag');
+      var pfx = act.blocked ? '⛔ Chặn: ' : (act.deferred ? '⏳ Hẹn điều kiện: ' : '✅ ');
+      tagsHtml += '<span class="' + cls + '">' + pfx + act.tool + '</span>';
+    });
+    document.getElementById('actionTags').innerHTML = tagsHtml;
+
+    document.getElementById('stClimate').textContent =
+      (c.on === false ? 'TẮT' : (c.maxAc ? 'MAX AC 16°C' : ('Tài ' + c.tempDriverC + '°C · Phụ ' + c.tempPassengerC + '°C'))) +
+      ' · Gió ' + c.fanLevel + (c.seatCoolDriver ? (' · Mát ghế ' + c.seatCoolDriver) : '') + (c.seatHeatPassenger ? (' · Sưởi phụ ' + c.seatHeatPassenger) : '');
+    document.getElementById('stAmbient').textContent =
+      (a.on === false ? 'Đèn tắt' : (a.name + ' (' + a.brightness + '%)')) + (a.readingLight ? ' · Đèn trần BẬT' : '');
+    document.getElementById('stLocks').textContent =
+      (t.doorsLocked ? '🔒 Đã khoá' : '🔓 Mở chốt') + (t.trunkOpen ? ' · Cốp MỞ' : ' · Cốp đóng') + (t.mirrorsFolded ? ' · Gương cụp' : '');
+    document.getElementById('stWindows').textContent =
+      'Kính T:' + t.windows.fl + '% P:' + t.windows.fr + '% · Rèm ' + (t.blindsOpen ? 'Mở' : 'Kéo') + ' · Trời ' + t.sunroof;
+    document.getElementById('stMedia').textContent =
+      (m.playing ? ('▶ ' + m.title) : '⏸ Đang dừng') + ' (' + m.source + ' · ' + (m.muted ? 'Mute' : (m.volumePercent + '%')) + ')';
+    document.getElementById('stExhaust').textContent =
+      'Bô: ' + t.exhaustMode.toUpperCase() + (s.deferredWatches && s.deferredWatches.length ? ' (Chờ 75°C)' : '') +
+      ' · Cam: ' + t.cameraView.toUpperCase() + (t.climate1crActive ? ' · 1CR NỔ' : '');
+
+    var gg = '';
+    Object.keys(GUARD_LABELS).forEach(function(k) {
+      var on = !s.guards || s.guards[k] !== false;
+      gg += '<div class="guard-item" onclick="toggleGuardKey(\'' + k + '\')"><span>' + GUARD_LABELS[k] + '</span><span class="dot' + (on ? '' : ' off') + '"></span></div>';
+    });
+    document.getElementById('guardGrid').innerHTML = gg;
+
+    if (document.activeElement !== document.getElementById('cfgOwner') && s.settings) {
+      document.getElementById('cfgOwner').value = s.settings.ownerName || 'Đại ca';
+      document.getElementById('cfgPtt').value = s.settings.pttTrigger || 'short_press';
+    }
+  }
+
+  function refresh() {
+    api('/api/state', 'GET').then(function(r) { if (r.ok) renderState(r.state); }).catch(function() {});
+  }
+  refresh();
+  setInterval(refresh, 1500);
+</script>
+</body>
+</html>

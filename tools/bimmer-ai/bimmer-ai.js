@@ -1,0 +1,681 @@
+'use strict';
+/**
+ * bimmer-ai.js - Main Root Daemon & HTTP Voice/Simulator Server for "Bimmer AI" (BMW MGU iDrive 7).
+ *
+ * Responsibilities:
+ *   1. Connects `VehicleController` (SOME/IP comfort, lighting, windows, locks, RideTube, Bimmer-Link 1CR, VietMap).
+ *   2. Listens to Steering Wheel PTT (`statusPTTButton1`) & captures stereo 16kHz audio from the OEM ceiling mics (`audio-io.js`),
+ *      automatically detecting Driver (Left) vs Passenger (Right) speaker zone and yielding during phone/CarPlay calls.
+ *   3. Runs `AiBrain.processAssistantTurn` (Online Gemini Multimodal + Offline Vietnamese NLU fallback) through `SafetyGate`.
+ *   4. Ducks media volume, pulses `IpaInteriorLight`, and synthesizes natural Vietnamese TTS audio (`vi`).
+ *   5. Exchanges zero-flash-wear RAM state & commands with `apps/bimmer_ai` via `/run/bimmer-ai/status.json` & `app/command.json`.
+ *   6. Serves the Mobile QR Voice / Config / Live Car Simulator Portal on port `8140` (with automatic `nft` rule on MGU).
+ *
+ * Node 8 compatible, zero external npm dependencies.
+ */
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const http = require('http');
+const urlMod = require('url');
+const crypto = require('crypto');
+const cp = require('child_process');
+
+const Up = require('./uplink');
+const SafetyGate = require('./safety-gate');
+const VehicleBus = require('./vehicle-bus');
+const AudioIO = require('./audio-io');
+const AiBrain = require('./ai-brain');
+
+const VERSION = '0.1.0';
+const FW_TAG = 'bimmer-ai';
+const APP_RE = /^bimmer_ai\d*$/;
+
+const env = (k, d) => (process.env[k] !== undefined && process.env[k] !== '' ? process.env[k] : d);
+
+function createDaemonConfig(over) {
+    return Object.assign({
+        run: env('BA_RUN', '/run/bimmer-ai'),
+        state: env('BA_STATE', '/var/opt/bimmer-ai'),
+        oap: env('BA_OAP', '/var/opt/public/oap'),
+        proc: env('BA_PROC', '/proc'),
+        port: Number(env('BA_PORT', 8140)),
+        host: env('BA_HOST', '0.0.0.0'),
+        nft: env('BA_NFT', 'nft'),
+        route: env('BA_ROUTE', '/proc/net/route'),
+        ips: env('BA_IPS', ''),
+        simMode: env('BA_SIM', '') === '1',
+        noNft: env('BA_NO_NFT', '') === '1',
+        geminiBaseUrl: env('BA_GEMINI_BASE', ''),
+    }, over || {});
+}
+
+const mkdirp = (d) => {
+    if (fs.existsSync(d)) return;
+    mkdirp(path.dirname(d));
+    try { fs.mkdirSync(d); } catch (e) { if (e.code !== 'EEXIST') throw e; }
+};
+
+const readJson = (f) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return null; } };
+
+function writeAtomic(file, data, mode) {
+    mkdirp(path.dirname(file));
+    const tmp = file + '.tmp.' + process.pid + '.' + Math.floor(Math.random() * 10000);
+    fs.writeFileSync(tmp, data, { mode: mode || 0o644 });
+    fs.renameSync(tmp, file);
+}
+
+function defaultSettings() {
+    return {
+        apiKey: '',
+        model: 'gemini-2.5-flash',
+        ownerName: 'Đại ca',
+        pttTrigger: 'short_press',      // short_press | double_press | disabled
+        micDevice: 'auto',
+        micDurationSec: 4,
+        swapMicChannels: false,
+        ttsEnabled: true,
+        duckVolumePercent: 20,
+        startupBriefing: true,
+        vietmapCoPilot: true,
+        guards: SafetyGate.defaultGuards(),
+    };
+}
+
+function normalizeSettings(raw) {
+    const d = defaultSettings();
+    const r = raw && typeof raw === 'object' ? raw : {};
+    const ptt = String(r.pttTrigger || d.pttTrigger);
+    return {
+        apiKey: typeof r.apiKey === 'string' ? r.apiKey.trim() : d.apiKey,
+        model: typeof r.model === 'string' && r.model.trim() ? r.model.trim() : d.model,
+        ownerName: typeof r.ownerName === 'string' && r.ownerName.trim() ? r.ownerName.trim().slice(0, 40) : d.ownerName,
+        pttTrigger: (ptt === 'short_press' || ptt === 'double_press' || ptt === 'disabled') ? ptt : d.pttTrigger,
+        micDevice: typeof r.micDevice === 'string' && r.micDevice.trim() ? r.micDevice.trim() : d.micDevice,
+        micDurationSec: Math.max(2, Math.min(8, Math.round(Number(r.micDurationSec) || d.micDurationSec))),
+        swapMicChannels: !!r.swapMicChannels,
+        ttsEnabled: r.ttsEnabled !== false,
+        duckVolumePercent: Math.max(5, Math.min(50, Math.round(Number(r.duckVolumePercent) || d.duckVolumePercent))),
+        startupBriefing: r.startupBriefing !== false,
+        vietmapCoPilot: r.vietmapCoPilot !== false,
+        guards: SafetyGate.normalizeGuards(r.guards),
+    };
+}
+
+function discoverLanAddresses(cfg) {
+    if (cfg.ips) return cfg.ips.split(',').filter(Boolean);
+    if (cfg.simMode) return ['127.0.0.1'];
+    let via = '';
+    try {
+        const rows = fs.readFileSync(cfg.route, 'utf8').split('\n').slice(1)
+            .map((l) => l.trim().split(/\s+/)).filter((c) => c.length > 7 && c[1] === '00000000' && c[7] === '00000000');
+        rows.sort((x, y) => Number(x[6]) - Number(y[6]));
+        via = rows.length ? rows[0][0] : '';
+    } catch (e) { via = ''; }
+    const out = [];
+    const nets = os.networkInterfaces();
+    Object.keys(nets).forEach((name) => (nets[name] || []).forEach((a) => {
+        if (a.internal || (a.family !== 'IPv4' && a.family !== 4) || /^169\.254\./.test(a.address)) return;
+        const range = /^192\.168\./.test(a.address) ? 0 : /^172\.(1[6-9]|2\d|3[01])\./.test(a.address) ? 1 : /^10\./.test(a.address) ? 2 : 3;
+        out.push({ ip: a.address, rank: (name === via ? 0 : /^(wl|ml|uap|ap|wifi)/i.test(name) ? 10 : 20) + range });
+    }));
+    const sorted = out.sort((a, b) => a.rank - b.rank).map((a) => a.ip);
+    return sorted.length ? sorted : ['127.0.0.1'];
+}
+
+function execNft(nftBin, args) {
+    return new Promise((resolve, reject) => cp.execFile(nftBin, args, { timeout: 8000, maxBuffer: 2 << 20 }, (err, out, stderr) => {
+        if (!err) return resolve(out);
+        const e = new Error('nft ' + args.join(' ') + ': ' + (String(stderr || '').trim() || err.message));
+        e.absent = err.code === 'ENOENT' || /No such file or directory/.test(String(stderr));
+        reject(e);
+    }));
+}
+
+async function fwClose(nftBin) {
+    let out;
+    try { out = await execNft(nftBin, ['-a', 'list', 'chain', 'ip', 'filter', 'input']); } catch (e) {
+        if (e.absent) return 'absent';
+        return 'skip';
+    }
+    const lines = out.split('\n').filter((l) => l.indexOf('comment "' + FW_TAG + '"') >= 0);
+    for (let i = 0; i < lines.length; i++) {
+        const m = /# handle (\d+)\s*$/.exec(lines[i]);
+        if (m) await execNft(nftBin, ['delete', 'rule', 'ip', 'filter', 'input', 'handle', m[1]]).catch(() => {});
+    }
+    return 'closed';
+}
+
+async function fwOpen(nftBin, port) {
+    await fwClose(nftBin);
+    try {
+        await execNft(nftBin, ['insert', 'rule', 'ip', 'filter', 'input', 'tcp', 'dport', String(port), 'accept', 'comment', '"' + FW_TAG + '"']);
+        return 'opened';
+    } catch (e) { return 'skip'; }
+}
+
+/** Chown `/run/bimmer-ai/app` to the OAP UID of `bimmer_ai` so the HMI app can write zero-flash commands. */
+function grantAppRamFolder(oapRoot, runDir) {
+    const appDir = path.join(runDir, 'app');
+    mkdirp(appDir);
+    try { fs.chmodSync(appDir, 0o775); } catch (e) {}
+    const mgr = path.join(oapRoot, 'oap_12201', 'data', 'apps');
+    let appUid = null;
+    try {
+        fs.readdirSync(mgr).forEach((name) => {
+            const info = readJson(path.join(mgr, name));
+            if (info && APP_RE.test(String(info.id || name)) && Number(info.userId) > 0) {
+                appUid = Number(info.userId);
+            }
+        });
+    } catch (e) {}
+    if (appUid) {
+        try { fs.chownSync(appDir, appUid, appUid); } catch (e) {}
+    }
+}
+
+class BimmerAiDaemon {
+    constructor(overCfg) {
+        this.cfg = createDaemonConfig(overCfg);
+        mkdirp(this.cfg.run);
+        mkdirp(path.join(this.cfg.run, 'app'));
+        mkdirp(path.join(this.cfg.run, 'tts'));
+        mkdirp(this.cfg.state);
+
+        this.settingsFile = path.join(this.cfg.state, 'settings.json');
+        this.settings = normalizeSettings(readJson(this.settingsFile) || {
+            apiKey: env('GEMINI_API_KEY', ''),
+        });
+        this.pin = this.cfg.simMode ? '0000' : String(crypto.randomBytes(2).readUInt16BE(0) % 9000 + 1000);
+        this.ipIdx = 0;
+        this.logs = [];
+        this.history = [];
+        this.assistantState = 'idle'; // idle | listening | thinking | speaking
+        this.activeSpeakerZone = 'driver';
+        this.micLevels = { leftDb: -65, rightDb: -65 };
+        this.lastTurn = {
+            at: Date.now(),
+            engine: this.settings.apiKey ? 'gemini' : 'offline',
+            speakerZone: 'driver',
+            transcript: '',
+            replyVi: 'Sẵn sàng! Bấm nút Mic vô-lăng, chọn lệnh nhanh trên màn hình hoặc mở cổng giọng nói QR.',
+            actions: [],
+        };
+        this.audioProbe = AudioIO.probeOemAudioStack();
+        this.lastOverspeedWarnAt = 0;
+        this.greetedDrive = false;
+        this.lastCmdId = 0;
+
+        this.uplinkOpts = Up.options({
+            stateDir: path.join(this.cfg.state, 'state'),
+            noSetuid: this.cfg.simMode,
+            baseUrl: this.cfg.geminiBaseUrl || '',
+            log: (m) => this.log(m),
+        });
+
+        this.vehicle = new VehicleBus.VehicleController({
+            onTelemetry: () => this.onVehicleStateChanged(),
+            onPttEvent: (ev) => this.onSteeringWheelPtt(ev),
+            onLog: (m) => this.log(m),
+        });
+        this.vehicle.setGuards(this.settings.guards);
+    }
+
+    log(msg) {
+        const line = new Date().toISOString() + ' ' + msg;
+        this.logs.push(line);
+        if (this.logs.length > 180) this.logs.shift();
+        if (!this.cfg.quiet) process.stdout.write('[bimmer-ai] ' + msg + '\n');
+    }
+
+    saveSettings(patch) {
+        const merged = Object.assign({}, this.settings, patch || {});
+        if (patch && patch.guards) merged.guards = Object.assign({}, this.settings.guards, patch.guards);
+        this.settings = normalizeSettings(merged);
+        this.vehicle.setGuards(this.settings.guards);
+        writeAtomic(this.settingsFile, JSON.stringify(this.settings, null, 2) + '\n', 0o600);
+        this.writeStatusFile();
+        return this.publicSettings();
+    }
+
+    publicSettings() {
+        const s = Object.assign({}, this.settings);
+        s.hasApiKey = !!s.apiKey;
+        s.apiKeyMasked = s.apiKey ? (s.apiKey.slice(0, 6) + '••••' + s.apiKey.slice(-4)) : '';
+        delete s.apiKey;
+        return s;
+    }
+
+    portalUrl() {
+        const ips = discoverLanAddresses(this.cfg);
+        const ip = ips[this.ipIdx % ips.length] || '127.0.0.1';
+        return {
+            url: 'http://' + ip + ':' + this.cfg.port + '/?pin=' + this.pin,
+            ips,
+            ip,
+        };
+    }
+
+    getPublicState() {
+        const netInfo = this.portalUrl();
+        return {
+            at: Date.now(),
+            version: VERSION,
+            simMode: !!this.cfg.simMode,
+            url: netInfo.url,
+            ips: netInfo.ips,
+            pin: this.pin,
+            assistantState: this.assistantState,
+            activeSpeakerZone: this.activeSpeakerZone,
+            micLevels: this.micLevels,
+            settings: this.publicSettings(),
+            audioProbe: this.audioProbe,
+            telemetry: this.vehicle.state,
+            guards: this.vehicle.guards,
+            deferredWatches: this.vehicle.deferredWatches,
+            lastTurn: this.lastTurn,
+            history: this.history.slice(-12),
+        };
+    }
+
+    writeStatusFile() {
+        try {
+            writeAtomic(path.join(this.cfg.run, 'status.json'), JSON.stringify(this.getPublicState()), 0o644);
+        } catch (e) {}
+    }
+
+    onVehicleStateChanged() {
+        const t = this.vehicle.state;
+        const now = Date.now();
+
+        // 1. Morning / Drive Startup Briefing when engine starts (`engineRunning` transitions true)
+        if (this.settings.startupBriefing && t.engineRunning && !this.greetedDrive) {
+            this.greetedDrive = true;
+            const brief = 'Chào ' + this.settings.ownerName + '! Bình 12V đạt ' + t.battery12v + 'V, dầu máy ' + t.oilTempC +
+                '°C, 4 lốp đều ' + t.tyresBar.fl + ' bar. Chúc thượng lộ bình an!';
+            this.lastTurn = {
+                at: now,
+                engine: 'copilot',
+                speakerZone: 'driver',
+                transcript: '(Tự động chào khi nổ máy)',
+                replyVi: brief,
+                actions: [],
+            };
+        } else if (!t.engineRunning && t.speedKmh === 0) {
+            this.greetedDrive = false;
+        }
+
+        // 2. VietMap Speed-Limit & Camera Proactive Co-Pilot
+        if (this.settings.vietmapCoPilot && t.vietmap && t.vietmap.speedLimitKmh > 0) {
+            const limit = t.vietmap.speedLimitKmh;
+            if (t.speedKmh > limit + 5 && (now - this.lastOverspeedWarnAt > 25000)) {
+                this.lastOverspeedWarnAt = now;
+                const camTxt = t.vietmap.cameraAheadM > 0 ? (' — phía trước ' + t.vietmap.cameraAheadM + 'm có camera tốc độ!') : '!';
+                const alertText = 'Chú ý! Đang chạy ' + Math.round(t.speedKmh) + ' km/h vượt giới hạn ' + limit + ' km/h' + camTxt;
+                this.lastTurn = {
+                    at: now,
+                    engine: 'copilot',
+                    speakerZone: 'driver',
+                    transcript: '(Cảnh báo tốc độ VietMap)',
+                    replyVi: alertText,
+                    actions: [{ tool: 'vietmap_alert', ok: true, summaryVi: alertText }],
+                };
+            }
+        }
+
+        this.writeStatusFile();
+    }
+
+    onSteeringWheelPtt(ev) {
+        if (this.settings.pttTrigger === 'disabled') return;
+        if (this.settings.pttTrigger === 'double_press' && ev.kind !== 'double_press') return;
+        if (this.settings.pttTrigger === 'short_press' && ev.kind !== 'short_press' && ev.kind !== 'double_press') return;
+        this.log('steering wheel PTT triggered (' + ev.kind + ') -> capturing ceiling mic');
+        this.captureAndProcessCeilingMic().catch((e) => this.log('PTT error: ' + e.message));
+    }
+
+    async captureAndProcessCeilingMic() {
+        if (this.assistantState === 'listening' || this.assistantState === 'thinking') {
+            return { ok: false, error: 'Đang xử lý câu trước' };
+        }
+        if (this.vehicle.state.callActive) {
+            const msg = 'Đang có cuộc gọi điện thoại / CarPlay — Bimmer AI tự nhường Mic zin.';
+            this.lastTurn = { at: Date.now(), engine: 'guard', speakerZone: 'driver', transcript: '(Nút Mic vô-lăng)', replyVi: msg, actions: [] };
+            this.writeStatusFile();
+            return { ok: false, error: msg };
+        }
+
+        const dev = this.settings.micDevice === 'auto' ? this.audioProbe.recommendedDevice : this.settings.micDevice;
+        if (!this.audioProbe.hasAlsaCapture && this.settings.micDevice === 'auto') {
+            const msg = 'Trên máy mô phỏng hãy dùng nút Giữ nói trên trình duyệt hoặc chọn câu lệnh thử nhanh!';
+            this.lastTurn = { at: Date.now(), engine: 'sim', speakerZone: 'driver', transcript: '(Nút Mic)', replyVi: msg, actions: [] };
+            this.writeStatusFile();
+            return { ok: false, error: msg };
+        }
+
+        this.assistantState = 'listening';
+        this.writeStatusFile();
+        try {
+            const cap = await AudioIO.captureCeilingMicClip({
+                device: dev,
+                durationSec: this.settings.micDurationSec,
+                outFile: path.join(this.cfg.run, 'capture.wav'),
+                swapChannels: this.settings.swapMicChannels,
+                isCallActive: () => !!this.vehicle.state.callActive,
+            });
+            this.micLevels = { leftDb: cap.analysis.leftDb, rightDb: cap.analysis.rightDb };
+            this.activeSpeakerZone = cap.analysis.speakerZone === 'passenger' ? 'passenger' : 'driver';
+            return await this.handleVoiceOrTextTurn({
+                audioWavBase64: cap.wavBuffer.toString('base64'),
+                audioMimeType: 'audio/wav',
+                speakerZone: this.activeSpeakerZone,
+            });
+        } catch (e) {
+            this.assistantState = 'idle';
+            this.lastTurn = {
+                at: Date.now(),
+                engine: 'audio_err',
+                speakerZone: 'driver',
+                transcript: '(Thu âm Mic trần)',
+                replyVi: 'Không mở được cổng thu âm (' + e.message + '). Mở trang QR để dò cổng ALSA.',
+                actions: [],
+            };
+            this.writeStatusFile();
+            return { ok: false, error: e.message };
+        }
+    }
+
+    /** Execute a full AI voice/text turn, including stereo WAV speaker localization, SafetyGate, Audio Ducking & TTS. */
+    async handleVoiceOrTextTurn(req) {
+        const input = req || {};
+        let speakerZone = input.speakerZone || 'driver';
+
+        // If stereo WAV audio was uploaded, analyze Left vs Right ceiling mic RMS energy!
+        if (input.audioWavBase64 && (!input.audioMimeType || input.audioMimeType === 'audio/wav')) {
+            try {
+                const wavBuf = Buffer.from(input.audioWavBase64, 'base64');
+                const ana = AudioIO.analyzeStereoMicBuffer(wavBuf, { swapChannels: this.settings.swapMicChannels });
+                if (ana.channels === 2 && ana.confidence >= 0.5) {
+                    speakerZone = ana.speakerZone;
+                    this.micLevels = { leftDb: ana.leftDb, rightDb: ana.rightDb };
+                }
+            } catch (e) {}
+        }
+
+        this.activeSpeakerZone = speakerZone;
+        this.assistantState = 'thinking';
+        this.writeStatusFile();
+
+        const turn = await AiBrain.processAssistantTurn({
+            text: input.text || '',
+            audioWavBase64: input.audioWavBase64 || '',
+            audioMimeType: input.audioMimeType || 'audio/wav',
+            speakerZone,
+            ownerName: this.settings.ownerName,
+            apiKey: this.settings.apiKey,
+            model: this.settings.model,
+            vehicleController: this.vehicle,
+            history: this.history,
+            uplinkOpts: this.uplinkOpts,
+        });
+
+        this.lastTurn = turn;
+        this.history.push({
+            at: turn.at,
+            zone: turn.speakerZone,
+            user: turn.transcript,
+            ai: turn.replyVi,
+            engine: turn.engine,
+            actions: turn.actions,
+        });
+        if (this.history.length > 25) this.history.shift();
+
+        // Synthesize TTS MP3 with Audio Ducking if enabled
+        let ttsAudioBase64 = '';
+        if (this.settings.ttsEnabled && turn.replyVi) {
+            this.assistantState = 'speaking';
+            this.writeStatusFile();
+            const prevVol = this.vehicle.state.media.volumePercent;
+            const wasPlaying = this.vehicle.state.media.playing;
+            if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
+                await this.vehicle.callProxySafe('audioCmd', 'setVolumeInPercent', { sinkID: 1024, volume: this.settings.duckVolumePercent });
+            }
+            const mp3 = await AudioIO.synthesizeVietnameseMp3(turn.replyVi, this.uplinkOpts, Up);
+            if (mp3) {
+                ttsAudioBase64 = mp3.toString('base64');
+                const mp3Path = path.join(this.cfg.run, 'tts', 'reply.mp3');
+                try { fs.writeFileSync(mp3Path, mp3); } catch (e) {}
+            }
+            if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
+                setTimeout(() => {
+                    this.vehicle.callProxySafe('audioCmd', 'setVolumeInPercent', { sinkID: 1024, volume: prevVol }).catch(() => {});
+                }, 2200);
+            }
+        }
+
+        this.assistantState = 'idle';
+        this.writeStatusFile();
+        return Object.assign({}, turn, { ttsAudioBase64, telemetry: this.vehicle.state });
+    }
+
+    /** Poll commands sent from the iDrive 7 HMI screen (`apps/bimmer_ai`). */
+    pollHmiAppCommand() {
+        const candidates = [
+            path.join(this.cfg.run, 'app', 'command.json'),
+        ];
+        for (let i = 0; i < candidates.length; i++) {
+            const c = readJson(candidates[i]);
+            if (!c || !c.id || c.id === this.lastCmdId) continue;
+            this.lastCmdId = c.id;
+            try { fs.unlinkSync(candidates[i]); } catch (e) {}
+            this.executeHmiCommand(c.cmd, c.arg || {}).catch((e) => this.log('hmi cmd error: ' + e.message));
+        }
+    }
+
+    async executeHmiCommand(cmd, arg) {
+        if (cmd === 'ptt_trigger') {
+            return this.captureAndProcessCeilingMic();
+        }
+        if (cmd === 'quick_prompt' && arg.text) {
+            return this.handleVoiceOrTextTurn({ text: String(arg.text), speakerZone: arg.speakerZone || 'driver' });
+        }
+        if (cmd === 'run_scene' && arg.scene) {
+            return this.handleVoiceOrTextTurn({ text: 'Bật chế độ ' + arg.scene, speakerZone: 'driver' });
+        }
+        if (cmd === 'health_check') {
+            return this.handleVoiceOrTextTurn({ text: 'Khám xe kiểm tra tình trạng bình ắc quy, dầu máy và áp suất lốp', speakerZone: 'driver' });
+        }
+        if (cmd === 'toggle_guard' && arg.domain) {
+            const g = Object.assign({}, this.vehicle.guards);
+            g[arg.domain] = !g[arg.domain];
+            this.saveSettings({ guards: g });
+            return { ok: true };
+        }
+        if (cmd === 'next_ip') {
+            this.ipIdx++;
+            this.writeStatusFile();
+            return { ok: true };
+        }
+        return { ok: false };
+    }
+
+    checkAuth(req, parsedUrl) {
+        if (this.cfg.simMode) return true;
+        const qPin = parsedUrl.query && parsedUrl.query.pin;
+        const hPin = req.headers['x-bimmer-pin'];
+        return String(qPin || hPin || '') === this.pin;
+    }
+
+    readBodyJson(req) {
+        return new Promise((resolve, reject) => {
+            const chunks = [];
+            let size = 0;
+            req.on('data', (c) => {
+                size += c.length;
+                if (size > 8e6) { req.destroy(); reject(new Error('payload too large')); return; }
+                chunks.push(c);
+            });
+            req.on('end', () => {
+                const raw = Buffer.concat(chunks).toString('utf8');
+                if (!raw) return resolve({});
+                try { resolve(JSON.parse(raw)); } catch (e) { reject(new Error('invalid JSON')); }
+            });
+            req.on('error', reject);
+        });
+    }
+
+    async handleHttp(req, res) {
+        const parsed = urlMod.parse(req.url || '/', true);
+        const pathname = parsed.pathname || '/';
+        const sendJson = (code, obj) => {
+            const body = Buffer.from(JSON.stringify(obj), 'utf8');
+            res.writeHead(code, {
+                'Content-Type': 'application/json; charset=utf-8',
+                'Cache-Control': 'no-store',
+                'Content-Length': body.length,
+            });
+            res.end(body);
+        };
+
+        if (pathname === '/' && req.method === 'GET') {
+            if (!this.checkAuth(req, parsed)) {
+                res.writeHead(403, { 'Content-Type': 'text/plain; charset=utf-8' });
+                res.end('Sai mã PIN trên màn hình xe BMW (quét lại mã QR trên màn hình Bimmer AI).');
+                return;
+            }
+            const htmlPath = path.join(__dirname, 'page.html');
+            const html = fs.existsSync(htmlPath) ? fs.readFileSync(htmlPath, 'utf8') : '<h1>Bimmer AI</h1>';
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
+            res.end(html);
+            return;
+        }
+
+        if (!this.checkAuth(req, parsed)) {
+            return sendJson(403, { ok: false, error: 'PIN không hợp lệ' });
+        }
+
+        if (pathname === '/api/state' && req.method === 'GET') {
+            return sendJson(200, { ok: true, state: this.getPublicState() });
+        }
+
+        if (pathname === '/api/ask' && req.method === 'POST') {
+            try {
+                const body = await this.readBodyJson(req);
+                const result = await this.handleVoiceOrTextTurn({
+                    text: body.text || '',
+                    audioWavBase64: body.audioWavBase64 || '',
+                    audioMimeType: body.audioMimeType || 'audio/wav',
+                    speakerZone: body.speakerZone || 'driver',
+                });
+                return sendJson(200, { ok: true, turn: result, state: this.getPublicState() });
+            } catch (e) {
+                return sendJson(500, { ok: false, error: e.message });
+            }
+        }
+
+        if (pathname === '/api/settings' && req.method === 'POST') {
+            try {
+                const body = await this.readBodyJson(req);
+                const saved = this.saveSettings(body);
+                return sendJson(200, { ok: true, settings: saved, state: this.getPublicState() });
+            } catch (e) {
+                return sendJson(400, { ok: false, error: e.message });
+            }
+        }
+
+        if (pathname === '/api/sim/telemetry' && req.method === 'POST') {
+            try {
+                const body = await this.readBodyJson(req);
+                this.vehicle.patchTelemetry(body);
+                this.writeStatusFile();
+                return sendJson(200, { ok: true, state: this.getPublicState() });
+            } catch (e) {
+                return sendJson(400, { ok: false, error: e.message });
+            }
+        }
+
+        if (pathname === '/api/audio/probe' && req.method === 'POST') {
+            this.audioProbe = AudioIO.probeOemAudioStack();
+            this.writeStatusFile();
+            return sendJson(200, { ok: true, audioProbe: this.audioProbe });
+        }
+
+        if (pathname === '/api/audio/ptt' && req.method === 'POST') {
+            const r = await this.captureAndProcessCeilingMic();
+            return sendJson(200, Object.assign({}, r, { state: this.getPublicState() }));
+        }
+
+        return sendJson(404, { ok: false, error: 'Not found' });
+    }
+
+    async start() {
+        grantAppRamFolder(this.cfg.oap, this.cfg.run);
+        await this.vehicle.initHardwareBus();
+        if (!this.cfg.noNft && !this.cfg.simMode) {
+            await fwOpen(this.cfg.nft, this.cfg.port);
+        }
+        this.server = http.createServer((req, res) => {
+            this.handleHttp(req, res).catch((err) => {
+                try {
+                    res.writeHead(500, { 'Content-Type': 'application/json' });
+                    res.end(JSON.stringify({ ok: false, error: err.message }));
+                } catch (e) {}
+            });
+        });
+
+        await new Promise((resolve, reject) => {
+            this.server.once('error', reject);
+            this.server.listen(this.cfg.port, this.cfg.host, resolve);
+        });
+
+        const actualAddr = this.server.address();
+        if (actualAddr && actualAddr.port) this.cfg.port = actualAddr.port;
+
+        this.pollTimer = setInterval(() => {
+            this.pollHmiAppCommand();
+            grantAppRamFolder(this.cfg.oap, this.cfg.run);
+            this.vehicle.pollCompanionApps();
+            this.writeStatusFile();
+        }, 700);
+
+        this.writeStatusFile();
+        this.log('listening on ' + this.portalUrl().url);
+        return this;
+    }
+
+    async stop() {
+        if (this.pollTimer) clearInterval(this.pollTimer);
+        if (this.server) {
+            await new Promise((resolve) => this.server.close(resolve));
+            this.server = null;
+        }
+        if (!this.cfg.noNft && !this.cfg.simMode) {
+            await fwClose(this.cfg.nft);
+        }
+    }
+}
+
+if (require.main === module) {
+    const sub = process.argv[2] || 'run';
+    if (sub === 'fwclose') {
+        const cfg = createDaemonConfig();
+        fwClose(cfg.nft).then(() => process.exit(0), () => process.exit(0));
+    } else {
+        const daemon = new BimmerAiDaemon();
+        daemon.start().catch((err) => {
+            process.stderr.write('[bimmer-ai] fatal: ' + err.message + '\n');
+            process.exit(1);
+        });
+        const cleanExit = () => daemon.stop().then(() => process.exit(0), () => process.exit(0));
+        process.on('SIGTERM', cleanExit);
+        process.on('SIGINT', cleanExit);
+    }
+}
+
+module.exports = {
+    VERSION,
+    createDaemonConfig,
+    defaultSettings,
+    normalizeSettings,
+    BimmerAiDaemon,
+};

@@ -1,0 +1,22 @@
+# bimmer-ai: Native Vietnamese In-Car AI Assistant & Vehicle Controller for BMW MGU (iDrive 7)
+[Unit]
+Description=Bimmer AI Vietnamese Voice Assistant & Vehicle Controller (bimmer-ai)
+RequiresMountsFor=/var/opt
+After=local-fs.target network.target ufipc_daemon.service
+StartLimitIntervalSec=0
+
+[Service]
+User=root
+RuntimeDirectory=bimmer-ai
+RuntimeDirectoryMode=0755
+Nice=5
+ExecStart=/bin/sh -c 'exec "$(command -v node || echo /usr/bin/node)" /var/opt/bimmer-ai/current/bimmer-ai.js run'
+ExecStopPost=-/bin/sh -c 'exec "$(command -v node || echo /usr/bin/node)" /var/opt/bimmer-ai/current/bimmer-ai.js fwclose'
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=5
+TimeoutStopSec=5
+
+[Install]
+WantedBy=multi-user.target

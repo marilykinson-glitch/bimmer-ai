@@ -1,0 +1,68 @@
+{
+  "id": "bimmer-ai",
+  "kind": "tool",
+  "version": "0.1.0",
+  "title": "Trợ lý AI Tiếng Việt (Bimmer AI)",
+  "description": "Bộ não AI Tiếng Việt chạy trực tiếp trên đầu BMW MGU (iDrive 7): thu giọng nói từ cặp Mic trần zin 2 vùng (Tài/Phụ) & nút Mic vô-lăng, kết hợp xử lý lệnh tức thời Offline (<50ms) và Gemini Multimodal/Function Calling qua mgu-uplink. Điều khiển toàn diện điều hoà, đèn nội thất RGB BDC, cửa kính, rèm, cốp, ghế massage, van bô, YouTube TV (RideTube), đề nổ 1CR (Bimmer-Link), cảnh báo VietMap và chẩn đoán UDS kèm chốt chặn an toàn cứng.",
+  "license": "GPL-3.0-or-later",
+  "mguHmi": [
+    "ID7"
+  ],
+  "uninstallable": true,
+  "requires": {
+    "mgu-deploy": "0.7.11"
+  },
+  "files": [
+    {
+      "path": "bimmer-ai.js",
+      "mode": "0644"
+    },
+    {
+      "path": "safety-gate.js",
+      "mode": "0644"
+    },
+    {
+      "path": "vehicle-bus.js",
+      "mode": "0644"
+    },
+    {
+      "path": "audio-io.js",
+      "mode": "0644"
+    },
+    {
+      "path": "ai-brain.js",
+      "mode": "0644"
+    },
+    {
+      "path": "uplink.js",
+      "mode": "0644"
+    },
+    {
+      "path": "page.html",
+      "mode": "0644"
+    },
+    {
+      "path": "LICENSE.GPL-3.0",
+      "mode": "0644"
+    }
+  ],
+  "units": [
+    {
+      "name": "bimmer-ai.service"
+    }
+  ],
+  "enable": [
+    {
+      "unit": "bimmer-ai.service",
+      "target": "multi-user.target"
+    }
+  ],
+  "recmgr": [
+    "bimmer-ai"
+  ],
+  "restart": [
+    "bimmer-ai.service"
+  ],
+  "internet": true,
+  "uids": "state/internet-uids"
+}
