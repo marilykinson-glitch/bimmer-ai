@@ -21,31 +21,22 @@ const SMARTX_HELPER = path.join(__dirname, 'alsa-smartx.py');
 
 const SMARTX_PROFILES = [
     {
+        match: 'smartx_SpeechSink_CF_2MIC_1REF_SPEECH_c',
+        hw: 'smartx:SpeechSink_CF_2MIC_1REF_SPEECH',
+        rate: 24000,
+        hwChannels: 3,
+        amRoute: { sourceID: 129, sinkID: 387 },
+        label: 'Cặp Mic trần 2 vùng SpeechSink (2MIC_1REF · Phân biệt Tài/Phụ)',
+        score: 98,
+    },
+    {
         match: 'smartx_VoiceNotesSink_CF_24_MONO_c',
         hw: 'smartx:VoiceNotesSink_CF_24_MONO',
         rate: 24000,
         hwChannels: 1,
         amRoute: { sourceID: 389, sinkID: 389, fallbackSourceID: 129 },
         label: 'Mic trần khử ồn Harman ECNR 24kHz (VoiceNotesSink)',
-        score: 96,
-    },
-    {
-        match: 'smartx_SpeechSink_CF_2MIC_1REF_SPEECH_c',
-        hw: 'smartx:SpeechSink_CF_2MIC_1REF_SPEECH',
-        rate: 24000,
-        hwChannels: 3,
-        amRoute: { sourceID: 129, sinkID: 387 },
-        label: 'Cặp Mic trần 2 vùng SpeechSink (2MIC_1REF)',
-        score: 94,
-    },
-    {
-        match: 'smartx_AndroidAutoSink_CF_24_MONO_c',
-        hw: 'smartx:AndroidAutoSink_CF_24_MONO',
-        rate: 24000,
-        hwChannels: 1,
-        amRoute: { sourceID: 389, sinkID: 390, fallbackSourceID: 129 },
-        label: 'Mic trần khử ồn Harman ECNR 24kHz (AndroidAutoSink)',
-        score: 90,
+        score: 95,
     },
     {
         match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_6REF_c',
@@ -54,7 +45,16 @@ const SMARTX_PROFILES = [
         hwChannels: 8,
         amRoute: null,
         label: 'Cặp Mic trần 2 vùng + 6 kênh khử vọng (AVB 2MIC_6REF)',
-        score: 85,
+        score: 91,
+    },
+    {
+        match: 'smartx_AndroidAutoSink_CF_24_MONO_c',
+        hw: 'smartx:AndroidAutoSink_CF_24_MONO',
+        rate: 24000,
+        hwChannels: 1,
+        amRoute: { sourceID: 389, sinkID: 390, fallbackSourceID: 129 },
+        label: 'Mic trần khử ồn Harman ECNR 24kHz (AndroidAutoSink)',
+        score: 88,
     },
 ];
 
@@ -485,6 +485,7 @@ class WakeWordMonitor {
         }, opts || {});
 
         this.running = false;
+        this.tickInFlight = false;
         this.child = null;
         this.routeToken = null;
         this.activeDevice = '';
@@ -493,6 +494,10 @@ class WakeWordMonitor {
         this.cooldownUntil = 0;
         this.watchTimer = null;
         this.stdoutBuf = '';
+    }
+
+    setSwapChannels(flag) {
+        this.opts.swapChannels = !!flag;
     }
 
     log(msg) {
@@ -566,72 +571,87 @@ class WakeWordMonitor {
     }
 
     async tick() {
-        if (!this.running) return;
-        const paused = !!this.opts.shouldPause() || Date.now() < this.cooldownUntil;
-        if (paused) {
-            if (this.child) await this.killWorker();
-            this.setStatus('paused');
-            return;
-        }
-        if (this.child) return;
-        if (!fs.existsSync(this.opts.mguPython) || !fs.existsSync(this.opts.smartxHelper)) {
-            this.setStatus('paused');
-            return;
-        }
-
-        const cands = this.pickCandidates();
-        if (!cands.length) {
-            this.setStatus('paused');
-            return;
-        }
-        const prof = cands[this.profileIdx % cands.length];
-        if (prof.amRoute && typeof this.opts.connectAmRoute === 'function') {
-            try { this.routeToken = await this.opts.connectAmRoute(prof.amRoute); } catch (e) { this.routeToken = null; }
-        }
-
-        this.stdoutBuf = '';
-        const child = cp.spawn(this.opts.mguPython, [
-            this.opts.smartxHelper,
-            '--vad-loop',
-            String(prof.hw),
-            this.opts.outFile,
-            String(prof.rate || 24000),
-            String(prof.hwChannels || 1),
-        ], { stdio: ['ignore', 'pipe', 'ignore'] });
-
-        this.child = child;
-        this.activeDevice = prof.hw;
-
-        child.stdout.on('data', (chunk) => {
-            this.stdoutBuf += chunk.toString('utf8');
-            let idx;
-            while ((idx = this.stdoutBuf.indexOf('\n')) >= 0) {
-                const line = this.stdoutBuf.slice(0, idx).trim();
-                this.stdoutBuf = this.stdoutBuf.slice(idx + 1);
-                if (!line) continue;
-                try {
-                    const ev = JSON.parse(line);
-                    this.handleVadEvent(ev, prof);
-                } catch (e) {}
+        if (!this.running || this.tickInFlight) return;
+        this.tickInFlight = true;
+        try {
+            const paused = !!this.opts.shouldPause() || Date.now() < this.cooldownUntil;
+            if (paused) {
+                if (this.child) await this.killWorker();
+                this.setStatus('paused');
+                return;
             }
-        });
+            if (this.child) return;
+            if (!fs.existsSync(this.opts.mguPython) || !fs.existsSync(this.opts.smartxHelper)) {
+                this.setStatus('paused');
+                return;
+            }
 
-        child.on('close', (code) => {
-            if (this.child === child) {
-                this.child = null;
-                if (code !== 0 && this.running && !this.opts.shouldPause()) {
-                    this.profileIdx++;
-                    this.holdCooldown(700);
+            const cands = this.pickCandidates();
+            if (!cands.length) {
+                this.setStatus('paused');
+                return;
+            }
+            const prof = cands[this.profileIdx % cands.length];
+            if (prof.amRoute && typeof this.opts.connectAmRoute === 'function') {
+                try { this.routeToken = await this.opts.connectAmRoute(prof.amRoute); } catch (e) { this.routeToken = null; }
+            }
+            if (!this.running || this.opts.shouldPause() || Date.now() < this.cooldownUntil) {
+                const rt = this.routeToken;
+                this.routeToken = null;
+                if (rt && rt.created && rt.connId !== null && typeof this.opts.disconnectAmRoute === 'function') {
+                    try { await this.opts.disconnectAmRoute(rt.connId); } catch (e) {}
                 }
+                this.setStatus('paused');
+                return;
             }
-        });
-        child.on('error', () => {
-            if (this.child === child) {
-                this.child = null;
-                this.profileIdx++;
-                this.holdCooldown(900);
-            }
-        });
+
+            unlinkSafe(this.opts.outFile);
+            this.stdoutBuf = '';
+            const child = cp.spawn(this.opts.mguPython, [
+                this.opts.smartxHelper,
+                '--vad-loop',
+                String(prof.hw),
+                this.opts.outFile,
+                String(prof.rate || 24000),
+                String(prof.hwChannels || 1),
+            ], { stdio: ['ignore', 'pipe', 'ignore'] });
+
+            this.child = child;
+            this.activeDevice = prof.hw;
+
+            child.stdout.on('data', (chunk) => {
+                this.stdoutBuf += chunk.toString('utf8');
+                let idx;
+                while ((idx = this.stdoutBuf.indexOf('\n')) >= 0) {
+                    const line = this.stdoutBuf.slice(0, idx).trim();
+                    this.stdoutBuf = this.stdoutBuf.slice(idx + 1);
+                    if (!line) continue;
+                    try {
+                        const ev = JSON.parse(line);
+                        this.handleVadEvent(ev, prof);
+                    } catch (e) {}
+                }
+            });
+
+            child.on('close', (code) => {
+                if (this.child === child) {
+                    this.child = null;
+                    if (code !== 0 && this.running && !this.opts.shouldPause()) {
+                        this.profileIdx++;
+                        this.holdCooldown(700);
+                    }
+                }
+            });
+            child.on('error', () => {
+                if (this.child === child) {
+                    this.child = null;
+                    this.profileIdx++;
+                    this.holdCooldown(900);
+                }
+            });
+        } finally {
+            this.tickInFlight = false;
+        }
     }
 
     handleVadEvent(ev, prof) {
@@ -649,6 +669,7 @@ class WakeWordMonitor {
             this.setStatus('armed');
             try {
                 const wavBuf = fs.readFileSync(ev.file);
+                unlinkSafe(ev.file);
                 const analysis = analyzeStereoMicBuffer(wavBuf, { swapChannels: this.opts.swapChannels });
                 if (this.opts.onUtterance) {
                     this.opts.onUtterance({

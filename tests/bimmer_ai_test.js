@@ -458,10 +458,12 @@ async function runAllTests() {
         // 5. `WakeWordMonitor` child-process supervisor & phone-call instant pause
         const fakeHelper = path.join(tmpWake, 'mock_vad.js');
         const fakeOutWav = path.join(tmpWake, 'vad_utt.wav');
-        fs.writeFileSync(fakeOutWav, wavClip);
+        const wavB64 = wavClip.toString('base64');
         fs.writeFileSync(fakeHelper, [
-            'console.log(JSON.stringify({ event: "ready", device: "smartx:VoiceNotesSink_CF_24_MONO" }));',
+            'const fs = require("fs");',
+            'console.log(JSON.stringify({ event: "ready", device: "smartx:SpeechSink_CF_2MIC_1REF_SPEECH" }));',
             'setTimeout(() => {',
+            '  fs.writeFileSync(process.argv[4], Buffer.from(' + JSON.stringify(wavB64) + ', "base64"));',
             '  console.log(JSON.stringify({ event: "utterance", file: process.argv[4], durationMs: 1200, speechDb: -18.5, noiseDb: -48.0 }));',
             '}, 80);',
             'setInterval(() => {}, 1000);',
@@ -480,6 +482,7 @@ async function runAllTests() {
         await new Promise((r) => setTimeout(r, 350));
         assert.strictEqual(mon.status, 'armed');
         assert.ok(gotUtterance && gotUtterance.analysis.speakerZone === 'driver');
+        assert.strictEqual(fs.existsSync(fakeOutWav), false); // unlinked after read so never re-processed!
 
         // Phone call arrives -> monitor must immediately kill worker & enter `paused`!
         callActive = true;
@@ -490,6 +493,147 @@ async function runAllTests() {
 
         await dm.stop();
         await new Promise((r) => mockWakeGemini.close(r));
+    });
+
+    /* ---------------- 10. QA v0.4.1 Edge-Case & Regression Suite ---------------- */
+    await step('QA v0.4.1: IPC Dedup, 2-Zone SpeechSink Priority, Hallucination Gate, Auto Start-Stop & HMI Toggle', async () => {
+        const net = require('net');
+        const Module = require('module');
+        const origLoad = Module._load;
+        Module._load = function (reqId, parent, isMain) {
+            if (reqId === './kit/qr') return { draw: () => 180 };
+            return origLoad.apply(this, [reqId, parent, isMain]);
+        };
+        let UI;
+        try {
+            UI = require('../apps/bimmer_ai/ui');
+        } finally {
+            Module._load = origLoad;
+        }
+
+        // 1. Primary SmartX profile MUST be 2-Zone Stereo `SpeechSink_CF_2MIC_1REF_SPEECH` (`hwChannels: 3`)
+        assert.strictEqual(AudioIO.SMARTX_PROFILES[0].hw, 'smartx:SpeechSink_CF_2MIC_1REF_SPEECH');
+        assert.strictEqual(AudioIO.SMARTX_PROFILES[0].hwChannels, 3);
+
+        // 2. Casual "BMW" / "Bim" chatter rejected, while fillers + "Hey BMW" + "Trợ lý ơi" + stripped remainder work!
+        assert.strictEqual(AiBrain.extractWakeCommand('BMW mới ra bản CS đẹp quá').matched, false);
+        assert.strictEqual(AiBrain.extractWakeCommand('Bim của mày chạy bốc thế').matched, false);
+        assert.strictEqual(AiBrain.extractWakeCommand('Trợ lý ơi!').wakeOnly, true);
+        const heyBmw = AiBrain.extractWakeCommand('Hey BMW mở cửa sổ trời');
+        assert.strictEqual(heyBmw.matched, true);
+        assert.strictEqual(heyBmw.wakeOnly, false);
+        assert.strictEqual(heyBmw.remainder, 'mở cửa sổ trời');
+        const fillerWake = AiBrain.extractWakeCommand('À Hey Bimmer, dẫn đường tới Hồ Gươm');
+        assert.strictEqual(fillerWake.matched, true);
+        assert.strictEqual(fillerWake.remainder, 'dẫn đường tới Hồ Gươm');
+
+        // 3. Deterministic Wake Gate blocks LLM hallucinated tool calls when cabin chatter lacks wake word!
+        const rogueGemini = http.createServer((req, res) => {
+            req.on('data', () => {});
+            req.on('end', () => {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    candidates: [{
+                        content: {
+                            parts: [
+                                { functionCall: { name: 'set_climate', args: { tempC: 16.5, zone: 'both' } } },
+                                { text: '[TRANSCRIPT: Trời nóng quá nhỉ tí đi uống bia không] Đã hạ điều hoà!' },
+                            ],
+                        },
+                    }],
+                }));
+            });
+        });
+        await new Promise((r) => rogueGemini.listen(0, '127.0.0.1', r));
+        const roguePort = rogueGemini.address().port;
+
+        const tmpQa = fs.mkdtempSync(path.join(os.tmpdir(), 'bimmer-ai-qa-'));
+        const dm = new BimmerAiDaemon({
+            run: path.join(tmpQa, 'run'),
+            state: path.join(tmpQa, 'state'),
+            oap: path.join(tmpQa, 'oap'),
+            port: 0,
+            host: '127.0.0.1',
+            simMode: true,
+            noNft: true,
+            quiet: true,
+            geminiBaseUrl: 'http://127.0.0.1:' + roguePort,
+        });
+        await dm.start();
+        dm.saveSettings({ apiKey: 'AIzaSyFakeQaKey', handsFreeWake: true, ttsEnabled: false });
+
+        const driverL = new Float32Array(8000);
+        const passR = new Float32Array(8000);
+        for (let i = 0; i < 8000; i++) {
+            driverL[i] = Math.sin(i * 0.15) * 0.03;
+            passR[i] = Math.sin(i * 0.15) * 0.45; // Passenger louder!
+        }
+        const passWav = AudioIO.buildStereoWav(driverL, passR, 16000);
+
+        const beforeTemp = dm.vehicle.state.climate.tempDriverC;
+        const rRogue = await dm.handleVoiceOrTextTurn({
+            audioWavBase64: passWav.toString('base64'),
+            audioMimeType: 'audio/wav',
+            wakeMode: true,
+        });
+        assert.strictEqual(rRogue.ignored, true);
+        assert.strictEqual(dm.vehicle.state.climate.tempDriverC, beforeTemp);
+
+        // 4. Duplicate HMI Command ID sent simultaneously over `ctl.sock` AND `app/command.json` executes ONLY ONCE!
+        assert.strictEqual(dm.settings.handsFreeWake, true);
+        const dupPayload = JSON.stringify({ id: 987654, cmd: 'toggle_hands_free', arg: {} });
+        fs.writeFileSync(path.join(tmpQa, 'run', 'app', 'command.json'), dupPayload);
+        await new Promise((resolve) => {
+            const c = net.createConnection(path.join(tmpQa, 'run', 'ctl.sock'), () => {
+                c.end(dupPayload + '\n', resolve);
+            });
+        });
+        dm.pollHmiAppCommand();
+        await new Promise((r) => setTimeout(r, 80));
+        assert.strictEqual(dm.settings.handsFreeWake, false); // Toggled ONCE (true -> false), NOT twice!
+        dm.saveSettings({ handsFreeWake: true });
+
+        // 5. Auto Start-Stop at red light (`gear: 'D', rpm: 0, battery12v: 12.3`) keeps WakeWordMonitor active,
+        //    whereas parked engine-off with weak battery (`gear: 'P', rpm: 0, battery12v: 11.6`) pauses to save 12V!
+        dm.vehicle.patchTelemetry({ liveCar: true, gear: 'D', rpm: 0, battery12v: 12.3 });
+        assert.strictEqual(dm.wakeMonitor.opts.shouldPause(), false);
+        dm.vehicle.patchTelemetry({ liveCar: true, gear: 'P', rpm: 0, battery12v: 11.6 });
+        assert.strictEqual(dm.wakeMonitor.opts.shouldPause(), true);
+
+        // 6. HMI `ui.js` Guards screen exposes direct `'aiToggleHandsFree'` touch/rotary target
+        const targets = {};
+        const mockCv = {
+            clear: () => {},
+            roundRect: () => {},
+            strokeRoundRect: () => {},
+            fillRect: () => {},
+            circle: () => {},
+            text: () => {},
+            textWidth: (s) => String(s || '').length * 8,
+            target: (_x, _y, _w, _h, fn, key) => { targets[key] = fn; },
+        };
+        const mockG = {
+            TOP: 64,
+            MARGIN: 24,
+            withAlpha: (c) => c,
+            frame: () => {},
+            stripes: () => {},
+            button: () => {},
+            pageBottom: () => 500,
+        };
+        let toggledUi = 0;
+        UI.draw(mockCv, mockG, { bg: '#000', text: '#fff', dim: '#888' }, {
+            viewMode: 'guards',
+            settings: { handsFreeWake: true, hasApiKey: true },
+            guards: {},
+            telemetry: dm.vehicle.state,
+        }, { toggleHandsFree: () => { toggledUi++; } });
+        assert.strictEqual(typeof targets.aiToggleHandsFree, 'function');
+        targets.aiToggleHandsFree();
+        assert.strictEqual(toggledUi, 1);
+
+        await dm.stop();
+        await new Promise((r) => rogueGemini.close(r));
     });
 
     console.log('\nALL ' + passed + ' TEST SUITES PASSED!');

@@ -80,12 +80,20 @@ def _extract_pcm_chunk(raw, got, hw_ch, out_channels, decim, frame_idx):
 
 def _write_wav_atomic(out_wav, out_channels, out_rate, pcm_bytes):
     tmp_path = out_wav + ".tmp." + str(os.getpid())
-    with wave.open(tmp_path, "wb") as wf:
-        wf.setnchannels(out_channels)
-        wf.setsampwidth(2)
-        wf.setframerate(out_rate)
-        wf.writeframes(pcm_bytes)
-    os.replace(tmp_path, out_wav)
+    try:
+        with wave.open(tmp_path, "wb") as wf:
+            wf.setnchannels(out_channels)
+            wf.setsampwidth(2)
+            wf.setframerate(out_rate)
+            wf.writeframes(pcm_bytes)
+        os.replace(tmp_path, out_wav)
+    except BaseException:
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
 
 
 def _fast_chunk_db_and_peak(pcm_bytes):
@@ -282,8 +290,9 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                 else:
                     quiet_streak += 1
 
-                # End utterance after 12 quiet chunks (~720ms silence) OR max 100 chunks (~6.0s)
-                if quiet_streak >= 12 or len(active_chunks) >= 100:
+                # Allow natural 900ms pause right after "Hey Bimmer," (<30 chunks) and 720ms after command body, max 6.6s
+                hangover_chunks = 15 if len(active_chunks) < 30 else 12
+                if quiet_streak >= hangover_chunks or len(active_chunks) >= 110:
                     pcm_all = b"".join(active_chunks)
                     dur_ms = int(round((len(pcm_all) / (out_channels * 2 * out_rate)) * 1000))
                     in_speech = False
@@ -291,8 +300,8 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                     hot_streak = 0
                     quiet_streak = 0
 
-                    # Require >= 8 voiced chunks (~480ms actual voice) to ignore door slams / coughs
-                    if voiced_chunks >= 8 and dur_ms >= 650:
+                    # Require >= 7 voiced chunks (~420ms actual voice) & >= 600ms total to ignore door slams / clicks
+                    if voiced_chunks >= 7 and dur_ms >= 600:
                         _write_wav_atomic(out_wav, out_channels, out_rate, pcm_all)
                         last_emit_at = time.monotonic()
                         emit_json({
@@ -307,6 +316,12 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                         emit_json({"event": "speech_cancel", "durationMs": dur_ms})
     finally:
         asound.snd_pcm_close(pcm)
+        tmp_leftover = out_wav + ".tmp." + str(os.getpid())
+        try:
+            if os.path.exists(tmp_leftover):
+                os.unlink(tmp_leftover)
+        except OSError:
+            pass
 
 
 def main():

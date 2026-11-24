@@ -39,28 +39,42 @@ function dbToNorm(db) {
     return Math.max(0.06, Math.min(1, (db + 65) / 55));
 }
 
-function drawGuardsPane(cv, G, t, lx, top, guards, act) {
+function drawGuardsPane(cv, G, t, lx, top, v, act) {
+    const guards = (v && v.guards) || {};
+    const hfEnabled = !(v && v.settings && v.settings.handsFreeWake === false);
     const w = 324, h = 390;
     cv.roundRect(lx, top, w, h, 16, G.withAlpha('#ffffff', 0.05));
     cv.strokeRoundRect(lx, top, w, h, 16, 1.4, G.withAlpha('#ffffff', 0.22));
-    cv.text('QUYỀN ĐIỀU KHIỂN AI', lx + 18, top + 32, 18, t.text, { literal: true, font: 'bold' });
-    cv.text('Đóng', lx + w - 18, top + 32, 15, t.accent2 || '#4da6ff', { literal: true, align: 'right', font: 'bold' });
-    if (cv.target && act.toggleView) cv.target(lx + w - 84, top, 84, 44, act.toggleView, 'aiCloseGuards');
+    cv.text('QUYỀN & HEY BIMMER', lx + 18, top + 30, 17, t.text, { literal: true, font: 'bold' });
+    cv.text('Đóng', lx + w - 18, top + 30, 15, t.accent2 || '#4da6ff', { literal: true, align: 'right', font: 'bold' });
+    if (cv.target && act.toggleView) cv.target(lx + w - 84, top, 84, 42, act.toggleView, 'aiCloseGuards');
+
+    // Row 0: Direct iDrive toggle for 100% Hands-Free "Hey Bimmer / Ê Bimmer"
+    const hfCol = hfEnabled ? '#00e5ff' : (t.dim || '#94a3b8');
+    const hfY = top + 44;
+    cv.roundRect(lx + 14, hfY, w - 28, 42, 10, G.withAlpha('#00e5ff', hfEnabled ? 0.14 : 0.03));
+    cv.strokeRoundRect(lx + 14, hfY, w - 28, 42, 10, 1.2, G.withAlpha(hfCol, 0.75));
+    cv.circle(lx + 32, hfY + 21, 6, hfCol);
+    cv.text(fit(cv, 'Gọi rảnh tay "Hey Bimmer"', 15, { literal: true, font: 'bold' }, w - 115), lx + 48, hfY + 27, 15, t.text, { literal: true, font: 'bold' });
+    cv.text(hfEnabled ? 'BẬT' : 'TẮT', lx + w - 28, hfY + 27, 14, hfCol, { literal: true, align: 'right', font: 'bold' });
+    if (cv.target && act.toggleHandsFree) {
+        cv.target(lx + 14, hfY, w - 28, 42, act.toggleHandsFree, 'aiToggleHandsFree');
+    }
 
     for (let i = 0; i < GUARD_ITEMS.length; i++) {
         const key = GUARD_ITEMS[i][0];
         const label = GUARD_ITEMS[i][1];
         const enabled = guards[key] !== false;
-        const ry = top + 48 + i * 54;
+        const ry = top + 94 + i * 47;
         const col = enabled ? (t.go || '#2fd27a') : (t.crit || '#ef2b2d');
-        cv.roundRect(lx + 14, ry, w - 28, 46, 10, G.withAlpha('#ffffff', enabled ? 0.06 : 0.025));
-        cv.strokeRoundRect(lx + 14, ry, w - 28, 46, 10, 1, G.withAlpha(col, 0.55));
-        cv.circle(lx + 32, ry + 23, 6, col);
-        cv.text(fit(cv, label, 16, { literal: true, font: 'bold' }, w - 115), lx + 48, ry + 29, 16, t.text, { literal: true, font: 'bold' });
-        cv.text(enabled ? 'BẬT' : 'KHOÁ', lx + w - 28, ry + 29, 14, col, { literal: true, align: 'right', font: 'bold' });
+        cv.roundRect(lx + 14, ry, w - 28, 41, 10, G.withAlpha('#ffffff', enabled ? 0.06 : 0.025));
+        cv.strokeRoundRect(lx + 14, ry, w - 28, 41, 10, 1, G.withAlpha(col, 0.55));
+        cv.circle(lx + 32, ry + 20, 6, col);
+        cv.text(fit(cv, label, 15, { literal: true, font: 'bold' }, w - 115), lx + 48, ry + 26, 15, t.text, { literal: true, font: 'bold' });
+        cv.text(enabled ? 'BẬT' : 'KHOÁ', lx + w - 28, ry + 26, 14, col, { literal: true, align: 'right', font: 'bold' });
         if (cv.target && act.toggleGuard) {
             const domainKey = key;
-            cv.target(lx + 14, ry, w - 28, 46, () => act.toggleGuard(domainKey), 'aiGuard_' + domainKey);
+            cv.target(lx + 14, ry, w - 28, 41, () => act.toggleGuard(domainKey), 'aiGuard_' + domainKey);
         }
     }
 }
@@ -166,7 +180,7 @@ function draw(cv, G, t, v, act) {
     const bottom = G.pageBottom(cv) - (cv.own ? G.MARGIN : 8);
 
     if (v.viewMode === 'guards') {
-        drawGuardsPane(cv, G, t, lx, top, v.guards || {}, act);
+        drawGuardsPane(cv, G, t, lx, top, v, act);
     } else {
         drawVoiceAndQrPane(cv, G, t, lx, top, v, act);
     }

@@ -28,7 +28,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.4.0';
+const VERSION = '0.4.1';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -248,6 +248,10 @@ class BimmerAiDaemon {
         this.lastOverspeedWarnAt = 0;
         this.greetedDrive = false;
         this.lastCmdId = 0;
+        this.seenCmdIds = [];
+        this.turnBusy = false;
+        this.unduckedVolume = null;
+        this.unduckTimer = null;
 
         this.uplinkOpts = Up.options({
             stateDir: path.join(this.cfg.state, 'state'),
@@ -272,9 +276,12 @@ class BimmerAiDaemon {
                 if (!this.settings.handsFreeWake) return true;
                 if (!(this.settings.apiKey && String(this.settings.apiKey).trim())) return true;
                 if (this.vehicle.state.callActive) return true;
-                if (this.assistantState !== 'idle') return true;
-                // On live car, only keep mic stream open when engine/ignition is on (or in active follow-up window)
-                if (this.vehicle.state.liveCar && !this.vehicle.state.engineRunning && Date.now() >= this.followUpUntil) return true;
+                if (this.turnBusy || this.assistantState !== 'idle') return true;
+                // Keep armed at red lights (Auto Start-Stop) & when iDrive is awake; only pause on engine-off + low 12V (<11.85V)
+                const t = this.vehicle.state;
+                if (t.liveCar && !t.engineRunning && t.gear === 'P' && typeof t.battery12v === 'number' && t.battery12v > 5 && t.battery12v < 11.85 && Date.now() >= this.followUpUntil) {
+                    return true;
+                }
                 return false;
             },
             onStatusChange: (st) => {
@@ -288,6 +295,7 @@ class BimmerAiDaemon {
                 }
             },
             onUtterance: (utt) => {
+                if (this.turnBusy || this.assistantState !== 'idle') return;
                 const inFollowUp = Date.now() < this.followUpUntil;
                 this.micLevels = { leftDb: utt.analysis.leftDb, rightDb: utt.analysis.rightDb };
                 const zone = utt.analysis.speakerZone === 'passenger' ? 'passenger' : 'driver';
@@ -302,6 +310,15 @@ class BimmerAiDaemon {
         });
     }
 
+    markCmdSeen(id) {
+        if (!id) return true;
+        if (this.seenCmdIds.indexOf(id) >= 0) return false;
+        this.lastCmdId = id;
+        this.seenCmdIds.push(id);
+        if (this.seenCmdIds.length > 64) this.seenCmdIds.shift();
+        return true;
+    }
+
     log(msg) {
         const line = new Date().toISOString() + ' ' + msg;
         this.logs.push(line);
@@ -314,6 +331,10 @@ class BimmerAiDaemon {
         if (patch && patch.guards) merged.guards = Object.assign({}, this.settings.guards, patch.guards);
         this.settings = normalizeSettings(merged);
         this.vehicle.setGuards(this.settings.guards);
+        if (this.wakeMonitor) {
+            this.wakeMonitor.setSwapChannels(this.settings.swapMicChannels);
+            this.wakeMonitor.tick().catch(() => {});
+        }
         writeAtomic(this.settingsFile, JSON.stringify(this.settings, null, 2) + '\n', 0o600);
         this.writeStatusFile();
         return this.publicSettings();
@@ -503,109 +524,151 @@ class BimmerAiDaemon {
     /** Execute a full AI voice/text turn, including stereo WAV speaker localization, SafetyGate, Audio Ducking & TTS. */
     async handleVoiceOrTextTurn(req) {
         const input = req || {};
-        let speakerZone = input.speakerZone || 'driver';
-
-        // If stereo WAV audio was uploaded, analyze Left vs Right ceiling mic RMS energy!
-        if (input.audioWavBase64 && (!input.audioMimeType || input.audioMimeType === 'audio/wav')) {
-            try {
-                const wavBuf = Buffer.from(input.audioWavBase64, 'base64');
-                const ana = AudioIO.analyzeStereoMicBuffer(wavBuf, { swapChannels: this.settings.swapMicChannels });
-                if (ana.channels === 2 && ana.confidence >= 0.5) {
-                    speakerZone = ana.speakerZone;
-                    this.micLevels = { leftDb: ana.leftDb, rightDb: ana.rightDb };
-                }
-            } catch (e) {}
+        if (this.turnBusy && input.wakeMode) {
+            return { at: Date.now(), engine: 'busy', ignored: true, wakeOnly: false, speakerZone: 'driver', transcript: '', replyVi: '', actions: [], ttsAudioBase64: '', telemetry: this.vehicle.state };
         }
+        this.turnBusy = true;
+        try {
+            let speakerZone = input.speakerZone || 'driver';
 
-        this.activeSpeakerZone = speakerZone;
-        if (!input.wakeMode) {
-            this.assistantState = 'thinking';
-            this.writeStatusFile();
-        }
-
-        const turn = await AiBrain.processAssistantTurn({
-            text: input.text || '',
-            audioWavBase64: input.audioWavBase64 || '',
-            audioMimeType: input.audioMimeType || 'audio/wav',
-            wakeMode: !!input.wakeMode,
-            speakerZone,
-            ownerName: this.settings.ownerName,
-            apiKey: this.settings.apiKey,
-            model: this.settings.model,
-            vehicleController: this.vehicle,
-            history: this.history,
-            uplinkOpts: this.uplinkOpts,
-        });
-
-        // In Hands-Free `wakeMode`, silently drop background cabin conversation that lacked "Hey Bimmer"
-        if (turn.ignored) {
-            this.assistantState = 'idle';
-            if (this.wakeMonitor) this.wakeMonitor.holdCooldown(500);
-            this.writeStatusFile();
-            return Object.assign({}, turn, { ttsAudioBase64: '', telemetry: this.vehicle.state });
-        }
-
-        if (turn.wakeOnly) {
-            // User called "Hey Bimmer!" -> answer "Dạ đại ca cần gì em?" and open 10s follow-up window!
-            this.followUpUntil = Date.now() + 10000;
-        } else {
-            this.followUpUntil = 0;
-        }
-
-        this.lastTurn = turn;
-        this.history.push({
-            at: turn.at,
-            zone: turn.speakerZone,
-            user: turn.transcript,
-            ai: turn.replyVi,
-            engine: turn.engine,
-            actions: turn.actions,
-        });
-        if (this.history.length > 25) this.history.shift();
-
-        // Synthesize TTS MP3 with Audio Ducking & BMW MediaPlayer speaker output
-        let ttsAudioBase64 = '';
-        if (this.settings.ttsEnabled && turn.replyVi) {
-            this.assistantState = 'speaking';
-            if (this.wakeMonitor) this.wakeMonitor.holdCooldown(turn.wakeOnly ? 2600 : 3800);
-            this.writeStatusFile();
-            const prevVol = this.vehicle.state.media.volumePercent;
-            const wasPlaying = this.vehicle.state.media.playing;
-            if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
-                await this.vehicle.callMethodIfAvailable('audioCmd', 'setVolume', {
-                    sinkID: 1,
-                    volume: this.settings.duckVolumePercent,
-                });
-            }
-            const mp3 = await AudioIO.synthesizeVietnameseMp3(turn.replyVi, this.uplinkOpts, Up);
-            if (mp3) {
-                ttsAudioBase64 = mp3.toString('base64');
-                const ttsDir = path.join(this.cfg.run, 'tts');
-                const mp3Path = path.join(ttsDir, 'reply.mp3');
+            // If stereo WAV audio was uploaded, analyze Left vs Right ceiling mic RMS energy!
+            if (input.audioWavBase64 && (!input.audioMimeType || input.audioMimeType === 'audio/wav')) {
                 try {
-                    fs.chmodSync(this.cfg.run, 0o755);
-                    fs.chmodSync(ttsDir, 0o755);
-                    fs.writeFileSync(mp3Path, mp3, { mode: 0o644 });
-                    await this.vehicle.playTtsOnCarSpeakers(mp3Path, speakerZone);
+                    const wavBuf = Buffer.from(input.audioWavBase64, 'base64');
+                    const ana = AudioIO.analyzeStereoMicBuffer(wavBuf, { swapChannels: this.settings.swapMicChannels });
+                    if (ana.channels === 2 && ana.confidence >= 0.5) {
+                        speakerZone = ana.speakerZone;
+                        this.micLevels = { leftDb: ana.leftDb, rightDb: ana.rightDb };
+                    }
                 } catch (e) {}
+            }
+
+            this.activeSpeakerZone = speakerZone;
+            if (!input.wakeMode) {
+                this.assistantState = 'thinking';
+                this.writeStatusFile();
+            }
+
+            const prevVolBeforeTurn = this.unduckedVolume !== null ? this.unduckedVolume : this.vehicle.state.media.volumePercent;
+            const wasPlayingBeforeTurn = this.vehicle.state.media.playing;
+
+            const turn = await AiBrain.processAssistantTurn({
+                text: input.text || '',
+                audioWavBase64: input.audioWavBase64 || '',
+                audioMimeType: input.audioMimeType || 'audio/wav',
+                wakeMode: !!input.wakeMode,
+                speakerZone,
+                ownerName: this.settings.ownerName,
+                apiKey: this.settings.apiKey,
+                model: this.settings.model,
+                vehicleController: this.vehicle,
+                history: this.history,
+                uplinkOpts: this.uplinkOpts,
+            });
+
+            // In Hands-Free `wakeMode`, silently drop background cabin conversation that lacked "Hey Bimmer"
+            if (turn.ignored) {
+                this.assistantState = 'idle';
+                if (this.wakeMonitor) this.wakeMonitor.holdCooldown(450);
+                this.writeStatusFile();
+                return Object.assign({}, turn, { ttsAudioBase64: '', telemetry: this.vehicle.state });
+            }
+
+            const turnChangedVolume = (turn.actions || []).some((a) =>
+                a && a.ok && (
+                    (a.tool === 'control_media' && a.args && (a.args.volumePercent !== undefined || a.args.action === 'volume' || a.args.action === 'mute')) ||
+                    a.tool === 'run_scene'
+                )
+            );
+
+            this.lastTurn = turn;
+            this.history.push({
+                at: turn.at,
+                zone: turn.speakerZone,
+                user: turn.transcript,
+                ai: turn.replyVi,
+                engine: turn.engine,
+                actions: turn.actions,
+            });
+            if (this.history.length > 25) this.history.shift();
+
+            // Synthesize TTS MP3 with Safe Audio Ducking & Echo-Free Cooldown
+            let ttsAudioBase64 = '';
+            const estSpeakMs = Math.max(2200, Math.min(5600, 1100 + String(turn.replyVi || '').length * 52));
+            if (this.settings.ttsEnabled && turn.replyVi) {
+                this.assistantState = 'speaking';
+                if (this.wakeMonitor) this.wakeMonitor.holdCooldown(estSpeakMs + 1500);
+                this.writeStatusFile();
+
+                const shouldDuck = !turnChangedVolume && wasPlayingBeforeTurn && prevVolBeforeTurn > this.settings.duckVolumePercent;
+                if (shouldDuck) {
+                    if (this.unduckTimer) {
+                        clearTimeout(this.unduckTimer);
+                        this.unduckTimer = null;
+                    }
+                    this.unduckedVolume = prevVolBeforeTurn;
+                    await this.vehicle.callMethodIfAvailable('audioCmd', 'setVolume', {
+                        sinkID: 1,
+                        volume: this.settings.duckVolumePercent,
+                    });
+                }
+
+                const mp3 = await AudioIO.synthesizeVietnameseMp3(turn.replyVi, this.uplinkOpts, Up);
+                let playedOnCar = false;
+                if (mp3) {
+                    ttsAudioBase64 = mp3.toString('base64');
+                    const ttsDir = path.join(this.cfg.run, 'tts');
+                    const mp3Path = path.join(ttsDir, 'reply.mp3');
+                    try {
+                        fs.chmodSync(this.cfg.run, 0o755);
+                        fs.chmodSync(ttsDir, 0o755);
+                        fs.writeFileSync(mp3Path, mp3, { mode: 0o644 });
+                        playedOnCar = await this.vehicle.playTtsOnCarSpeakers(mp3Path, speakerZone);
+                    } catch (e) {}
+                } else {
+                    await this.vehicle.pulseIpaLight('off');
+                }
+
+                // Refresh echo-guard cooldown AFTER network synthesis completes so car speakers never self-trigger VAD!
+                if (this.wakeMonitor) {
+                    this.wakeMonitor.holdCooldown(playedOnCar ? estSpeakMs : 600);
+                }
+
+                if (shouldDuck) {
+                    const restoreTarget = this.unduckedVolume;
+                    this.unduckTimer = setTimeout(() => {
+                        this.unduckTimer = null;
+                        this.unduckedVolume = null;
+                        if (restoreTarget !== null) {
+                            this.vehicle.callMethodIfAvailable('audioCmd', 'setVolume', {
+                                sinkID: 1,
+                                volume: restoreTarget,
+                            }).catch(() => {});
+                        }
+                    }, playedOnCar ? estSpeakMs : 900);
+                } else if (turnChangedVolume && this.unduckTimer) {
+                    clearTimeout(this.unduckTimer);
+                    this.unduckTimer = null;
+                    this.unduckedVolume = null;
+                }
             } else {
                 await this.vehicle.pulseIpaLight('off');
             }
-            if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
-                setTimeout(() => {
-                    this.vehicle.callMethodIfAvailable('audioCmd', 'setVolume', {
-                        sinkID: 1,
-                        volume: prevVol,
-                    }).catch(() => {});
-                }, 3200);
-            }
-        } else {
-            await this.vehicle.pulseIpaLight('off');
-        }
 
-        this.assistantState = 'idle';
-        this.writeStatusFile();
-        return Object.assign({}, turn, { ttsAudioBase64, telemetry: this.vehicle.state });
+            // Open full 10s follow-up window AFTER TTS prompt starts so network latency never steals user's speaking window!
+            if (turn.wakeOnly) {
+                const extraSpeakHold = (this.settings.ttsEnabled && turn.replyVi) ? Math.min(3200, estSpeakMs) : 0;
+                this.followUpUntil = Date.now() + 10000 + extraSpeakHold;
+            } else {
+                this.followUpUntil = 0;
+            }
+
+            this.assistantState = 'idle';
+            this.writeStatusFile();
+            return Object.assign({}, turn, { ttsAudioBase64, telemetry: this.vehicle.state });
+        } finally {
+            this.turnBusy = false;
+        }
     }
 
     /** Poll commands sent from the iDrive 7 HMI screen (both RAM /run and fallback oap data dir). */
@@ -618,9 +681,9 @@ class BimmerAiDaemon {
         }
         for (let i = 0; i < candidates.length; i++) {
             const c = readJson(candidates[i]);
-            if (!c || !c.id || c.id === this.lastCmdId) continue;
-            this.lastCmdId = c.id;
+            if (!c || !c.cmd) continue;
             try { fs.unlinkSync(candidates[i]); } catch (e) {}
+            if (!this.markCmdSeen(c.id)) continue;
             this.log('HMI app command: ' + c.cmd);
             this.executeHmiCommand(c.cmd, c.arg || {}).catch((e) => this.log('hmi cmd error: ' + e.message));
         }
@@ -785,7 +848,7 @@ class BimmerAiDaemon {
                         try {
                             const c = JSON.parse(line);
                             if (c && c.cmd) {
-                                if (c.id) this.lastCmdId = c.id;
+                                if (!this.markCmdSeen(c.id)) continue;
                                 this.log('HMI ctl.sock command: ' + c.cmd);
                                 this.executeHmiCommand(c.cmd, c.arg || {}).catch((e) => this.log('ctl.sock error: ' + e.message));
                             }
@@ -851,7 +914,14 @@ class BimmerAiDaemon {
 
     async stop() {
         if (this.pollTimer) clearInterval(this.pollTimer);
+        if (this.unduckTimer) {
+            clearTimeout(this.unduckTimer);
+            this.unduckTimer = null;
+        }
         if (this.wakeMonitor) await this.wakeMonitor.stop();
+        if (this.vehicle && typeof this.vehicle.closeRideTube === 'function') {
+            this.vehicle.closeRideTube();
+        }
         if (this.ctlServer) {
             await new Promise((resolve) => this.ctlServer.close(resolve));
             this.ctlServer = null;

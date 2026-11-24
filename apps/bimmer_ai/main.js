@@ -26,7 +26,7 @@ const SCENES = ['chill đêm', 'hạ nhiệt', 'rạp phim', 'thể thao', 'mặ
 mgu.run({
     async start(ctx) {
         const { ui, log } = ctx;
-        const version = (ctx.spec && ctx.spec.version) ? ('Bản ' + ctx.spec.version) : 'Bản 0.3.3';
+        const version = (ctx.spec && ctx.spec.version) ? ('Bản ' + ctx.spec.version) : 'Bản 0.4.1';
         let status = null, readAt = 0, cmdId = Date.now();
         let viewMode = 'main', sceneIdx = 0, animTick = 0;
 
@@ -35,6 +35,8 @@ mgu.run({
         let pendingState = '';
         let pendingBaseTurnAt = 0;
         let pendingTurn = null;
+        let optimisticHandsFree = null;
+        let optimisticHandsFreeUntil = 0;
 
         const localGuards = {
             locksAndTrunk: true,
@@ -82,22 +84,7 @@ mgu.run({
             readAt = 0;
         }
 
-        function send(cmd, arg) {
-            const msgObj = { id: ++cmdId, cmd, arg: arg || {} };
-            const payload = JSON.stringify(msgObj);
-            const sockPath = path.join(RUN, 'ctl.sock');
-
-            // 1. Instant `<1ms` Unix socket dispatch to `bimmer-ai.service`
-            if (fs.existsSync(sockPath)) {
-                try {
-                    const s = net.createConnection(sockPath, () => {
-                        s.end(payload + '\n');
-                    });
-                    s.on('error', () => {});
-                } catch (e) {}
-            }
-
-            // 2. Also write RAM/dataDir command file as fallback for older daemon versions
+        function writeFallbackCommand(cmd, payload) {
             const ramCmd = path.join(RUN, 'app', 'command.json');
             let wroteRam = false;
             try {
@@ -112,6 +99,29 @@ mgu.run({
                     fs.renameSync(f + '.tmp', f);
                 } catch (e2) { log.warn('cmd ' + cmd + ': ' + (e2 && e2.message)); }
             }
+        }
+
+        function send(cmd, arg) {
+            const msgObj = { id: ++cmdId, cmd, arg: arg || {} };
+            const payload = JSON.stringify(msgObj);
+            const sockPath = path.join(RUN, 'ctl.sock');
+
+            // 1. Primary `<1ms` Unix socket dispatch; only write fallback file if socket is absent or errors
+            if (fs.existsSync(sockPath)) {
+                try {
+                    let sent = false;
+                    const s = net.createConnection(sockPath, () => {
+                        sent = true;
+                        s.end(payload + '\n');
+                    });
+                    s.on('error', () => {
+                        if (!sent) writeFallbackCommand(cmd, payload);
+                    });
+                    readAt = 0;
+                    return;
+                } catch (e) {}
+            }
+            writeFallbackCommand(cmd, payload);
             readAt = 0;
         }
 
@@ -181,6 +191,15 @@ mgu.run({
                 viewMode = viewMode === 'guards' ? 'main' : 'guards';
                 return repaint();
             },
+            toggleHandsFree: () => {
+                const cur = optimisticHandsFree !== null
+                    ? optimisticHandsFree
+                    : !((status && status.settings && status.settings.handsFreeWake === false));
+                optimisticHandsFree = !cur;
+                optimisticHandsFreeUntil = Date.now() + 2500;
+                send('toggle_hands_free', {});
+                return repaint();
+            },
             toggleGuard: (domain) => {
                 localGuards[domain] = !localGuards[domain];
                 send('toggle_guard', { domain });
@@ -200,10 +219,16 @@ mgu.run({
                 pendingTurn = null;
                 pendingState = '';
             }
+            if (optimisticHandsFreeUntil > 0 && now > optimisticHandsFreeUntil) {
+                optimisticHandsFreeUntil = 0;
+                optimisticHandsFree = null;
+            }
             animTick++;
             const s = status;
             const hostOf = (u) => String(u || '').replace(/^http:\/\//, '').replace(/\/\?pin=\d+$/, '');
             const liveState = s ? s.assistantState : 'idle';
+            const mergedSettings = Object.assign({ hasApiKey: false, handsFreeWake: true }, (s && s.settings) || {});
+            if (optimisticHandsFree !== null) mergedSettings.handsFreeWake = optimisticHandsFree;
             return {
                 daemonUp: !!s,
                 version,
@@ -218,7 +243,7 @@ mgu.run({
                 followUpActive: !!(s && s.followUpActive),
                 activeSpeakerZone: s ? s.activeSpeakerZone : 'driver',
                 micLevels: (s && s.micLevels) || { leftDb: -32, rightDb: -54 },
-                settings: (s && s.settings) || { hasApiKey: false },
+                settings: mergedSettings,
                 telemetry: (s && s.telemetry) || {
                     speedKmh: 0,
                     gear: 'P',
