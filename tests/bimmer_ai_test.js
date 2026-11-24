@@ -74,7 +74,7 @@ async function runAllTests() {
         vc.patchTelemetry({ speedKmh: 0, gear: 'P', battery12v: 12.6 });
         await vc.invokeTool('run_scene', { scene: 'cinema_park' }, 'driver');
         assert.strictEqual(vc.state.activeScene, 'cinema_park');
-        assert.strictEqual(vc.state.blindsOpen, false);
+        assert.strictEqual(vc.state.climate.massageDriver, true);
 
         vc.patchTelemetry({ gear: 'D', speedKmh: 5 });
         assert.strictEqual(vc.state.activeScene, 'none');
