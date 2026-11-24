@@ -1,22 +1,62 @@
 'use strict';
 /**
- * audio-io.js - OEM 2-Zone Ceiling Microphone Capture, Speaker Localization & Audio Ducking TTS for BMW MGU.
+ * audio-io.js - OEM BMW MGU SmartXbar / AVB Ceiling Microphone Capture, 2-Zone Speaker Localization & TTS.
  *
- * Features:
- *   1. `probeOemAudioStack`: Discovers ALSA / Harman I2S / Intel SmartXbar capture devices (`/proc/asound/cards`,
- *      `/proc/asound/pcm`, `/dev/snd/*`, `arecord -L`) on the head unit without touching active phone/CarPlay streams.
- *   2. `analyzeStereoMicBuffer`: Computes per-channel RMS energy (dBFS) on 16-bit PCM stereo WAV/raw audio from the
- *      overhead roof microphones (Left = Driver, Right = Passenger) to localize who spoke (`driver` vs `passenger`).
- *   3. `captureCeilingMicClip`: Records a bounded 16 kHz stereo WAV clip via `arecord`, automatically aborting if a
- *      Bluetooth / CarPlay phone call starts (`isCallActive()`).
- *   4. `synthesizeVietnameseMp3`: Generates natural Vietnamese TTS audio (`vi`) via `mgu-uplink` for car speaker playback
- *      and browser simulator preview, paired with automatic media volume ducking.
+ * Verified on real BMW MGU (iDrive 7) hardware:
+ *   - Ceiling microphones enter MGU as `DOMAIN_RAM` `Microphones` (`sourceID: 129`) -> `ECNR_Uplink_Source` (`sourceID: 389`),
+ *     exposed in `/run/smartx` via Intel SmartXbar (`/usr/share/alsa/alsa.conf.d/50-smartx.conf` & `libasound.so.2`).
+ *   - Uses `/var/opt/mgu-python/current/bin/python3` + `alsa-smartx.py` (`ctypes` `libasound.so.2`) when `arecord` is absent.
+ *   - Supports both 2-Mic Stereo streams (`avb:MGU_GW_3_SOURCE_CF_2MIC_6REF` / `smartx:SpeechSink_CF_2MIC_1REF_SPEECH`)
+ *     for Driver (Left) vs Passenger (Right) speaker localization, and 24 kHz Hardware Echo-Cancelled ECNR streams
+ *     (`smartx:VoiceNotesSink_CF_24_MONO` / `smartx:AndroidAutoSink_CF_24_MONO`).
  *
- * Node 8 compatible, zero external dependencies.
+ * Node 8 compatible, zero external npm dependencies.
  */
 const fs = require('fs');
 const path = require('path');
 const cp = require('child_process');
+
+const MGU_PYTHON = '/var/opt/mgu-python/current/bin/python3';
+const SMARTX_HELPER = path.join(__dirname, 'alsa-smartx.py');
+
+const SMARTX_PROFILES = [
+    {
+        match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_6REF_c',
+        hw: 'avb:MGU_GW_3_SOURCE_CF_2MIC_6REF',
+        rate: 48000,
+        hwChannels: 8,
+        amRoute: null,
+        label: 'Cặp Mic trần 2 vùng + 6 kênh khử vọng (AVB 2MIC_6REF)',
+        score: 95,
+    },
+    {
+        match: 'smartx_VoiceNotesSink_CF_24_MONO_c',
+        hw: 'smartx:VoiceNotesSink_CF_24_MONO',
+        rate: 24000,
+        hwChannels: 1,
+        amRoute: { sourceID: 389, sinkID: 389, fallbackSourceID: 129 },
+        label: 'Mic trần khử ồn Harman ECNR 24kHz (VoiceNotesSink)',
+        score: 90,
+    },
+    {
+        match: 'smartx_AndroidAutoSink_CF_24_MONO_c',
+        hw: 'smartx:AndroidAutoSink_CF_24_MONO',
+        rate: 24000,
+        hwChannels: 1,
+        amRoute: { sourceID: 389, sinkID: 390, fallbackSourceID: 129 },
+        label: 'Mic trần khử ồn Harman ECNR 24kHz (AndroidAutoSink)',
+        score: 88,
+    },
+    {
+        match: 'smartx_SpeechSink_CF_2MIC_1REF_SPEECH_c',
+        hw: 'smartx:SpeechSink_CF_2MIC_1REF_SPEECH',
+        rate: 24000,
+        hwChannels: 3,
+        amRoute: { sourceID: 129, sinkID: 387 },
+        label: 'Cặp Mic trần 2 vùng SpeechSink (2MIC_1REF)',
+        score: 85,
+    },
+];
 
 function readTextSafe(file) {
     try { return fs.readFileSync(file, 'utf8'); } catch (e) { return ''; }
@@ -27,20 +67,41 @@ function listDirSafe(dir) {
 }
 
 /**
- * Inspect ALSA capture cards and PCM streams on the Linux MGU head unit.
+ * Inspect Intel SmartXbar (`/run/smartx`) and ALSA (`/proc/asound`) capture streams on the MGU head unit.
  */
 function probeOemAudioStack(opts) {
     const o = Object.assign({
         procAsound: '/proc/asound',
         devSnd: '/dev/snd',
-        arecordBin: 'arecord',
+        smartxDir: '/run/smartx',
+        mguPython: MGU_PYTHON,
     }, opts || {});
 
     const cardsRaw = readTextSafe(path.join(o.procAsound, 'cards'));
     const pcmRaw = readTextSafe(path.join(o.procAsound, 'pcm'));
     const sndNodes = listDirSafe(o.devSnd).filter((n) => /^pcmC\d+D\d+c$/.test(n));
+    const smartxNodes = listDirSafe(o.smartxDir);
+    const hasMguPython = fs.existsSync(o.mguPython);
 
     const captureStreams = [];
+
+    // 1. Intel SmartXbar / AVB roof microphone pipes on real BMW MGU
+    SMARTX_PROFILES.forEach((p) => {
+        if (smartxNodes.indexOf(p.match) >= 0) {
+            captureStreams.push({
+                hw: p.hw,
+                rawHw: p.hw,
+                rate: p.rate,
+                hwChannels: p.hwChannels,
+                amRoute: p.amRoute,
+                label: p.label,
+                backend: 'smartx-libasound',
+                score: p.score,
+            });
+        }
+    });
+
+    // 2. Standard ALSA `/proc/asound/pcm` capture devices
     pcmRaw.split('\n').forEach((line) => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.toLowerCase().indexOf('capture') < 0) return;
@@ -48,28 +109,33 @@ function probeOemAudioStack(opts) {
         if (m) {
             const card = Number(m[1]), dev = Number(m[2]);
             const label = m[3].trim();
-            // Prefer Harman DSP / I2S / SmartX / Mic capture streams over loopback if present
-            let score = 10;
-            if (/mic|speech|voice|harman|i2s|smartx|avb|ssp/i.test(label)) score += 30;
-            if (/loopback/i.test(label)) score -= 5;
+            let score = 15;
+            if (/mic|speech|voice|harman|i2s|smartx/i.test(label)) score += 30;
             captureStreams.push({
-                hw: 'plughw:' + card + ',' + dev,
+                hw: 'hw:' + card + ',' + dev,
                 rawHw: 'hw:' + card + ',' + dev,
                 card,
                 device: dev,
+                rate: 24000,
+                hwChannels: 1,
+                amRoute: null,
                 label,
+                backend: hasMguPython ? 'smartx-libasound' : 'arecord',
                 score,
             });
         }
     });
 
     captureStreams.sort((a, b) => b.score - a.score);
-    const recommendedDevice = captureStreams.length ? captureStreams[0].hw : (sndNodes.length ? 'default' : 'simulated');
+    const recommended = captureStreams.length ? captureStreams[0] : null;
 
     return {
         probedAt: Date.now(),
         hasAlsaCapture: captureStreams.length > 0 || sndNodes.length > 0,
-        recommendedDevice,
+        hasMguPython,
+        smartxCount: smartxNodes.length,
+        recommendedDevice: recommended ? recommended.hw : 'simulated',
+        recommendedProfile: recommended,
         captureStreams,
         sndCaptureNodes: sndNodes,
         cardsSummary: cardsRaw.trim().split('\n').filter(Boolean).slice(0, 12),
@@ -77,8 +143,7 @@ function probeOemAudioStack(opts) {
 }
 
 /**
- * Parse a 16-bit PCM WAV (or raw stereo S16LE) buffer and compute Left/Right dBFS RMS to detect
- * whether the Driver (Left mic) or Passenger (Right mic) spoke.
+ * Parse a 16-bit PCM WAV buffer and compute Left/Right dBFS RMS to detect Driver (Left) vs Passenger (Right) speaker.
  */
 function analyzeStereoMicBuffer(buf, opts) {
     const o = Object.assign({
@@ -96,7 +161,6 @@ function analyzeStereoMicBuffer(buf, opts) {
     let sampleRate = 16000;
     let bitsPerSample = 16;
 
-    // Parse RIFF/WAVE header if present
     if (buf.length >= 44 && buf.slice(0, 4).toString('ascii') === 'RIFF' && buf.slice(8, 12).toString('ascii') === 'WAVE') {
         let pos = 12;
         while (pos + 8 <= buf.length) {
@@ -186,9 +250,6 @@ function analyzeStereoMicBuffer(buf, opts) {
     };
 }
 
-/**
- * Build a valid 16-bit PCM WAV buffer from synthetic left/right float samples (used for unit tests & mic diagnostics).
- */
 function buildStereoWav(leftSamples, rightSamples, sampleRate) {
     const sr = sampleRate || 16000;
     const n = Math.min(leftSamples.length, rightSamples.length);
@@ -199,8 +260,8 @@ function buildStereoWav(leftSamples, rightSamples, sampleRate) {
     buf.write('WAVE', 8);
     buf.write('fmt ', 12);
     buf.writeUInt32LE(16, 16);
-    buf.writeUInt16LE(1, 20);      // PCM
-    buf.writeUInt16LE(2, 22);      // 2 channels (Driver + Passenger)
+    buf.writeUInt16LE(1, 20);
+    buf.writeUInt16LE(2, 22);
     buf.writeUInt32LE(sr, 24);
     buf.writeUInt32LE(sr * 4, 28);
     buf.writeUInt16LE(4, 32);
@@ -217,79 +278,107 @@ function buildStereoWav(leftSamples, rightSamples, sampleRate) {
 }
 
 /**
- * Capture a short stereo WAV clip from the OEM ceiling mic via ALSA `arecord`, yielding immediately if a phone call is active.
+ * Capture a bounded WAV clip from the OEM ceiling mic via `mgu-python` + `libasound.so.2` (or `arecord` fallback),
+ * automatically connecting/disconnecting any required GENIVI AudioManager mic route and yielding on phone calls.
  */
-function captureCeilingMicClip(opts) {
+async function captureCeilingMicClip(opts) {
     const o = Object.assign({
+        mguPython: MGU_PYTHON,
+        smartxHelper: SMARTX_HELPER,
         arecordBin: 'arecord',
-        device: 'default',
+        device: 'avb:MGU_GW_3_SOURCE_CF_2MIC_6REF',
+        rate: 24000,
+        hwChannels: 1,
+        amRoute: null,
+        connectAmRoute: null,
+        disconnectAmRoute: null,
         durationSec: 4,
         outFile: '/run/bimmer-ai/capture.wav',
         swapChannels: false,
         isCallActive: () => false,
     }, opts || {});
 
-    return new Promise((resolve, reject) => {
-        if (o.isCallActive()) {
-            return reject(new Error('Đang có cuộc gọi điện thoại / CarPlay — Bimmer AI tự nhường Mic zin.'));
-        }
-        const args = [
-            '-q',
-            '-D', String(o.device || 'default'),
-            '-f', 'S16_LE',
-            '-c', '2',
-            '-r', '16000',
-            '-d', String(Math.max(1, Math.min(10, Math.round(o.durationSec)))),
-            '-t', 'wav',
-            o.outFile,
-        ];
-        let child;
-        try {
-            child = cp.spawn(o.arecordBin, args, { stdio: ['ignore', 'ignore', 'pipe'] });
-        } catch (e) {
-            return reject(e);
-        }
+    if (o.isCallActive()) {
+        throw new Error('Đang có cuộc gọi điện thoại / CarPlay — Bimmer AI tự nhường Mic zin.');
+    }
 
-        let stderr = '';
-        let abortedForCall = false;
-        const callWatch = setInterval(() => {
-            if (o.isCallActive()) {
-                abortedForCall = true;
+    // Look up matching SmartX profile metadata if device matches one of our known pipes
+    for (let i = 0; i < SMARTX_PROFILES.length; i++) {
+        if (SMARTX_PROFILES[i].hw === o.device) {
+            o.rate = SMARTX_PROFILES[i].rate;
+            o.hwChannels = SMARTX_PROFILES[i].hwChannels;
+            if (!o.amRoute) o.amRoute = SMARTX_PROFILES[i].amRoute;
+            break;
+        }
+    }
+
+    let connId = null;
+    if (o.amRoute && typeof o.connectAmRoute === 'function') {
+        try { connId = await o.connectAmRoute(o.amRoute); } catch (e) { connId = null; }
+    }
+
+    const usePythonLibasound = fs.existsSync(o.mguPython) && fs.existsSync(o.smartxHelper);
+
+    try {
+        await new Promise((resolve, reject) => {
+            let child;
+            if (usePythonLibasound) {
+                child = cp.spawn(o.mguPython, [
+                    o.smartxHelper,
+                    String(o.device),
+                    o.outFile,
+                    String(Math.max(1, Math.min(10, o.durationSec))),
+                    String(o.rate || 24000),
+                    String(o.hwChannels || 1),
+                ], { stdio: ['ignore', 'pipe', 'pipe'] });
+            } else {
+                child = cp.spawn(o.arecordBin, [
+                    '-q', '-D', String(o.device), '-f', 'S16_LE', '-c', '2', '-r', '16000',
+                    '-d', String(Math.max(1, Math.min(10, Math.round(o.durationSec)))), '-t', 'wav', o.outFile,
+                ], { stdio: ['ignore', 'pipe', 'pipe'] });
+            }
+
+            let out = '';
+            let abortedForCall = false;
+            const callWatch = setInterval(() => {
+                if (o.isCallActive()) {
+                    abortedForCall = true;
+                    try { child.kill('SIGTERM'); } catch (e) {}
+                }
+            }, 150);
+
+            const timer = setTimeout(() => {
                 try { child.kill('SIGTERM'); } catch (e) {}
-            }
-        }, 150);
+            }, (o.durationSec + 3) * 1000);
 
-        const timer = setTimeout(() => {
-            try { child.kill('SIGTERM'); } catch (e) {}
-        }, (o.durationSec + 3) * 1000);
+            child.stdout.on('data', (d) => { out += d.toString('utf8'); });
+            child.stderr.on('data', (d) => { out += d.toString('utf8'); });
+            child.on('error', (err) => {
+                clearInterval(callWatch);
+                clearTimeout(timer);
+                reject(err);
+            });
+            child.on('close', (code) => {
+                clearInterval(callWatch);
+                clearTimeout(timer);
+                if (abortedForCall) return reject(new Error('Đã ngắt thu âm ngay lập tức để nhường Mic cho cuộc gọi.'));
+                if (code !== 0 && !fs.existsSync(o.outFile)) {
+                    return reject(new Error('Thu âm (' + o.device + '): ' + (out.trim() || ('exit ' + code))));
+                }
+                resolve();
+            });
+        });
+    } finally {
+        if (connId !== null && typeof o.disconnectAmRoute === 'function') {
+            try { await o.disconnectAmRoute(connId); } catch (e) {}
+        }
+    }
 
-        child.stderr.on('data', (d) => { stderr += d.toString('utf8'); });
-        child.on('error', (err) => {
-            clearInterval(callWatch);
-            clearTimeout(timer);
-            reject(err);
-        });
-        child.on('close', (code) => {
-            clearInterval(callWatch);
-            clearTimeout(timer);
-            if (abortedForCall) {
-                return reject(new Error('Đã ngắt thu âm ngay lập tức để nhường Mic cho cuộc gọi.'));
-            }
-            if (code !== 0 && !fs.existsSync(o.outFile)) {
-                return reject(new Error('arecord (' + o.device + '): ' + (stderr.trim() || ('exit ' + code))));
-            }
-            let wav = null;
-            try { wav = fs.readFileSync(o.outFile); } catch (e) { return reject(e); }
-            const analysis = analyzeStereoMicBuffer(wav, { swapChannels: o.swapChannels });
-            resolve({ wavBuffer: wav, file: o.outFile, analysis });
-        });
-    });
+    const wav = fs.readFileSync(o.outFile);
+    const analysis = analyzeStereoMicBuffer(wav, { swapChannels: o.swapChannels });
+    return { wavBuffer: wav, file: o.outFile, analysis };
 }
 
-/**
- * Fetch natural Vietnamese TTS MP3 audio (`vi`) via `uplink.request` so the head unit can play it
- * over the car's MediaPlayer / speaker sink (or return base64 MP3 to the simulator).
- */
 async function synthesizeVietnameseMp3(text, uplinkOpts, uplinkModule) {
     const clean = String(text || '').replace(/\s+/g, ' ').trim().slice(0, 200);
     if (!clean || !uplinkModule) return null;
@@ -307,11 +396,12 @@ async function synthesizeVietnameseMp3(text, uplinkOpts, uplinkModule) {
         if (res && res.status === 200 && res.bodyBase64 && res.bodyBase64.length > 200) {
             return Buffer.from(res.bodyBase64, 'base64');
         }
-    } catch (e) { /* offline fallback: UI text + optional local chime */ }
+    } catch (e) {}
     return null;
 }
 
 module.exports = {
+    SMARTX_PROFILES,
     probeOemAudioStack,
     analyzeStereoMicBuffer,
     buildStereoWav,

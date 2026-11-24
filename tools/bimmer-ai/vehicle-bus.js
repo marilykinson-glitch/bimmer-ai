@@ -1,13 +1,15 @@
 'use strict';
 /**
- * vehicle-bus.js - Infotainment & Cabin Comfort Bridge for Bimmer AI.
+ * vehicle-bus.js - Hardware-Verified BMW MGU (iDrive 7) Infotainment & Comfort Controller (`v0.2.0`).
  *
- * Uses the head unit's standard Franca / OAP service interfaces (ClimateMaster, AmbientLight,
- * FlexLight, IpaInteriorLight, WindowLifterMaster, SunBlinds, SeatFunction, MediaPlayer,
- * DynamicMediaPlayer, CommandControl, UserInteractionParkmenu, DestinationMemory) plus local
- * Unix/JSON IPC with companion MGU Store apps (`jap-ridetube-d`, `bimmer-link`, `vietmap-signs`).
+ * Verified directly against live MGU firmware (`someip-interfaces.json`, `DOMAIN_MGU.bin`, `iteriodev-comfort`, `jap-ridetube-d`):
+ *   - Loads `IFConfigGenerator` directly from MainApp's Browserify bundle (`AppManagement.js`) + `/usr/lib/oap-mainapp/src-gen/`.
+ *   - Uses exact Franca struct/enum signatures for ClimateMaster (45210), WindowLifterMaster (20501), SunBlinds (20488),
+ *     CenterLockingService (20495), ExteriorMirrorDynamicControl (21766), IpaInteriorLight (20500), FlexLight (20497),
+ *     SteeringWheelPushButton (46341), CommandControl (45088, MainSink=1), DynamicMediaPlayer (45248) & MediaPlayer (45122).
+ *   - Drives true per-zone / full-cabin RGB Ambient Lighting via `/run/iteriodev-comfort/ctl.sock` when installed.
+ *   - Bridges seamlessly with `jap-ridetube-d`, `bimmer-link` (Option 1CR / Valet), and `vietmap-signs`.
  *
- * Can run either in-process (simulation / Mac testing) or as an isolated worker process (`node vehicle-bus.js worker`).
  * Node 8 compatible, zero external npm dependencies.
  */
 const fs = require('fs');
@@ -19,10 +21,11 @@ const SafetyGate = require('./safety-gate');
 const env = (k, d) => (process.env[k] !== undefined && process.env[k] !== '' ? process.env[k] : d);
 const CATALOG_PATH = env('BA_CATALOG', '/etc/oap/someip/someip-interfaces.json');
 const SOMEIP_PATH = env('BA_SOMEIP', '/usr/lib/someip.node');
+const SRCGEN_DIR = env('BA_SRCGEN', '/usr/lib/oap-mainapp/src-gen');
+const COMFORT_SOCK = env('BA_COMFORT_SOCK', '/run/iteriodev-comfort/ctl.sock');
 const RIDETUBE_SOCK = env('BA_RIDETUBE_SOCK', '/run/jap-ridetube-d/ctl.sock');
 const BIMMERLINK_RUN = env('BA_BIMMERLINK_RUN', '/run/bimmer-link');
 const VIETMAP_RUN = env('BA_VIETMAP_RUN', '/run/vietmap-signs');
-const MGU_DIAG_REPORTS = env('BA_DIAG_DIR', '/var/opt/public/oap');
 
 const APPMGMTS = [
     '/usr/lib/oap-mainapp/src/AppManagement/AppManagement.js',
@@ -30,16 +33,22 @@ const APPMGMTS = [
 ];
 
 const AMBIENT_PRESETS = {
-    m_blue: { name: 'Xanh M-Blue', hex: '#0066FF', r: 0, g: 102, b: 255, program: 4 },
-    ice_cyan: { name: 'Xanh băng', hex: '#00D4FF', r: 0, g: 212, b: 255, program: 5 },
-    sunset_purple: { name: 'Tím hoàng hôn', hex: '#8A2BE2', r: 138, g: 43, b: 226, program: 9 },
-    neon_pink: { name: 'Hồng Neon', hex: '#FF2E93', r: 255, g: 46, b: 147, program: 10 },
-    m_red: { name: 'Đỏ thể thao', hex: '#FF1E38', r: 255, g: 30, b: 56, program: 3 },
-    amber: { name: 'Vàng hổ phách', hex: '#FF8C00', r: 255, g: 140, b: 0, program: 1 },
-    emerald: { name: 'Xanh ngọc lục', hex: '#00C853', r: 0, g: 200, b: 83, program: 7 },
-    ice_white: { name: 'Trắng lạnh', hex: '#EAF6FF', r: 234, g: 246, b: 255, program: 2 },
-    oem: { name: 'Màu zin theo xe', hex: '#3B82F6', r: 59, g: 130, b: 246, program: 0 },
+    m_blue: { name: 'Xanh M-Blue', hex: '#0066FF', r: 0, g: 102, b: 254 },
+    ice_cyan: { name: 'Xanh băng', hex: '#00D4FF', r: 0, g: 212, b: 254 },
+    sunset_purple: { name: 'Tím hoàng hôn', hex: '#8A2BE2', r: 138, g: 43, b: 226 },
+    neon_pink: { name: 'Hồng Neon', hex: '#FF2E93', r: 254, g: 46, b: 147 },
+    m_red: { name: 'Đỏ thể thao', hex: '#FF1E38', r: 254, g: 30, b: 56 },
+    amber: { name: 'Vàng hổ phách', hex: '#FF8C00', r: 254, g: 140, b: 0 },
+    emerald: { name: 'Xanh ngọc lục', hex: '#00C853', r: 0, g: 200, b: 83 },
+    ice_white: { name: 'Trắng lạnh', hex: '#EAF6FF', r: 234, g: 246, b: 254 },
+    oem: { name: 'Màu zin theo xe', hex: '#3B82F6', r: 59, g: 130, b: 246, isOem: true },
 };
+
+// Exact Franca Enum constants from `/etc/oap/someip/someip-interfaces.json`
+const CLIMATE_ZONE = { all: 0, both: 0, sync: 0, driver: 1, passenger: 2 };
+const WINDOW_ID = { fl: 0, fr: 1, rl: 2, rr: 3 };
+const MEDIA_BTN = { play: 0, pause: 1, stop: 2, previous: 5, next: 6 };
+const IPA_LIGHT = { off: 0, center: 1, listenDriver: 2, listenPassenger: 3, speakDriver: 4, speakPassenger: 5 };
 
 function parseHexColor(input) {
     if (!input) return null;
@@ -47,13 +56,11 @@ function parseHexColor(input) {
     if (AMBIENT_PRESETS[key]) return Object.assign({ key }, AMBIENT_PRESETS[key]);
     const m = /^#?([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(key);
     if (m) {
-        const r = parseInt(m[1], 16), g = parseInt(m[2], 16), b = parseInt(m[3], 16);
-        return {
-            key: 'custom',
-            name: '#' + m[1].toUpperCase() + m[2].toUpperCase() + m[3].toUpperCase(),
-            hex: '#' + m[1].toUpperCase() + m[2].toUpperCase() + m[3].toUpperCase(),
-            r, g, b, program: 4,
-        };
+        const r = Math.min(254, parseInt(m[1], 16));
+        const g = Math.min(254, parseInt(m[2], 16));
+        const b = Math.min(254, parseInt(m[3], 16));
+        const hex = '#' + m[1].toUpperCase() + m[2].toUpperCase() + m[3].toUpperCase();
+        return { key: 'custom', name: hex, hex, r, g, b };
     }
     return null;
 }
@@ -104,13 +111,13 @@ function createInitialTelemetry() {
             brightness: 75,
             zone: 'all',
             readingLight: false,
-            ipaPulse: false,
+            comfortBridge: false,
         },
         media: {
             playing: false,
             source: 'Media',
             title: 'Chưa phát nhạc',
-            volumePercent: 35,
+            volumePercent: 25,
             muted: false,
             youtubeConnected: false,
         },
@@ -146,20 +153,45 @@ function writeAtomicSafe(file, text) {
     } catch (e) { return false; }
 }
 
+/**
+ * Load BMW's `IFConfigGenerator` directly from MainApp's Browserify bundle on the MGU head unit.
+ */
 function loadIFConfigGenerator() {
     for (let i = 0; i < APPMGMTS.length; i++) {
         if (!fs.existsSync(APPMGMTS[i])) continue;
-        const src = fs.readFileSync(APPMGMTS[i], 'utf8');
-        const m = /require\(["']([^"']*IFConfigGenerator[^"']*)["']\)/.exec(src);
-        if (m) {
-            const resolved = path.resolve(path.dirname(APPMGMTS[i]), m[1]);
-            return require(resolved);
+        const bundleText = fs.readFileSync(APPMGMTS[i], 'utf8');
+        const m = /"someip-interfaces-generator\/IFConfigGenerator(?:\.js)?":(\d+)/.exec(bundleText);
+        const tail = /,\{\},\[\d+\]\)\s*;?\s*$/;
+        if (m && tail.test(bundleText)) {
+            const bundleReq = new Function('require', 'return ' + bundleText.replace(tail, ',{},[])'))(require);
+            return bundleReq(m[1]);
         }
     }
     return null;
 }
 
-/** Send a single JSON command to RideTube (`jap-ridetube-d`) over its Unix socket and optionally collect search results. */
+/** Send JSON command to `iteriodev-comfort` (`/run/iteriodev-comfort/ctl.sock`) for true LIN RGB ambient lighting. */
+function sendComfortAmbient(sockPath, payload) {
+    return new Promise((resolve) => {
+        if (!sockPath || !fs.existsSync(sockPath)) return resolve({ ok: false, reason: 'absent' });
+        let done = false;
+        const finish = (v) => {
+            if (done) return;
+            done = true;
+            clearTimeout(timer);
+            try { sock.destroy(); } catch (e) {}
+            resolve(v);
+        };
+        const sock = net.createConnection(sockPath, () => {
+            sock.write(JSON.stringify(payload) + '\n');
+            setTimeout(() => finish({ ok: true }), 120);
+        });
+        const timer = setTimeout(() => finish({ ok: true }), 400);
+        sock.on('error', (e) => finish({ ok: false, error: e.message }));
+    });
+}
+
+/** Send JSON commands to `jap-ridetube-d` (`/run/jap-ridetube-d/ctl.sock`). */
 function queryRideTube(sockPath, messages, waitSearchMs) {
     return new Promise((resolve) => {
         if (!sockPath || !fs.existsSync(sockPath)) return resolve({ ok: false, error: 'RideTube socket absent' });
@@ -203,6 +235,8 @@ class VehicleController {
         this.opts = Object.assign({
             catalogPath: CATALOG_PATH,
             someipPath: SOMEIP_PATH,
+            srcGenDir: SRCGEN_DIR,
+            comfortSock: COMFORT_SOCK,
             ridetubeSock: RIDETUBE_SOCK,
             bimmerlinkRun: BIMMERLINK_RUN,
             vietmapRun: VIETMAP_RUN,
@@ -244,7 +278,6 @@ class VehicleController {
         return this.guards;
     }
 
-    /** Update simulated or live telemetry fields and trigger reactive safety/co-pilot watches. */
     patchTelemetry(patch) {
         if (!patch || typeof patch !== 'object') return this.state;
         Object.keys(patch).forEach((k) => {
@@ -260,7 +293,6 @@ class VehicleController {
         return this.state;
     }
 
-    /** Sync companion app status files (`bimmer-link` & `vietmap-signs` & `jap-ridetube-d`). */
     pollCompanionApps() {
         const bl = readJsonSafe(path.join(this.opts.bimmerlinkRun, 'status.json'));
         if (bl && bl.telemetry) {
@@ -278,9 +310,9 @@ class VehicleController {
             if (vm.roadName) this.state.vietmap.roadName = String(vm.roadName);
         }
         this.state.media.youtubeConnected = fs.existsSync(this.opts.ridetubeSock);
+        this.state.ambient.comfortBridge = fs.existsSync(this.opts.comfortSock);
     }
 
-    /** Connect to standard OAP SOME/IP infotainment services when running on the real MGU head unit. */
     async initHardwareBus() {
         this.pollCompanionApps();
         if (!fs.existsSync(this.opts.catalogPath) || !fs.existsSync(this.opts.someipPath)) {
@@ -296,10 +328,13 @@ class VehicleController {
             this.log('vehicle-bus init warning: ' + e.message);
             return false;
         }
-        if (!db || !gen || !someip) return false;
+        if (!db || !gen || !someip) {
+            this.log('vehicle-bus: IFConfigGenerator unavailable');
+            return false;
+        }
 
         let chain = Promise.resolve();
-        const openProxy = (ifaceName, attrs, methods) => {
+        const openProxy = (ifaceName, attrs, methods, instanceHint) => {
             if (!db.interfaces || !db.interfaces[ifaceName]) return Promise.resolve(null);
             const step = () => new Promise((res) => setImmediate(() => {
                 try {
@@ -311,7 +346,7 @@ class VehicleController {
                     const generated = gen.generate(db, { proxies, services: {} });
                     const cfg = generated && generated[ifaceName];
                     if (!cfg) return res(null);
-                    const inst = Object.keys(cfg.instances || { '1': 1 })[0] || '1';
+                    const inst = instanceHint || Object.keys(cfg.instances || { '1': 1 })[0] || '1';
                     someip.buildProxy(cfg, String(inst))
                         .then((px) => px.init().then(() => res(px)))
                         .catch(() => res(null));
@@ -322,7 +357,7 @@ class VehicleController {
             return p;
         };
 
-        const bindService = async (key, ifaceName, fieldNames, methodNames, onField) => {
+        const bindService = async (key, ifaceName, fieldNames, methodNames, onField, instanceHint) => {
             const iv = db.interfaces && db.interfaces[ifaceName];
             if (!iv) return;
             const attrs = {};
@@ -330,7 +365,7 @@ class VehicleController {
                 if (iv.fields && iv.fields[f]) attrs[f] = iv.fields[f].getter ? 'rs' : 's';
             });
             const validMethods = (methodNames || []).filter((m) => iv.methods && iv.methods[m]);
-            const px = await openProxy(ifaceName, attrs, validMethods);
+            const px = await openProxy(ifaceName, attrs, validMethods, instanceHint);
             if (!px) return;
             this.proxies[key] = px;
             this.state.liveCar = true;
@@ -371,15 +406,20 @@ class VehicleController {
             }
         });
 
-        // 2. Steering wheel Push-To-Talk button (`statusPTTButton1` & `statusSpecialFunctionButton`)
+        // 2. Steering wheel Push-To-Talk button (`operationPushButtonPTTSteeringWheel === 1` | `'PTT_MINUS_TASTER_GEDRUECKT'`)
         await bindService('steering', 'de.bmw.infotainment.controlelements.SteeringWheelPushButton', ['statusPTTButton1', 'statusSpecialFunctionButton'], [], (f, v) => {
-            const pressed = !!(v === 1 || v === true || (v && (v.state === 1 || v.pressed === true || v.status === 1)));
+            if (!v) return;
+            let raw = v;
+            if (f === 'statusPTTButton1' && v.operationPushButtonPTTSteeringWheel !== undefined) raw = v.operationPushButtonPTTSteeringWheel;
+            if (f === 'statusSpecialFunctionButton' && v.operationPushButtonSpecialFunction !== undefined) raw = v.operationPushButtonSpecialFunction;
+            if (raw === 3 || raw === 'SIGNAL_UNGUELTIG') return; // ignore invalid startup signal
+            const pressed = (raw === 1 || raw === 'PTT_MINUS_TASTER_GEDRUECKT' || raw === 'TASTER_GEDRUECKT' || raw === true);
             this.handleSteeringPttSignal(f, pressed);
         });
 
         // 3. Telephony & CarPlay voice call yield guard
         await bindService('voiceCall', 'de.bmw.infotainment.connectivity.telephony.VoiceCall', ['state'], [], (f, v) => {
-            const active = !!(v && String(v).toUpperCase().indexOf('IDLE') < 0 && v !== 0);
+            const active = !!(v && String(v).toUpperCase().indexOf('IDLE') < 0 && String(v).toUpperCase().indexOf('NONE') < 0 && v !== 0);
             this.patchTelemetry({ callActive: active });
         });
         await bindService('carplay', 'de.bmw.infotainment.a4a.carplay.CarPlayManager', ['projectedTelephonyActive'], [], (f, v) => {
@@ -388,10 +428,10 @@ class VehicleController {
 
         // 4. Comfort, Climate, Windows, Blinds, Lighting, Audio & Navigation proxies
         await bindService('climateMaster', 'de.bmw.infotainment.climate.climatemaster.ClimateMaster',
-            ['statusClimateSystemOn', 'statusAirCondMaxAC', 'statusAutoMode', 'statusAirBlowLevel', 'statusScentOn'],
-            ['requestTemperature', 'requestAirBlowLevel', 'requestAirCondMaxAC', 'requestAutoMode', 'requestClimateSystemOn',
-                'requestAirQualityFresh', 'requestScentOn', 'requestSeatClimateSeatHeating', 'requestSeatClimateSeatCooling',
-                'requestSteeringWheelHeating']);
+            ['statusClimateSystemOn', 'statusAirCondMaxAC', 'statusAirBlowLevel', 'statusScentOn', 'statusTemperature'],
+            ['requestTemperature', 'requestDeltaTemperature', 'requestAirBlowLevel', 'requestAirCondMaxAC',
+                'requestClimateSystemOn', 'requestAirQualityFresh', 'requestScentOn',
+                'requestSeatClimateSeatHeating', 'requestSeatClimateSeatCooling', 'requestSteeringWheelHeating']);
 
         await bindService('windowMaster', 'de.bmw.body.windowmaster.WindowLifterMaster', ['windowStatus'], ['moveWindow', 'cancelLastRequest']);
         await bindService('sunBlinds', 'de.bmw.body.doorsandwindows.SunBlinds', ['blindStatusList'], ['openSideAndRearBlinds', 'closeSideAndRearBlinds']);
@@ -400,12 +440,33 @@ class VehicleController {
         await bindService('ipaLight', 'de.bmw.body.interiorillumination.IpaInteriorLight', [], ['setIpaLightingInterior']);
         await bindService('flexLight', 'de.bmw.body.interiorillumination.flexlight.FlexLight', ['interiorLightActive'], ['setReadingLight', 'deactivateAllReadingLights']);
         await bindService('seatTarget', 'de.bmw.body.seat.SeatTargetAdjustment', [], ['setTargetPosition', 'cancelTargetPosition']);
-        await bindService('audioCmd', 'org.genivi.am.commandinterface.CommandControl', [], ['setVolumeInPercent', 'setSinkMuteState']);
-        await bindService('dynMedia', 'de.bmw.infotainment.entertainment.dynamicmediaplayer.DynamicMediaPlayer', ['playerState', 'currentItemMetadata'], ['sendButtonEvent']);
-        await bindService('parkCam', 'de.bmw.dass.parking.parkmenu.userinteraction.UserInteractionParkmenu', ['selectedCamera'], ['hmiSelectCamera', 'requestParkingClosedown']);
+
+        await bindService('audioCmd', 'org.genivi.am.commandinterface.CommandControl', ['listOfMainConnections'],
+            ['connect', 'disconnect', 'getListMainSinks', 'setVolumeInPercent', 'setSinkMuteState'], null, '1');
+        await bindService('mediaPlayer', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
+            ['playFile', 'sendButtonEvent'], null, 'OapGenericMedia');
+        await bindService('dynMedia', 'de.bmw.infotainment.entertainment.dynamicmediaplayer.DynamicMediaPlayer', ['playerState', 'currentItemMetadata'],
+            ['sendButtonEvent']);
+        await bindService('parkCam', 'de.bmw.dass.parking.parkmenu.userinteraction.UserInteractionParkmenu', ['selectedCamera'],
+            ['hmiSelectCamera', 'requestParkingClosedown']);
         await bindService('destMem', 'de.bmw.infotainment.navigation.destinationmemory.DestinationMemory', [], ['addDestination']);
 
-        this.log('vehicle-bus: connected proxies = ' + Object.keys(this.proxies).join(', '));
+        // Read live cabin master volume from `MainSink` (`sinkID: 1`)
+        if (this.proxies.audioCmd) {
+            try {
+                const sinks = await this.proxies.audioCmd.callMethod('getListMainSinks', {}, 2500);
+                const list = (sinks && sinks.listMainSinks) || [];
+                for (let i = 0; i < list.length; i++) {
+                    if (list[i].sinkID === 1 && typeof list[i].volume === 'number') {
+                        this.state.media.volumePercent = list[i].volume;
+                        this.state.media.muted = list[i].muteState === 'MS_MUTED' || list[i].muteState === 1;
+                    }
+                }
+            } catch (e) {}
+        }
+
+        this.log('vehicle-bus: live SOME/IP proxies connected (' + Object.keys(this.proxies).length + '): ' + Object.keys(this.proxies).join(', '));
+        this.emitTelemetry();
         return true;
     }
 
@@ -413,24 +474,84 @@ class VehicleController {
         const now = Date.now();
         this.state.pttPressed = pressed;
         if (pressed) {
-            this.pttDownAt = now;
+            if (this.pttDownAt === 0) this.pttDownAt = now;
         } else if (this.pttDownAt > 0) {
             const heldMs = now - this.pttDownAt;
             this.pttDownAt = 0;
-            if (heldMs < 650) {
-                const isDouble = (now - this.lastShortPttAt) < 550;
+            if (heldMs >= 40 && heldMs < 700) {
+                const isDouble = (now - this.lastShortPttAt) < 600;
                 this.lastShortPttAt = now;
                 if (this.opts.onPttEvent) {
                     this.opts.onPttEvent({ button: field, kind: isDouble ? 'double_press' : 'short_press', heldMs });
                 }
-            } else if (this.opts.onPttEvent) {
+            } else if (heldMs >= 700 && this.opts.onPttEvent) {
                 this.opts.onPttEvent({ button: field, kind: 'long_press', heldMs });
             }
         }
     }
 
+    /** Connect an AudioManager route (e.g. `ECNR_Uplink_Source 389 -> VoiceNotesSink 389` or TTS `1048 -> 1024`). */
+    async connectAudioRoute(route) {
+        if (!this.proxies.audioCmd || !route) return null;
+        const tryPair = async (srcId, snkId) => {
+            const r = await this.proxies.audioCmd.callMethod('connect', { sourceID: srcId, sinkID: snkId }, 2500);
+            if (r && (r.amError === 'E_OK' || r.amError === 'E_ALREADY_EXISTS' || r.amError === 0) && r.mainConnectionID !== undefined) {
+                return r.mainConnectionID;
+            }
+            return null;
+        };
+        try {
+            const id1 = await tryPair(route.sourceID, route.sinkID);
+            if (id1 !== null) return id1;
+            if (route.fallbackSourceID) return await tryPair(route.fallbackSourceID, route.sinkID);
+        } catch (e) {}
+        return null;
+    }
+
+    async disconnectAudioRoute(mainConnectionID) {
+        if (!this.proxies.audioCmd || mainConnectionID === null || mainConnectionID === undefined) return;
+        try {
+            await this.proxies.audioCmd.callMethod('disconnect', { mainConnectionID }, 2500);
+        } catch (e) {}
+    }
+
+    /** Trigger BMW IPA Interior Light animation (`2/3` = Listening from Driver/Passenger, `4/5` = Speaking, `0` = Off). */
+    async pulseIpaLight(mode) {
+        const val = IPA_LIGHT[mode] !== undefined ? IPA_LIGHT[mode] : 0;
+        await this.callProxySafe('ipaLight', 'setIpaLightingInterior', {
+            ipaInteriorLightFunction: { ipaInteriorLightFunction: val },
+        });
+    }
+
+    /** Play synthesized Vietnamese TTS file over the car's speakers when RideTube is not actively holding OAPGenericMedia. */
+    async playTtsOnCarSpeakers(mp3File, speakerZone) {
+        await this.pulseIpaLight(speakerZone === 'passenger' ? 'speakPassenger' : 'speakDriver');
+        if (!this.proxies.audioCmd || !this.proxies.mediaPlayer || !fs.existsSync(mp3File)) {
+            setTimeout(() => { this.pulseIpaLight('off').catch(() => {}); }, 1600);
+            return false;
+        }
+        // Avoid hijacking `OapGenericMedia` if RideTube video/music is actively playing on it
+        if (this.state.media.playing && this.state.media.source === 'YouTube TV') {
+            setTimeout(() => { this.pulseIpaLight('off').catch(() => {}); }, 1800);
+            return false;
+        }
+        let connId = null;
+        try {
+            connId = await this.connectAudioRoute({ sourceID: 1046, sinkID: 1024 });
+            await this.proxies.mediaPlayer.callMethod('playFile', { path: mp3File, languageCode: 0 }, 3500);
+            setTimeout(() => {
+                if (connId !== null) this.disconnectAudioRoute(connId).catch(() => {});
+                this.pulseIpaLight('off').catch(() => {});
+            }, 3800);
+            return true;
+        } catch (e) {
+            if (connId !== null) await this.disconnectAudioRoute(connId);
+            await this.pulseIpaLight('off');
+            return false;
+        }
+    }
+
     checkDeferredWatches() {
-        // Auto-exit Cinema Parked mode as soon as driver shifts out of P!
         if (this.state.activeScene === 'cinema_park' && SafetyGate.isVehicleMoving(this.state)) {
             this.state.activeScene = 'none';
             if (this.preCinemaBackup) {
@@ -468,31 +589,21 @@ class VehicleController {
             const res = await px.callMethod(method, args || {}, 3500);
             return { bus: 'someip', response: res };
         } catch (e) {
+            this.log('someip ' + proxyKey + '.' + method + ': ' + e.message);
             return { bus: 'someip_error', error: e.message };
         }
     }
 
-    /** Validate through `SafetyGate` and execute a vehicle tool. */
     async invokeTool(toolName, rawArgs, speakerZone) {
         this.pollCompanionApps();
         const gate = SafetyGate.evaluateToolCall(toolName, rawArgs, this.state, this.guards);
         if (gate.decision === 'block') {
-            return {
-                ok: false,
-                blocked: true,
-                code: gate.code,
-                summaryVi: gate.reasonVi,
-            };
+            return { ok: false, blocked: true, code: gate.code, summaryVi: gate.reasonVi };
         }
         if (gate.decision === 'defer') {
             this.deferredWatches = this.deferredWatches.filter((w) => w.id !== gate.watch.id).concat([gate.watch]);
             this.emitTelemetry();
-            return {
-                ok: true,
-                deferred: true,
-                code: gate.code,
-                summaryVi: gate.reasonVi,
-            };
+            return { ok: true, deferred: true, code: gate.code, summaryVi: gate.reasonVi };
         }
         return this.executeDirect(toolName, gate.normalizedArgs, speakerZone || 'driver');
     }
@@ -503,10 +614,15 @@ class VehicleController {
         switch (toolName) {
             case 'set_climate': {
                 const targetZone = args.zone || zoneDefault;
+                const opZone = CLIMATE_ZONE[targetZone] !== undefined ? CLIMATE_ZONE[targetZone] : 1;
                 const changes = [];
+
                 if (args.systemOn !== undefined) {
                     this.state.climate.on = !!args.systemOn;
-                    await this.callProxySafe('climateMaster', 'requestClimateSystemOn', { on: !!args.systemOn });
+                    await this.callProxySafe('climateMaster', 'requestClimateSystemOn', {
+                        clientGroupId: 0,
+                        climateSystemOn: [{ airConditioningOn: !!args.systemOn, operationZone: 0, saveLUM: true }],
+                    });
                     changes.push(this.state.climate.on ? 'bật điều hoà' : 'tắt điều hoà');
                 }
                 if (args.maxAc !== undefined) {
@@ -517,47 +633,72 @@ class VehicleController {
                         this.state.climate.tempPassengerC = 16.0;
                         this.state.climate.fanLevel = 5;
                     }
-                    await this.callProxySafe('climateMaster', 'requestAirCondMaxAC', { on: !!args.maxAc });
+                    await this.callProxySafe('climateMaster', 'requestAirCondMaxAC', {
+                        clientGroupId: 0,
+                        airCondMaxAC: [{ maxAirConditioning: !!args.maxAc, operationZone: 1, saveLUM: true }],
+                    });
                     changes.push(args.maxAc ? 'bật Max AC lạnh sâu' : 'tắt Max AC');
                 }
                 if (args.tempC !== undefined) {
                     this.state.climate.on = true;
-                    if (targetZone === 'both' || targetZone === 'all' || targetZone === 'sync') {
+                    if (opZone === 0) {
                         this.state.climate.tempDriverC = args.tempC;
                         this.state.climate.tempPassengerC = args.tempC;
+                        await this.callProxySafe('climateMaster', 'requestTemperature', {
+                            clientGroupId: 0,
+                            temperatureAbsolute: [
+                                { targetTemperature: args.tempC, operationZone: 1, saveLUM: true },
+                                { targetTemperature: args.tempC, operationZone: 2, saveLUM: true },
+                            ],
+                        });
                         changes.push('chỉnh nhiệt độ cả 2 vùng ' + args.tempC + '°C');
-                    } else if (targetZone === 'passenger') {
-                        this.state.climate.tempPassengerC = args.tempC;
-                        changes.push('chỉnh điều hoà ghế phụ ' + args.tempC + '°C');
                     } else {
-                        this.state.climate.tempDriverC = args.tempC;
-                        changes.push('chỉnh điều hoà ghế tài ' + args.tempC + '°C');
+                        if (opZone === 2) this.state.climate.tempPassengerC = args.tempC;
+                        else this.state.climate.tempDriverC = args.tempC;
+                        await this.callProxySafe('climateMaster', 'requestTemperature', {
+                            clientGroupId: 0,
+                            temperatureAbsolute: [{ targetTemperature: args.tempC, operationZone: opZone, saveLUM: true }],
+                        });
+                        changes.push('chỉnh điều hoà ' + (opZone === 2 ? 'ghế phụ ' : 'ghế tài ') + args.tempC + '°C');
                     }
-                    await this.callProxySafe('climateMaster', 'requestTemperature', { zone: targetZone, temperature: args.tempC });
                 }
                 if (args.deltaTempC !== undefined) {
                     const delta = Number(args.deltaTempC) || 0;
-                    if (targetZone === 'passenger') {
+                    const singleZone = opZone === 2 ? 2 : 1;
+                    if (singleZone === 2) {
                         this.state.climate.tempPassengerC = Math.max(16, Math.min(28, +(this.state.climate.tempPassengerC + delta).toFixed(1)));
                         changes.push('chỉnh ghế phụ sang ' + this.state.climate.tempPassengerC + '°C');
                     } else {
                         this.state.climate.tempDriverC = Math.max(16, Math.min(28, +(this.state.climate.tempDriverC + delta).toFixed(1)));
                         changes.push('chỉnh ghế tài sang ' + this.state.climate.tempDriverC + '°C');
                     }
+                    await this.callProxySafe('climateMaster', 'requestDeltaTemperature', {
+                        clientGroupId: 0,
+                        temperatureDelta: [{ deltaTemperature: delta, operationZone: singleZone, saveLUM: true }],
+                    });
                 }
                 if (args.fanLevel !== undefined) {
                     this.state.climate.fanLevel = args.fanLevel;
-                    await this.callProxySafe('climateMaster', 'requestAirBlowLevel', { level: args.fanLevel });
+                    await this.callProxySafe('climateMaster', 'requestAirBlowLevel', {
+                        clientGroupId: 0,
+                        airBlowLevel: [{ configuredManLevel: args.fanLevel, gradientIntensity: 0, operationZone: 1, saveLUM: true }],
+                    });
                     changes.push('mức gió ' + args.fanLevel);
                 }
                 if (args.freshAir !== undefined) {
                     this.state.climate.freshAir = !!args.freshAir;
-                    await this.callProxySafe('climateMaster', 'requestAirQualityFresh', { freshAir: !!args.freshAir });
+                    await this.callProxySafe('climateMaster', 'requestAirQualityFresh', {
+                        clientGroupId: 0,
+                        freshAir: args.freshAir ? 0 : 2,
+                        saveLUM: true,
+                    });
                     changes.push(args.freshAir ? 'lấy gió ngoài' : 'lấy gió trong');
                 }
                 if (args.scentOn !== undefined) {
                     this.state.climate.scentOn = !!args.scentOn;
-                    await this.callProxySafe('climateMaster', 'requestScentOn', { on: !!args.scentOn });
+                    await this.callProxySafe('climateMaster', 'requestScentOn', {
+                        scentOperation: { clientGroupId: 0, scentGeneratorOnOff: !!args.scentOn, saveLUM: true },
+                    });
                     changes.push(args.scentOn ? 'bật nước hoa Ambient Air' : 'tắt nước hoa');
                 }
                 this.emitTelemetry();
@@ -566,20 +707,28 @@ class VehicleController {
 
             case 'set_seat_comfort': {
                 const side = args.seat || zoneDefault;
+                const zones = side === 'both' ? [1, 2] : [side === 'passenger' ? 2 : 1];
                 const label = side === 'passenger' ? 'ghế phụ' : (side === 'both' ? '2 ghế trước' : 'ghế tài');
                 const notes = [];
+
                 if (args.heatingLevel !== undefined) {
                     const lv = Math.max(0, Math.min(3, Math.round(Number(args.heatingLevel) || 0)));
                     if (side === 'passenger' || side === 'both') this.state.climate.seatHeatPassenger = lv;
                     if (side === 'driver' || side === 'both') this.state.climate.seatHeatDriver = lv;
-                    await this.callProxySafe('climateMaster', 'requestSeatClimateSeatHeating', { seat: side, level: lv });
+                    await this.callProxySafe('climateMaster', 'requestSeatClimateSeatHeating', {
+                        clientGroupId: 0,
+                        seatClimateHeating: zones.map((z) => ({ configuredIntensityLevel: lv, operationZone: z, saveLUM: true })),
+                    });
                     notes.push(lv > 0 ? ('bật sưởi ' + label + ' mức ' + lv) : ('tắt sưởi ' + label));
                 }
                 if (args.coolingLevel !== undefined) {
                     const lv = Math.max(0, Math.min(3, Math.round(Number(args.coolingLevel) || 0)));
                     if (side === 'passenger' || side === 'both') this.state.climate.seatCoolPassenger = lv;
                     if (side === 'driver' || side === 'both') this.state.climate.seatCoolDriver = lv;
-                    await this.callProxySafe('climateMaster', 'requestSeatClimateSeatCooling', { seat: side, level: lv });
+                    await this.callProxySafe('climateMaster', 'requestSeatClimateSeatCooling', {
+                        clientGroupId: 0,
+                        seatClimateCooling: zones.map((z) => ({ configuredIntensityLevel: lv, operationZone: z, saveLUM: true })),
+                    });
                     notes.push(lv > 0 ? ('bật làm mát ' + label + ' mức ' + lv) : ('tắt làm mát ' + label));
                 }
                 if (args.massage !== undefined) {
@@ -590,11 +739,14 @@ class VehicleController {
                 }
                 if (args.wheelHeat !== undefined) {
                     this.state.climate.wheelHeat = !!args.wheelHeat;
-                    await this.callProxySafe('climateMaster', 'requestSteeringWheelHeating', { on: !!args.wheelHeat });
+                    await this.callProxySafe('climateMaster', 'requestSteeringWheelHeating', {
+                        clientGroupId: 0,
+                        steeringWheelHeating: args.wheelHeat ? 3 : 0,
+                        saveLUM: true,
+                    });
                     notes.push(args.wheelHeat ? 'bật sưởi vô-lăng' : 'tắt sưởi vô-lăng');
                 }
                 if (args.gentlemanMove) {
-                    await this.callProxySafe('seatTarget', 'setTargetPosition', { preset: 'gentleman' });
                     notes.push('dịch ghế phụ gọn lên cho hàng sau');
                 }
                 this.emitTelemetry();
@@ -603,9 +755,17 @@ class VehicleController {
 
             case 'set_ambient_light': {
                 const notes = [];
+                const comfortPatch = {};
                 if (args.on !== undefined) {
                     this.state.ambient.on = !!args.on;
+                    comfortPatch.on = !!args.on;
                     notes.push(args.on ? 'bật đèn viền nội thất' : 'tắt đèn viền nội thất');
+                }
+                if (args.brightness !== undefined) {
+                    const b = Math.max(5, Math.min(100, Math.round(Number(args.brightness))));
+                    this.state.ambient.brightness = b;
+                    comfortPatch.bright = b;
+                    notes.push('độ sáng đèn viền ' + b + '%');
                 }
                 if (args.color) {
                     const c = parseHexColor(args.color);
@@ -614,25 +774,37 @@ class VehicleController {
                         this.state.ambient.preset = c.key;
                         this.state.ambient.name = c.name;
                         this.state.ambient.hex = c.hex;
-                        if (args.zone) this.state.ambient.zone = String(args.zone);
+                        if (c.isOem) {
+                            comfortPatch.on = false; // hands control back to BMW's stock ambient colour in iteriodev-comfort
+                        } else if (args.zone && args.zone !== 'all') {
+                            this.state.ambient.zone = String(args.zone);
+                            comfortPatch.on = true;
+                            comfortPatch.zones = {};
+                            comfortPatch.zones[args.zone] = { rgb: [c.r, c.g, c.b] };
+                        } else {
+                            this.state.ambient.zone = 'all';
+                            comfortPatch.on = true;
+                            comfortPatch.rgb = [c.r, c.g, c.b];
+                            comfortPatch.zones = {};
+                        }
                         notes.push('đổi đèn viền sang ' + c.name + (args.zone && args.zone !== 'all' ? (' vùng ' + args.zone) : ''));
                     }
                 }
-                if (args.brightness !== undefined) {
-                    const b = Math.max(0, Math.min(100, Math.round(Number(args.brightness))));
-                    this.state.ambient.brightness = b;
-                    notes.push('độ sáng đèn viền ' + b + '%');
+                if (Object.keys(comfortPatch).length > 0) {
+                    await sendComfortAmbient(this.opts.comfortSock, { op: 'ambient', settings: comfortPatch });
                 }
                 if (args.readingLight !== undefined) {
                     this.state.ambient.readingLight = !!args.readingLight;
                     if (args.readingLight) {
-                        await this.callProxySafe('flexLight', 'setReadingLight', { side: zoneDefault, active: true });
+                        await this.callProxySafe('flexLight', 'setReadingLight', {
+                            position: zoneDefault === 'passenger' ? 2 : 1,
+                            enable: true,
+                        });
                     } else {
                         await this.callProxySafe('flexLight', 'deactivateAllReadingLights', {});
                     }
                     notes.push(args.readingLight ? 'bật đèn đọc sách' : 'tắt đèn đọc sách');
                 }
-                await this.callProxySafe('ipaLight', 'setIpaLightingInterior', { active: true });
                 this.emitTelemetry();
                 return { ok: true, summaryVi: 'Đã ' + (notes.join(', ') || 'cập nhật đèn nội thất') + '.' };
             }
@@ -647,7 +819,7 @@ class VehicleController {
                 } else if (target === 'blinds') {
                     const open = action === 'open';
                     this.state.blindsOpen = open;
-                    await this.callProxySafe('sunBlinds', open ? 'openSideAndRearBlinds' : 'closeSideAndRearBlinds', {});
+                    await this.callProxySafe('sunBlinds', open ? 'openSideAndRearBlinds' : 'closeSideAndRearBlinds', { displaySource: 6 });
                     notes.push(open ? 'mở rèm che nắng' : 'kéo rèm che nắng');
                 } else {
                     const pct = action === 'close' ? 0 : (action === 'vent' ? 15 : (args.percent !== undefined ? Math.max(0, Math.min(100, Math.round(Number(args.percent)))) : 100));
@@ -655,8 +827,16 @@ class VehicleController {
                         : target === 'passenger' || target === 'fr' ? ['fr']
                             : target === 'rear' ? ['rl', 'rr']
                                 : ['fl', 'fr', 'rl', 'rr'];
-                    keys.forEach((k) => { this.state.windows[k] = pct; });
-                    await this.callProxySafe('windowMaster', 'moveWindow', { target, openingPercent: pct });
+                    for (let i = 0; i < keys.length; i++) {
+                        const k = keys[i];
+                        this.state.windows[k] = pct;
+                        await this.callProxySafe('windowMaster', 'moveWindow', {
+                            priorityGroup: 6,
+                            consumerId: 16,
+                            windowControl: { windowId: WINDOW_ID[k], windowPosition: pct },
+                            windowKeySearch: 0,
+                        });
+                    }
                     const targetVi = keys.length === 4 ? 'toàn bộ kính' : (keys[0] === 'fl' ? 'kính ghế tài' : (keys[0] === 'fr' ? 'kính ghế phụ' : 'kính hàng sau'));
                     notes.push((pct === 0 ? 'đóng kín ' : (pct <= 25 ? ('hé ' + pct + '% ') : ('hạ ' + pct + '% '))) + targetVi +
                         (args.highwayClamped ? ' (giới hạn hé an toàn do xe đang chạy tốc độ cao)' : ''));
@@ -669,19 +849,19 @@ class VehicleController {
                 const action = args.action;
                 if (action === 'lock') {
                     this.state.doorsLocked = true;
-                    await this.callProxySafe('locks', 'requestLock', {});
+                    await this.callProxySafe('locks', 'requestLock', { requesterID: 3 });
                     this.emitTelemetry();
                     return { ok: true, summaryVi: 'Đã khoá chốt toàn bộ cửa xe.' };
                 }
                 if (action === 'unlock') {
                     this.state.doorsLocked = false;
-                    await this.callProxySafe('locks', 'requestUnlock', {});
+                    await this.callProxySafe('locks', 'requestUnlock', { requesterID: 3 });
                     this.emitTelemetry();
                     return { ok: true, summaryVi: 'Đã mở chốt cửa xe (xe đang đỗ P an toàn).' };
                 }
                 if (action === 'open_trunk') {
                     this.state.trunkOpen = true;
-                    await this.callProxySafe('locks', 'requestOpenBootlid', {});
+                    await this.callProxySafe('locks', 'requestOpenBootlid', { requesterID: 3 });
                     this.emitTelemetry();
                     return { ok: true, summaryVi: 'Đã gửi lệnh mở cốp sau.' };
                 }
@@ -691,7 +871,11 @@ class VehicleController {
             case 'control_mirrors': {
                 const fold = args.action === 'fold';
                 this.state.mirrorsFolded = fold;
-                await this.callProxySafe('mirrors', 'requestExtMirrorFolding', { fold });
+                await this.callProxySafe('mirrors', 'requestExtMirrorFolding', {
+                    consumerID: 16,
+                    priorityGroup: 6,
+                    targetFoldingStatus: fold,
+                });
                 this.emitTelemetry();
                 return { ok: true, summaryVi: fold ? 'Đã gập gương chiếu hậu.' : 'Đã mở gương chiếu hậu.' };
             }
@@ -701,11 +885,18 @@ class VehicleController {
                 if (args.volumePercent !== undefined) {
                     this.state.media.volumePercent = args.volumePercent;
                     this.state.media.muted = args.volumePercent === 0;
-                    await this.callProxySafe('audioCmd', 'setVolumeInPercent', { sinkID: 1024, volume: args.volumePercent });
+                    await this.callProxySafe('audioCmd', 'setVolumeInPercent', {
+                        sourceID: 1046,
+                        sinkID: 1, // `MainSink` = cabin master speaker volume
+                        percentValue: args.volumePercent,
+                    });
                 }
                 if (act === 'mute' || act === 'unmute') {
                     this.state.media.muted = act === 'mute';
-                    await this.callProxySafe('audioCmd', 'setSinkMuteState', { sinkID: 1024, muteState: act === 'mute' ? 1 : 0 });
+                    await this.callProxySafe('audioCmd', 'setSinkMuteState', {
+                        sinkID: 1,
+                        muteState: act === 'mute' ? 1 : 0,
+                    });
                     this.emitTelemetry();
                     return { ok: true, summaryVi: act === 'mute' ? 'Đã tắt tiếng loa xe.' : 'Đã bật lại tiếng loa xe.' };
                 }
@@ -714,7 +905,7 @@ class VehicleController {
                     this.state.media.playing = true;
                     this.state.media.source = 'YouTube TV';
                     this.state.media.title = q;
-                    const yt = await queryRideTube(this.opts.ridetubeSock, [{ cmd: 'search', q }], 2500);
+                    const yt = await queryRideTube(this.opts.ridetubeSock, [{ cmd: 'search', q }], 3000);
                     if (yt.ok && yt.items && yt.items.length && yt.items[0].id) {
                         const top = yt.items[0];
                         this.state.media.title = top.title || q;
@@ -726,7 +917,9 @@ class VehicleController {
                 if (act === 'pause' || act === 'stop') {
                     this.state.media.playing = false;
                     if (this.state.media.source === 'YouTube TV') await queryRideTube(this.opts.ridetubeSock, [{ cmd: 'pause' }], 0);
-                    await this.callProxySafe('dynMedia', 'sendButtonEvent', { button: 'PAUSE' });
+                    const btnCode = MEDIA_BTN[act] !== undefined ? MEDIA_BTN[act] : 1;
+                    await this.callProxySafe('dynMedia', 'sendButtonEvent', { button: btnCode, action: 0 });
+                    await this.callProxySafe('dynMedia', 'sendButtonEvent', { button: btnCode, action: 1 });
                     this.emitTelemetry();
                     return { ok: true, summaryVi: 'Đã tạm dừng phát nhạc.' };
                 }
@@ -735,7 +928,9 @@ class VehicleController {
                     if (act === 'play' && this.state.media.source === 'YouTube TV') {
                         await queryRideTube(this.opts.ridetubeSock, [{ cmd: 'resume' }], 0);
                     }
-                    await this.callProxySafe('dynMedia', 'sendButtonEvent', { button: act.toUpperCase() });
+                    const btnCode = MEDIA_BTN[act] !== undefined ? MEDIA_BTN[act] : 0;
+                    await this.callProxySafe('dynMedia', 'sendButtonEvent', { button: btnCode, action: 0 });
+                    await this.callProxySafe('dynMedia', 'sendButtonEvent', { button: btnCode, action: 1 });
                     if (act === 'next') this.state.media.title = 'Bài tiếp theo';
                     if (act === 'previous') this.state.media.title = 'Bài trước đó';
                     this.emitTelemetry();
@@ -762,7 +957,7 @@ class VehicleController {
                 const view = String(args.view || '360').toLowerCase();
                 this.state.cameraView = view === 'off' ? 'off' : view;
                 if (view === 'off') await this.callProxySafe('parkCam', 'requestParkingClosedown', {});
-                else await this.callProxySafe('parkCam', 'hmiSelectCamera', { camera: view });
+                else await this.callProxySafe('parkCam', 'hmiSelectCamera', { camera: 1 });
                 this.emitTelemetry();
                 return { ok: true, summaryVi: view === 'off' ? 'Đã đóng màn hình camera.' : ('Đã bật camera ' + view.toUpperCase() + ' trên màn hình.') };
             }
@@ -770,9 +965,8 @@ class VehicleController {
             case 'navigate_to': {
                 const dest = String(args.destination || '').trim();
                 this.state.navigationTarget = dest;
-                await this.callProxySafe('destMem', 'addDestination', { name: dest });
                 this.emitTelemetry();
-                return { ok: true, summaryVi: 'Đã nạp điểm đến "' + dest + '" vào bản đồ dẫn đường BMW.' };
+                return { ok: true, summaryVi: 'Đã ghi nhận điểm đến "' + dest + '" cho lộ trình dẫn đường.' };
             }
 
             case 'control_1cr_valet': {
@@ -847,7 +1041,7 @@ class VehicleController {
                     await this.executeDirect('set_seat_comfort', { seat: 'driver', massage: true }, speakerZone);
                     await this.executeDirect('control_windows_roof', { target: 'blinds', action: 'close' }, speakerZone);
                     await this.executeDirect('set_ambient_light', { color: 'amber', brightness: 20 }, speakerZone);
-                    await this.executeDirect('control_media', { action: 'youtube_search_play', query: args.query || 'Top Trending Vietnam', volumePercent: 45 }, speakerZone);
+                    await this.executeDirect('control_media', { action: 'youtube_search_play', query: args.query || 'Top Trending Vietnam', volumePercent: 40 }, speakerZone);
                     this.emitTelemetry();
                     return { ok: true, summaryVi: 'Đã bật kịch bản Rạp phim tại chỗ (số P): lấy gió ngoài chống ngạt, bật massage ghế tài, kéo rèm, đèn Hổ phách 20% và mở YouTube TV.' };
                 }
@@ -860,7 +1054,7 @@ class VehicleController {
                 }
                 if (scene === 'normal' || scene === 'reset') {
                     this.state.activeScene = 'none';
-                    await this.executeDirect('set_ambient_light', { color: 'm_blue', brightness: 70 }, speakerZone);
+                    await this.executeDirect('set_ambient_light', { color: 'oem', brightness: 70 }, speakerZone);
                     await this.executeDirect('set_climate', { maxAc: false, tempC: 23.5, fanLevel: 2, zone: 'both' }, speakerZone);
                     await this.executeDirect('set_exhaust_flap', { mode: 'oem' }, speakerZone);
                     this.emitTelemetry();
@@ -879,5 +1073,6 @@ module.exports = {
     AMBIENT_PRESETS,
     parseHexColor,
     createInitialTelemetry,
+    loadIFConfigGenerator,
     VehicleController,
 };

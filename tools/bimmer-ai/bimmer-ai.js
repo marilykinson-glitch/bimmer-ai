@@ -27,7 +27,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.1.0';
+const VERSION = '0.2.0';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -355,12 +355,15 @@ class BimmerAiDaemon {
 
         this.assistantState = 'listening';
         this.writeStatusFile();
+        await this.vehicle.pulseIpaLight('listenDriver');
         try {
             const cap = await AudioIO.captureCeilingMicClip({
                 device: dev,
                 durationSec: this.settings.micDurationSec,
                 outFile: path.join(this.cfg.run, 'capture.wav'),
                 swapChannels: this.settings.swapMicChannels,
+                connectAmRoute: (r) => this.vehicle.connectAudioRoute(r),
+                disconnectAmRoute: (cid) => this.vehicle.disconnectAudioRoute(cid),
                 isCallActive: () => !!this.vehicle.state.callActive,
             });
             this.micLevels = { leftDb: cap.analysis.leftDb, rightDb: cap.analysis.rightDb };
@@ -371,6 +374,7 @@ class BimmerAiDaemon {
                 speakerZone: this.activeSpeakerZone,
             });
         } catch (e) {
+            await this.vehicle.pulseIpaLight('off');
             this.assistantState = 'idle';
             this.lastTurn = {
                 at: Date.now(),
@@ -430,7 +434,7 @@ class BimmerAiDaemon {
         });
         if (this.history.length > 25) this.history.shift();
 
-        // Synthesize TTS MP3 with Audio Ducking if enabled
+        // Synthesize TTS MP3 with Audio Ducking & BMW MediaPlayer speaker output
         let ttsAudioBase64 = '';
         if (this.settings.ttsEnabled && turn.replyVi) {
             this.assistantState = 'speaking';
@@ -438,19 +442,37 @@ class BimmerAiDaemon {
             const prevVol = this.vehicle.state.media.volumePercent;
             const wasPlaying = this.vehicle.state.media.playing;
             if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
-                await this.vehicle.callProxySafe('audioCmd', 'setVolumeInPercent', { sinkID: 1024, volume: this.settings.duckVolumePercent });
+                await this.vehicle.callProxySafe('audioCmd', 'setVolumeInPercent', {
+                    sourceID: 1046,
+                    sinkID: 1,
+                    percentValue: this.settings.duckVolumePercent,
+                });
             }
             const mp3 = await AudioIO.synthesizeVietnameseMp3(turn.replyVi, this.uplinkOpts, Up);
             if (mp3) {
                 ttsAudioBase64 = mp3.toString('base64');
-                const mp3Path = path.join(this.cfg.run, 'tts', 'reply.mp3');
-                try { fs.writeFileSync(mp3Path, mp3); } catch (e) {}
+                const ttsDir = path.join(this.cfg.run, 'tts');
+                const mp3Path = path.join(ttsDir, 'reply.mp3');
+                try {
+                    fs.chmodSync(this.cfg.run, 0o755);
+                    fs.chmodSync(ttsDir, 0o755);
+                    fs.writeFileSync(mp3Path, mp3, { mode: 0o644 });
+                    await this.vehicle.playTtsOnCarSpeakers(mp3Path, speakerZone);
+                } catch (e) {}
+            } else {
+                await this.vehicle.pulseIpaLight('off');
             }
             if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
                 setTimeout(() => {
-                    this.vehicle.callProxySafe('audioCmd', 'setVolumeInPercent', { sinkID: 1024, volume: prevVol }).catch(() => {});
-                }, 2200);
+                    this.vehicle.callProxySafe('audioCmd', 'setVolumeInPercent', {
+                        sourceID: 1046,
+                        sinkID: 1,
+                        percentValue: prevVol,
+                    }).catch(() => {});
+                }, 3200);
             }
+        } else {
+            await this.vehicle.pulseIpaLight('off');
         }
 
         this.assistantState = 'idle';
