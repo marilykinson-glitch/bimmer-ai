@@ -244,6 +244,12 @@
           <input type="password" id="cfgApiKey" placeholder="AIzaSy...">
         </div>
         <div class="field-row">
+          <label style="display:flex;align-items:center;gap:8px;cursor:pointer;color:var(--text)">
+            <input type="checkbox" id="cfgHandsFree" checked style="width:18px;height:18px">
+            <span>🟢 Nghe rảnh tay <b>"Hey Bimmer / Ê Bimmer"</b> từ Mic trần xe (như Hey Siri, không cần chạm màn hình)</span>
+          </label>
+        </div>
+        <div class="field-row">
           <label>Cách gọi trên vô-lăng & Tên xưng hô:</label>
           <div style="display:flex;gap:8px">
             <select id="cfgPtt" style="flex:1">
@@ -413,6 +419,7 @@
 
   function saveCfg() {
     var body = {
+      handsFreeWake: !!document.getElementById('cfgHandsFree').checked,
       pttTrigger: document.getElementById('cfgPtt').value,
       ownerName: document.getElementById('cfgOwner').value
     };
@@ -458,7 +465,25 @@
 
     var ap = s.audioProbe || {};
     var availCount = (t.availableProxies && t.availableProxies.length) || 0;
-    document.getElementById('micProbeBadge').textContent = ap.hasAlsaCapture ? ('Mic: ' + ap.recommendedDevice.split(':').pop().slice(0, 18)) : 'Mic: Mô phỏng';
+    var hfOn = !(s.settings && s.settings.handsFreeWake === false);
+    var hasKey = !!(s.settings && s.settings.hasApiKey);
+    var mpBadge = document.getElementById('micProbeBadge');
+    if (s.followUpActive) {
+      mpBadge.textContent = '👂 Đang chờ đọc lệnh...';
+      mpBadge.className = 'badge ok';
+    } else if (s.wakeStatus === 'armed' || s.wakeStatus === 'speech') {
+      mpBadge.textContent = '🟢 Trực: "Hey Bimmer"';
+      mpBadge.className = 'badge ok';
+    } else if (hfOn && !hasKey) {
+      mpBadge.textContent = '🟡 Hey Bimmer: Cần dán Key';
+      mpBadge.className = 'badge warn';
+    } else {
+      mpBadge.textContent = ap.hasAlsaCapture ? ('Mic: ' + ap.recommendedDevice.split(':').pop().slice(0, 18)) : 'Mic: Mô phỏng';
+      mpBadge.className = 'badge';
+    }
+    if (document.activeElement !== document.getElementById('cfgHandsFree') && s.settings) {
+      document.getElementById('cfgHandsFree').checked = s.settings.handsFreeWake !== false;
+    }
     document.getElementById('alsaInfo').textContent =
       (t.liveCar ? ('SOME/IP sống (' + availCount + ' cổng: ' + (t.availableProxies || []).join(', ') + ')' + (t.lastBusTrace ? (' · Lệnh cuối: ' + t.lastBusTrace) : ''))
                  : 'Chế độ mô phỏng trên máy tính.') +

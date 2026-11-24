@@ -69,25 +69,32 @@ function drawVoiceAndQrPane(cv, G, t, lx, top, v, act) {
     const w = 324;
     const phase = (v.animTick || 0) * 0.12;
     const state = v.assistantState || 'idle';
-    const orbColor = state === 'listening' ? '#00e5ff'
+    const wakeArmed = (v.wakeStatus === 'armed' || v.wakeStatus === 'speech' || v.followUpActive);
+    const orbColor = state === 'listening' || v.wakeStatus === 'speech' ? '#00e5ff'
         : (state === 'thinking' ? '#a855f7'
-            : (state === 'speaking' ? '#2fd27a' : (t.accent2 || '#4da6ff')));
+            : (state === 'speaking' || wakeArmed ? '#2fd27a' : (t.accent2 || '#4da6ff')));
 
     // Top mini card: Animated Voice Orb + 2-Zone Ceiling Mic Meters
     cv.roundRect(lx, top, w, 112, 16, G.withAlpha('#ffffff', 0.05));
-    cv.strokeRoundRect(lx, top, w, 112, 16, 1.3, G.withAlpha(orbColor, state === 'idle' ? 0.35 : 0.9));
+    cv.strokeRoundRect(lx, top, w, 112, 16, 1.3, G.withAlpha(orbColor, (state === 'idle' && !wakeArmed) ? 0.35 : 0.9));
 
     const cx = lx + 52, cy = top + 56;
-    const pulseR = state === 'idle' ? 24 : (24 + Math.round(Math.sin(phase) * 5));
+    const pulseR = (state === 'idle' && !wakeArmed) ? 24 : (24 + Math.round(Math.sin(phase) * (state === 'idle' ? 2 : 5)));
     cv.circle(cx, cy, pulseR + 8, G.withAlpha(orbColor, 0.18));
     cv.circle(cx, cy, pulseR, G.withAlpha(orbColor, 0.88));
     cv.circle(cx, cy, 10, '#ffffff');
     if (cv.target && act.triggerMic) cv.target(lx, top, w, 112, act.triggerMic, 'aiTapOrb');
 
+    const hfEnabled = !(v.settings && v.settings.handsFreeWake === false);
+    const hasKey = !!(v.settings && v.settings.hasApiKey);
     const stateVi = state === 'listening' ? 'ĐANG NGHE MIC TRẦN…'
         : (state === 'thinking' ? 'ĐANG XỬ LÝ LỆNH…'
             : (state === 'speaking' ? 'BIMMER AI ĐANG NÓI…'
-                : (v.telemetry && v.telemetry.callActive ? 'NHƯỜNG MIC CUỘC GỌI' : 'MIC ZIN 2 VÙNG SẴN SÀNG')));
+                : (v.telemetry && v.telemetry.callActive ? 'NHƯỜNG MIC CUỘC GỌI'
+                    : (v.followUpActive ? 'ĐANG CHỜ ĐỌC LỆNH…'
+                        : (v.wakeStatus === 'speech' ? 'NGHE TIẾNG TRONG XE…'
+                            : (wakeArmed ? 'TRỰC: "HEY BIMMER"'
+                                : (hfEnabled && !hasKey ? 'DÁN KEY ĐỂ HEY BIMMER' : 'MIC ZIN 2 VÙNG SẴN SÀNG')))))));
     cv.text(fit(cv, stateVi, 15, { literal: true, font: 'bold' }, w - 112), lx + 102, top + 30, 15, orbColor, { literal: true, font: 'bold' });
 
     const lNorm = dbToNorm(v.micLevels && v.micLevels.leftDb);

@@ -28,7 +28,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.3.3';
+const VERSION = '0.4.0';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -71,7 +71,8 @@ function defaultSettings() {
         apiKey: '',
         model: 'gemini-2.5-flash',
         ownerName: 'Đại ca',
-        pttTrigger: 'short_press',      // short_press | double_press | disabled
+        handsFreeWake: true,            // Always-on "Hey Bimmer" / "Ê Bimmer" ceiling-mic VAD listener
+        pttTrigger: 'short_press',      // short_press | long_press | double_press | disabled
         micDevice: 'auto',
         micDurationSec: 4,
         swapMicChannels: false,
@@ -91,6 +92,7 @@ function normalizeSettings(raw) {
         apiKey: typeof r.apiKey === 'string' ? r.apiKey.trim() : d.apiKey,
         model: typeof r.model === 'string' && r.model.trim() ? r.model.trim() : d.model,
         ownerName: typeof r.ownerName === 'string' && r.ownerName.trim() ? r.ownerName.trim().slice(0, 40) : d.ownerName,
+        handsFreeWake: r.handsFreeWake !== false,
         pttTrigger: (ptt === 'short_press' || ptt === 'long_press' || ptt === 'double_press' || ptt === 'disabled') ? ptt : d.pttTrigger,
         micDevice: typeof r.micDevice === 'string' && r.micDevice.trim() ? r.micDevice.trim() : d.micDevice,
         micDurationSec: Math.max(2, Math.min(8, Math.round(Number(r.micDurationSec) || d.micDurationSec))),
@@ -230,6 +232,8 @@ class BimmerAiDaemon {
         this.logs = [];
         this.history = [];
         this.assistantState = 'idle'; // idle | listening | thinking | speaking
+        this.wakeStatus = 'off';      // off | paused | armed | speech
+        this.followUpUntil = 0;       // 2-step "Hey Bimmer!" -> active follow-up command window
         this.activeSpeakerZone = 'driver';
         this.micLevels = { leftDb: -65, rightDb: -65 };
         this.lastTurn = {
@@ -237,7 +241,7 @@ class BimmerAiDaemon {
             engine: this.settings.apiKey ? 'gemini' : 'offline',
             speakerZone: 'driver',
             transcript: '',
-            replyVi: 'Sẵn sàng! Bấm nút Mic vô-lăng, chọn lệnh nhanh trên màn hình hoặc mở cổng giọng nói QR.',
+            replyVi: 'Sẵn sàng! Gọi rảnh tay "Hey Bimmer / Ê Bimmer", bấm nút Mic vô-lăng hoặc mở cổng QR.',
             actions: [],
         };
         this.audioProbe = AudioIO.probeOemAudioStack();
@@ -258,6 +262,44 @@ class BimmerAiDaemon {
             onLog: (m) => this.log(m),
         });
         this.vehicle.setGuards(this.settings.guards);
+
+        this.wakeMonitor = new AudioIO.WakeWordMonitor({
+            outFile: path.join(this.cfg.run, 'vad_utt.wav'),
+            swapChannels: this.settings.swapMicChannels,
+            connectAmRoute: (r) => this.vehicle.connectAudioRoute(r),
+            disconnectAmRoute: (cid) => this.vehicle.disconnectAudioRoute(cid),
+            shouldPause: () => {
+                if (!this.settings.handsFreeWake) return true;
+                if (!(this.settings.apiKey && String(this.settings.apiKey).trim())) return true;
+                if (this.vehicle.state.callActive) return true;
+                if (this.assistantState !== 'idle') return true;
+                // On live car, only keep mic stream open when engine/ignition is on (or in active follow-up window)
+                if (this.vehicle.state.liveCar && !this.vehicle.state.engineRunning && Date.now() >= this.followUpUntil) return true;
+                return false;
+            },
+            onStatusChange: (st) => {
+                this.wakeStatus = st;
+                this.writeStatusFile();
+            },
+            onSpeechStart: (ev) => {
+                if (typeof ev.db === 'number') {
+                    this.micLevels = { leftDb: ev.db, rightDb: ev.db };
+                    this.writeStatusFile();
+                }
+            },
+            onUtterance: (utt) => {
+                const inFollowUp = Date.now() < this.followUpUntil;
+                this.micLevels = { leftDb: utt.analysis.leftDb, rightDb: utt.analysis.rightDb };
+                const zone = utt.analysis.speakerZone === 'passenger' ? 'passenger' : 'driver';
+                this.handleVoiceOrTextTurn({
+                    audioWavBase64: utt.wavBuffer.toString('base64'),
+                    audioMimeType: 'audio/wav',
+                    speakerZone: zone,
+                    wakeMode: !inFollowUp,
+                }).catch((e) => this.log('wake turn error: ' + e.message));
+            },
+            onLog: (m) => this.log(m),
+        });
     }
 
     log(msg) {
@@ -305,6 +347,8 @@ class BimmerAiDaemon {
             ips: netInfo.ips,
             pin: this.pin,
             assistantState: this.assistantState,
+            wakeStatus: this.wakeStatus,
+            followUpActive: Date.now() < this.followUpUntil,
             activeSpeakerZone: this.activeSpeakerZone,
             micLevels: this.micLevels,
             settings: this.publicSettings(),
@@ -395,6 +439,9 @@ class BimmerAiDaemon {
         const hasKey = !!(this.settings.apiKey && String(this.settings.apiKey).trim());
         const clipSec = hasKey ? this.settings.micDurationSec : 2;
 
+        // Release continuous VAD stream before opening one-shot PTT capture
+        if (this.wakeMonitor) await this.wakeMonitor.killWorker();
+
         this.assistantState = 'listening';
         this.writeStatusFile();
         await this.vehicle.pulseIpaLight('listenDriver');
@@ -471,13 +518,16 @@ class BimmerAiDaemon {
         }
 
         this.activeSpeakerZone = speakerZone;
-        this.assistantState = 'thinking';
-        this.writeStatusFile();
+        if (!input.wakeMode) {
+            this.assistantState = 'thinking';
+            this.writeStatusFile();
+        }
 
         const turn = await AiBrain.processAssistantTurn({
             text: input.text || '',
             audioWavBase64: input.audioWavBase64 || '',
             audioMimeType: input.audioMimeType || 'audio/wav',
+            wakeMode: !!input.wakeMode,
             speakerZone,
             ownerName: this.settings.ownerName,
             apiKey: this.settings.apiKey,
@@ -486,6 +536,21 @@ class BimmerAiDaemon {
             history: this.history,
             uplinkOpts: this.uplinkOpts,
         });
+
+        // In Hands-Free `wakeMode`, silently drop background cabin conversation that lacked "Hey Bimmer"
+        if (turn.ignored) {
+            this.assistantState = 'idle';
+            if (this.wakeMonitor) this.wakeMonitor.holdCooldown(500);
+            this.writeStatusFile();
+            return Object.assign({}, turn, { ttsAudioBase64: '', telemetry: this.vehicle.state });
+        }
+
+        if (turn.wakeOnly) {
+            // User called "Hey Bimmer!" -> answer "Dạ đại ca cần gì em?" and open 10s follow-up window!
+            this.followUpUntil = Date.now() + 10000;
+        } else {
+            this.followUpUntil = 0;
+        }
 
         this.lastTurn = turn;
         this.history.push({
@@ -502,6 +567,7 @@ class BimmerAiDaemon {
         let ttsAudioBase64 = '';
         if (this.settings.ttsEnabled && turn.replyVi) {
             this.assistantState = 'speaking';
+            if (this.wakeMonitor) this.wakeMonitor.holdCooldown(turn.wakeOnly ? 2600 : 3800);
             this.writeStatusFile();
             const prevVol = this.vehicle.state.media.volumePercent;
             const wasPlaying = this.vehicle.state.media.playing;
@@ -572,6 +638,10 @@ class BimmerAiDaemon {
         }
         if (cmd === 'health_check') {
             return this.handleVoiceOrTextTurn({ text: 'Khám xe kiểm tra tình trạng bình ắc quy, dầu máy và áp suất lốp', speakerZone: 'driver' });
+        }
+        if (cmd === 'toggle_hands_free') {
+            this.saveSettings({ handsFreeWake: !this.settings.handsFreeWake });
+            return { ok: true };
         }
         if (cmd === 'toggle_guard' && arg.domain) {
             const g = Object.assign({}, this.vehicle.guards);
@@ -654,6 +724,7 @@ class BimmerAiDaemon {
                     audioWavBase64: body.audioWavBase64 || '',
                     audioMimeType: body.audioMimeType || 'audio/wav',
                     speakerZone: body.speakerZone || 'driver',
+                    wakeMode: !!body.wakeMode,
                 });
                 return sendJson(200, { ok: true, turn: result, state: this.getPublicState() });
             } catch (e) {
@@ -773,12 +844,14 @@ class BimmerAiDaemon {
         }, 250);
 
         this.writeStatusFile();
+        if (this.wakeMonitor) this.wakeMonitor.start();
         this.log('listening on ' + this.portalUrl().url);
         return this;
     }
 
     async stop() {
         if (this.pollTimer) clearInterval(this.pollTimer);
+        if (this.wakeMonitor) await this.wakeMonitor.stop();
         if (this.ctlServer) {
             await new Promise((resolve) => this.ctlServer.close(resolve));
             this.ctlServer = null;

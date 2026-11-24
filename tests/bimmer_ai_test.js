@@ -371,6 +371,127 @@ async function runAllTests() {
         await new Promise((r) => mockGem25.close(r));
     });
 
+    await step('Hands-Free "Hey Bimmer" Wake Word, Chatter Filter, 2-Step Follow-Up & WakeWordMonitor', async () => {
+        const tmpWake = fs.mkdtempSync(path.join(os.tmpdir(), 'bimmer-ai-wake-'));
+        let mode = 'ignore';
+        const mockWakeGemini = http.createServer((req, res) => {
+            const chunks = [];
+            req.on('data', (c) => chunks.push(c));
+            req.on('end', () => {
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                if (mode === 'ignore') {
+                    res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[IGNORE]' }] } }] }));
+                } else if (mode === 'wake_only') {
+                    res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[WAKE_ONLY] [TRANSCRIPT: Hey Bimmer] Dạ Đại ca cần gì em?' }] } }] }));
+                } else {
+                    res.end(JSON.stringify({
+                        candidates: [{
+                            content: {
+                                parts: [
+                                    { functionCall: { name: 'set_seat_comfort', args: { seat: 'driver', massage: true } } },
+                                    { text: '[TRANSCRIPT: Bật massage ghế tài] Đã bật massage ghế tài cho Đại ca!' },
+                                ],
+                            },
+                        }],
+                    }));
+                }
+            });
+        });
+        await new Promise((r) => mockWakeGemini.listen(0, '127.0.0.1', r));
+
+        const dm = new BimmerAiDaemon({
+            run: path.join(tmpWake, 'run'),
+            state: path.join(tmpWake, 'state'),
+            oap: path.join(tmpWake, 'oap'),
+            host: '127.0.0.1',
+            port: 0,
+            simMode: true,
+            noNft: true,
+            quiet: true,
+            geminiBaseUrl: 'http://127.0.0.1:' + mockWakeGemini.address().port,
+        });
+        await dm.start();
+        dm.saveSettings({ apiKey: 'WAKE_KEY', handsFreeWake: true, ttsEnabled: false });
+
+        const wavClip = AudioIO.buildStereoWav(new Array(2400).fill(0.35), new Array(2400).fill(0.04), 16000);
+
+        // 1. Private cabin chatter -> `[IGNORE]` must NOT overwrite `lastTurn` or touch vehicle!
+        const prevReply = dm.lastTurn.replyVi;
+        mode = 'ignore';
+        const rIgnore = await dm.handleVoiceOrTextTurn({
+            audioWavBase64: wavClip.toString('base64'),
+            audioMimeType: 'audio/wav',
+            wakeMode: true,
+        });
+        assert.strictEqual(rIgnore.ignored, true);
+        assert.strictEqual(dm.lastTurn.replyVi, prevReply);
+        assert.strictEqual(dm.getPublicState().followUpActive, false);
+
+        // 2. "Hey Bimmer!" (wake-only) -> answers "Dạ Đại ca cần gì em?" and opens 10s follow-up window!
+        mode = 'wake_only';
+        const rWake = await dm.handleVoiceOrTextTurn({
+            audioWavBase64: wavClip.toString('base64'),
+            audioMimeType: 'audio/wav',
+            wakeMode: true,
+        });
+        assert.strictEqual(rWake.wakeOnly, true);
+        assert.strictEqual(dm.getPublicState().followUpActive, true);
+        assert.ok(dm.lastTurn.replyVi.indexOf('Dạ') >= 0);
+
+        // 3. Follow-up command without repeating "Hey Bimmer" -> executes immediately & closes follow-up window!
+        mode = 'cmd';
+        await dm.handleVoiceOrTextTurn({
+            audioWavBase64: wavClip.toString('base64'),
+            audioMimeType: 'audio/wav',
+            wakeMode: !dm.getPublicState().followUpActive,
+        });
+        assert.strictEqual(dm.vehicle.state.climate.massageDriver, true);
+        assert.strictEqual(dm.getPublicState().followUpActive, false);
+
+        // 4. Deterministic text `extractWakeCommand` (1-breath command vs non-wake chatter)
+        assert.strictEqual(AiBrain.extractWakeCommand('Tối nay đi ăn lẩu nhé').matched, false);
+        assert.strictEqual(AiBrain.extractWakeCommand('Hey Bimmer!').wakeOnly, true);
+        const oneBreath = AiBrain.extractWakeCommand('Ê Bimmer chỉnh điều hoà 22 độ');
+        assert.strictEqual(oneBreath.matched, true);
+        assert.strictEqual(oneBreath.wakeOnly, false);
+
+        // 5. `WakeWordMonitor` child-process supervisor & phone-call instant pause
+        const fakeHelper = path.join(tmpWake, 'mock_vad.js');
+        const fakeOutWav = path.join(tmpWake, 'vad_utt.wav');
+        fs.writeFileSync(fakeOutWav, wavClip);
+        fs.writeFileSync(fakeHelper, [
+            'console.log(JSON.stringify({ event: "ready", device: "smartx:VoiceNotesSink_CF_24_MONO" }));',
+            'setTimeout(() => {',
+            '  console.log(JSON.stringify({ event: "utterance", file: process.argv[4], durationMs: 1200, speechDb: -18.5, noiseDb: -48.0 }));',
+            '}, 80);',
+            'setInterval(() => {}, 1000);',
+        ].join('\n'));
+
+        let gotUtterance = null;
+        let callActive = false;
+        const mon = new AudioIO.WakeWordMonitor({
+            mguPython: process.execPath,
+            smartxHelper: fakeHelper,
+            outFile: fakeOutWav,
+            shouldPause: () => callActive,
+            onUtterance: (u) => { gotUtterance = u; },
+        });
+        mon.start();
+        await new Promise((r) => setTimeout(r, 350));
+        assert.strictEqual(mon.status, 'armed');
+        assert.ok(gotUtterance && gotUtterance.analysis.speakerZone === 'driver');
+
+        // Phone call arrives -> monitor must immediately kill worker & enter `paused`!
+        callActive = true;
+        await mon.tick();
+        assert.strictEqual(mon.status, 'paused');
+        assert.strictEqual(mon.child, null);
+        await mon.stop();
+
+        await dm.stop();
+        await new Promise((r) => mockWakeGemini.close(r));
+    });
+
     console.log('\nALL ' + passed + ' TEST SUITES PASSED!');
 }
 

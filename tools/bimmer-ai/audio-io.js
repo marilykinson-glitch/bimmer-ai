@@ -467,6 +467,206 @@ async function synthesizeVietnameseMp3(text, uplinkOpts, uplinkModule) {
     return null;
 }
 
+class WakeWordMonitor {
+    constructor(opts) {
+        this.opts = Object.assign({
+            mguPython: MGU_PYTHON,
+            smartxHelper: SMARTX_HELPER,
+            smartxDir: '/run/smartx',
+            outFile: '/run/bimmer-ai/vad_utt.wav',
+            swapChannels: false,
+            connectAmRoute: null,
+            disconnectAmRoute: null,
+            shouldPause: () => false,
+            onSpeechStart: null,
+            onUtterance: null,
+            onStatusChange: null,
+            onLog: null,
+        }, opts || {});
+
+        this.running = false;
+        this.child = null;
+        this.routeToken = null;
+        this.activeDevice = '';
+        this.status = 'off'; // off | paused | armed | speech
+        this.profileIdx = 0;
+        this.cooldownUntil = 0;
+        this.watchTimer = null;
+        this.stdoutBuf = '';
+    }
+
+    log(msg) {
+        if (this.opts.onLog) this.opts.onLog(msg);
+    }
+
+    setStatus(next) {
+        if (this.status === next) return;
+        this.status = next;
+        if (this.opts.onStatusChange) this.opts.onStatusChange(next, this.activeDevice);
+    }
+
+    holdCooldown(ms) {
+        this.cooldownUntil = Math.max(this.cooldownUntil, Date.now() + (ms || 1200));
+    }
+
+    pickCandidates() {
+        const nodes = listDirSafe(this.opts.smartxDir);
+        const list = [];
+        if (lastWorkingHw) {
+            for (let i = 0; i < SMARTX_PROFILES.length; i++) {
+                if (SMARTX_PROFILES[i].hw === lastWorkingHw) list.push(SMARTX_PROFILES[i]);
+            }
+        }
+        for (let j = 0; j < SMARTX_PROFILES.length; j++) {
+            const p = SMARTX_PROFILES[j];
+            if ((!nodes.length || nodes.indexOf(p.match) >= 0) && !list.some((x) => x.hw === p.hw)) {
+                list.push(p);
+            }
+        }
+        return list;
+    }
+
+    start() {
+        if (this.running) return;
+        this.running = true;
+        this.watchTimer = setInterval(() => {
+            this.tick().catch((e) => this.log('wake monitor tick err: ' + e.message));
+        }, 450);
+        this.tick().catch(() => {});
+    }
+
+    async stop() {
+        this.running = false;
+        if (this.watchTimer) {
+            clearInterval(this.watchTimer);
+            this.watchTimer = null;
+        }
+        await this.killWorker();
+        this.setStatus('off');
+    }
+
+    async killWorker() {
+        const c = this.child;
+        this.child = null;
+        this.stdoutBuf = '';
+        if (c) {
+            await new Promise((resolve) => {
+                let done = false;
+                const fin = () => { if (!done) { done = true; resolve(); } };
+                c.once('close', fin);
+                try { c.kill('SIGTERM'); } catch (e) { fin(); }
+                setTimeout(() => { try { c.kill('SIGKILL'); } catch (e) {} fin(); }, 400);
+            });
+        }
+        const rt = this.routeToken;
+        this.routeToken = null;
+        if (rt && rt.created && rt.connId !== null && typeof this.opts.disconnectAmRoute === 'function') {
+            try { await this.opts.disconnectAmRoute(rt.connId); } catch (e) {}
+        }
+    }
+
+    async tick() {
+        if (!this.running) return;
+        const paused = !!this.opts.shouldPause() || Date.now() < this.cooldownUntil;
+        if (paused) {
+            if (this.child) await this.killWorker();
+            this.setStatus('paused');
+            return;
+        }
+        if (this.child) return;
+        if (!fs.existsSync(this.opts.mguPython) || !fs.existsSync(this.opts.smartxHelper)) {
+            this.setStatus('paused');
+            return;
+        }
+
+        const cands = this.pickCandidates();
+        if (!cands.length) {
+            this.setStatus('paused');
+            return;
+        }
+        const prof = cands[this.profileIdx % cands.length];
+        if (prof.amRoute && typeof this.opts.connectAmRoute === 'function') {
+            try { this.routeToken = await this.opts.connectAmRoute(prof.amRoute); } catch (e) { this.routeToken = null; }
+        }
+
+        this.stdoutBuf = '';
+        const child = cp.spawn(this.opts.mguPython, [
+            this.opts.smartxHelper,
+            '--vad-loop',
+            String(prof.hw),
+            this.opts.outFile,
+            String(prof.rate || 24000),
+            String(prof.hwChannels || 1),
+        ], { stdio: ['ignore', 'pipe', 'ignore'] });
+
+        this.child = child;
+        this.activeDevice = prof.hw;
+
+        child.stdout.on('data', (chunk) => {
+            this.stdoutBuf += chunk.toString('utf8');
+            let idx;
+            while ((idx = this.stdoutBuf.indexOf('\n')) >= 0) {
+                const line = this.stdoutBuf.slice(0, idx).trim();
+                this.stdoutBuf = this.stdoutBuf.slice(idx + 1);
+                if (!line) continue;
+                try {
+                    const ev = JSON.parse(line);
+                    this.handleVadEvent(ev, prof);
+                } catch (e) {}
+            }
+        });
+
+        child.on('close', (code) => {
+            if (this.child === child) {
+                this.child = null;
+                if (code !== 0 && this.running && !this.opts.shouldPause()) {
+                    this.profileIdx++;
+                    this.holdCooldown(700);
+                }
+            }
+        });
+        child.on('error', () => {
+            if (this.child === child) {
+                this.child = null;
+                this.profileIdx++;
+                this.holdCooldown(900);
+            }
+        });
+    }
+
+    handleVadEvent(ev, prof) {
+        if (!ev || !ev.event) return;
+        if (ev.event === 'ready') {
+            lastWorkingHw = prof.hw;
+            this.setStatus('armed');
+            this.log('hands-free "Hey Bimmer" armed on ' + prof.hw);
+        } else if (ev.event === 'speech_start') {
+            this.setStatus('speech');
+            if (this.opts.onSpeechStart) this.opts.onSpeechStart(ev);
+        } else if (ev.event === 'speech_cancel') {
+            this.setStatus('armed');
+        } else if (ev.event === 'utterance' && ev.file && fs.existsSync(ev.file)) {
+            this.setStatus('armed');
+            try {
+                const wavBuf = fs.readFileSync(ev.file);
+                const analysis = analyzeStereoMicBuffer(wavBuf, { swapChannels: this.opts.swapChannels });
+                if (this.opts.onUtterance) {
+                    this.opts.onUtterance({
+                        wavBuffer: wavBuf,
+                        analysis,
+                        durationMs: ev.durationMs || analysis.durationMs,
+                        speechDb: ev.speechDb,
+                        noiseDb: ev.noiseDb,
+                        device: ev.device || prof.hw,
+                    });
+                }
+            } catch (e) {}
+        } else if (ev.event === 'error') {
+            this.log('vad stream switch (' + (ev.error || 'err') + ')');
+        }
+    }
+}
+
 module.exports = {
     SMARTX_PROFILES,
     probeOemAudioStack,
@@ -474,4 +674,5 @@ module.exports = {
     buildStereoWav,
     captureCeilingMicClip,
     synthesizeVietnameseMp3,
+    WakeWordMonitor,
 };

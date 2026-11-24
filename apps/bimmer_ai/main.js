@@ -214,6 +214,8 @@ mgu.run({
                 pin: s ? s.pin : '2468',
                 ipCount: s && Array.isArray(s.ips) ? s.ips.length : 1,
                 assistantState: (liveState && liveState !== 'idle') ? liveState : (pendingState || liveState),
+                wakeStatus: s ? s.wakeStatus : 'off',
+                followUpActive: !!(s && s.followUpActive),
                 activeSpeakerZone: s ? s.activeSpeakerZone : 'driver',
                 micLevels: (s && s.micLevels) || { leftDb: -32, rightDb: -54 },
                 settings: (s && s.settings) || { hasApiKey: false },

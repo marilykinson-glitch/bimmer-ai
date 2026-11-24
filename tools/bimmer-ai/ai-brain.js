@@ -409,6 +409,25 @@ function buildSystemPrompt(telemetry, speakerZone, ownerName) {
 }
 
 /**
+ * Parse a transcript in Hands-Free Wake Mode ("Hey Bimmer", "Ê Bimmer", "Bimmer ơi", "Ok Bimmer", "Hey BMW"):
+ *   - `{ matched: false }` -> background cabin chatter, ignore silently
+ *   - `{ matched: true, wakeOnly: true, remainder: '' }` -> user only said wake phrase ("Hey Bimmer!")
+ *   - `{ matched: true, wakeOnly: false, remainder: '...' }` -> user said wake phrase + command in one breath
+ */
+function extractWakeCommand(rawText) {
+    const clean = String(rawText || '').trim();
+    if (!clean) return { matched: false, wakeOnly: false, remainder: '' };
+    const norm = stripAccents(clean);
+    const m = /^\s*(?:hey|he|hay|e|oi|ok|okay|alo|nay|chao|u)?\s*(?:bimmer|bimer|bim\s*mo|bim\s*mer|bim|bmw)\b(?:\s*(?:oi|nha|nhe|a|ơi|dạ|nghe))?[\s,!.:?-]*(.*)$/i.exec(norm);
+    if (!m) return { matched: false, wakeOnly: false, remainder: '' };
+    const remNorm = String(m[1] || '').trim();
+    if (!remNorm || /^(oi|nha|nhe|a|nghe\s*khong|co\s*do\s*khong)$/.test(remNorm)) {
+        return { matched: true, wakeOnly: true, remainder: '' };
+    }
+    return { matched: true, wakeOnly: false, remainder: clean };
+}
+
+/**
  * Call Gemini `generateContent` with Multimodal Audio/Text + Function Declarations over `mgu-uplink`.
  */
 async function callGeminiApi(opts) {
@@ -416,6 +435,7 @@ async function callGeminiApi(opts) {
     if (!apiKey) throw new Error('Chưa nhập Gemini API Key');
     const model = String(opts.model || 'gemini-2.5-flash').trim();
     const sysText = buildSystemPrompt(opts.telemetry, opts.speakerZone, opts.ownerName);
+    const wakeMode = !!opts.wakeMode;
 
     const userParts = [];
     if (opts.audioWavBase64) {
@@ -425,11 +445,24 @@ async function callGeminiApi(opts) {
                 data: opts.audioWavBase64,
             },
         });
-        userParts.push({
-            text: opts.text
-                ? ('Người ngồi trên xe nói: "' + opts.text + '"')
-                : 'Hãy nghe đoạn thu âm tiếng Việt từ micro trên trần xe này, thực thi các công cụ điều khiển xe phù hợp (nếu có), và trả lời ngắn gọn bằng tiếng Việt. Mở đầu phần text bằng định dạng [TRANSCRIPT: <câu người dùng nói>] rồi xuống dòng trả lời.',
-        });
+        if (wakeMode) {
+            userParts.push({
+                text: [
+                    'CHẾ ĐỘ NGHE NỀN RẢNH TAY (WAKE WORD "HEY BIMMER" / "Ê BIMMER"):',
+                    '1. Hãy nghe đoạn thu âm từ micro trần xe BMW.',
+                    '2. Kiểm tra xem người nói có gọi từ đánh thức ("Hey Bimmer", "Ê Bimmer", "Bimmer ơi", "Ơi Bimmer", "Ok Bimmer", "Hey BMW", hoặc "Bimmer") ở đầu câu không.',
+                    '3. Nếu người trong xe chỉ đang nói chuyện riêng với nhau, hát, hoặc tạp âm mà KHÔNG gọi Bimmer: BẮT BUỘC trả về đúng chuỗi duy nhất "[IGNORE]" và TUYỆT ĐỐI KHÔNG gọi bất kỳ tool nào.',
+                    '4. Nếu người nói CHỈ gọi tên đánh thức ("Hey Bimmer", "Ê Bimmer", "Bimmer ơi") mà chưa nêu yêu cầu: trả về "[WAKE_ONLY] [TRANSCRIPT: Hey Bimmer] Dạ đại ca cần gì em?" và không gọi tool.',
+                    '5. Nếu người nói gọi tên đánh thức KÈM yêu cầu (ví dụ "Hey Bimmer chỉnh điều hoà 21 độ"): hãy gọi ngay các tool tương ứng và mở đầu phần text bằng "[TRANSCRIPT: <câu người nói>]" rồi trả lời ngắn gọn bằng tiếng Việt.',
+                ].join('\n'),
+            });
+        } else {
+            userParts.push({
+                text: opts.text
+                    ? ('Người ngồi trên xe nói: "' + opts.text + '"')
+                    : 'Hãy nghe đoạn thu âm tiếng Việt từ micro trên trần xe này, thực thi các công cụ điều khiển xe phù hợp (nếu có), và trả lời ngắn gọn bằng tiếng Việt. Mở đầu phần text bằng định dạng [TRANSCRIPT: <câu người dùng nói>] rồi xuống dòng trả lời.',
+            });
+        }
     } else {
         userParts.push({ text: String(opts.text || '') });
     }
@@ -494,16 +527,28 @@ async function callGeminiApi(opts) {
     });
 
     let rawReply = textChunks.join(' ').trim();
+    let ignored = false;
+    let wakeOnly = false;
+    if (/\[IGNORE\]/i.test(rawReply) && toolCalls.length === 0) {
+        ignored = true;
+    }
+    if (/\[WAKE_ONLY\]/i.test(rawReply)) {
+        wakeOnly = true;
+        rawReply = rawReply.replace(/\[WAKE_ONLY\]\s*/gi, '').trim();
+    }
+
     let transcript = opts.text || '';
-    const trMatch = /^\[TRANSCRIPT:\s*([^\]]+)\]\s*/i.exec(rawReply);
+    const trMatch = /\[TRANSCRIPT:\s*([^\]]+)\]\s*/i.exec(rawReply);
     if (trMatch) {
         if (!transcript) transcript = trMatch[1].trim();
-        rawReply = rawReply.slice(trMatch[0].length).trim();
+        rawReply = rawReply.replace(trMatch[0], '').trim();
     }
 
     return {
         engine: 'gemini',
         model,
+        ignored,
+        wakeOnly,
         transcript,
         toolCalls,
         replyText: rawReply,
@@ -512,15 +557,39 @@ async function callGeminiApi(opts) {
 
 /**
  * Full conversational + vehicle-control turn:
- *   - Uses Online Gemini when `apiKey` is configured (with instant Offline NLU fallback on network/tunnel dropout!)
+ *   - Supports Hands-Free `wakeMode: true` ("Hey Bimmer" / "Ê Bimmer" / "Bimmer ơi"), silently ignoring cabin chatter
+ *   - Supports 2-step "Hey Siri" style (`wakeOnly: true` -> opens follow-up command window)
  *   - Executes every tool call through `vehicleController.invokeTool` (`SafetyGate` enforced!)
- *   - Composes concise Vietnamese voice feedback reflecting actual allow/defer/block outcomes.
  */
 async function processAssistantTurn(params) {
-    const text = String(params.text || '').trim();
+    const rawText = String(params.text || '').trim();
+    const wakeMode = !!params.wakeMode;
+    const ownerCall = params.ownerName ? params.ownerName : 'đại ca';
     const speakerZone = params.speakerZone || 'driver';
     const vc = params.vehicleController;
     const telemetry = vc ? vc.state : (params.telemetry || {});
+
+    // Fast deterministic gate when plain text is provided in `wakeMode`
+    if (wakeMode && rawText && !params.audioWavBase64) {
+        const wk = extractWakeCommand(rawText);
+        if (!wk.matched) {
+            return { at: Date.now(), engine: 'wake_gate', ignored: true, wakeOnly: false, speakerZone, transcript: rawText, replyVi: '', actions: [] };
+        }
+        if (wk.wakeOnly) {
+            return {
+                at: Date.now(),
+                engine: 'wake_gate',
+                ignored: false,
+                wakeOnly: true,
+                speakerZone,
+                transcript: rawText,
+                replyVi: 'Dạ ' + ownerCall + ' cần gì em?',
+                actions: [],
+            };
+        }
+    }
+
+    const text = rawText;
     let engine = 'offline';
     let transcript = text;
     let toolCalls = [];
@@ -537,6 +606,7 @@ async function processAssistantTurn(params) {
                 text,
                 audioWavBase64: params.audioWavBase64,
                 audioMimeType: params.audioMimeType,
+                wakeMode,
                 speakerZone,
                 ownerName: params.ownerName,
                 telemetry,
@@ -544,12 +614,51 @@ async function processAssistantTurn(params) {
                 uplinkOpts: params.uplinkOpts,
             });
             engine = 'gemini';
+            if (gem.ignored) {
+                return { at: Date.now(), engine: 'gemini', ignored: true, wakeOnly: false, speakerZone, transcript: gem.transcript || '', replyVi: '', actions: [] };
+            }
             if (gem.transcript) transcript = gem.transcript;
+            if (gem.wakeOnly && (!gem.toolCalls || gem.toolCalls.length === 0)) {
+                return {
+                    at: Date.now(),
+                    engine: 'gemini',
+                    ignored: false,
+                    wakeOnly: true,
+                    speakerZone,
+                    transcript: transcript || 'Hey Bimmer!',
+                    replyVi: gem.replyText || ('Dạ ' + ownerCall + ' cần gì em?'),
+                    actions: [],
+                };
+            }
+            // Extra safety: if wakeMode=true and Gemini transcribed text without wake phrase and emitted 0 tools, ignore chatter!
+            if (wakeMode && transcript && (!gem.toolCalls || gem.toolCalls.length === 0)) {
+                const wkCheck = extractWakeCommand(transcript);
+                if (!wkCheck.matched) {
+                    return { at: Date.now(), engine: 'gemini', ignored: true, wakeOnly: false, speakerZone, transcript, replyVi: '', actions: [] };
+                }
+                if (wkCheck.wakeOnly) {
+                    return {
+                        at: Date.now(),
+                        engine: 'gemini',
+                        ignored: false,
+                        wakeOnly: true,
+                        speakerZone,
+                        transcript,
+                        replyVi: 'Dạ ' + ownerCall + ' cần gì em?',
+                        actions: [],
+                    };
+                }
+            }
             toolCalls = gem.toolCalls || [];
             aiReply = gem.replyText || '';
         } catch (e) {
             onlineError = e.message;
+            if (wakeMode && params.audioWavBase64 && !text) {
+                return { at: Date.now(), engine: 'wake_err', ignored: true, wakeOnly: false, speakerZone, transcript: '', replyVi: '', actions: [], onlineError };
+            }
         }
+    } else if (wakeMode && params.audioWavBase64 && !text) {
+        return { at: Date.now(), engine: 'wake_no_key', ignored: true, wakeOnly: false, speakerZone, transcript: '', replyVi: '', actions: [] };
     }
 
     // Fallback or supplement with Offline NLU if offline OR if Gemini transcribed audio text without emitting toolCalls
@@ -604,6 +713,7 @@ async function processAssistantTurn(params) {
 module.exports = {
     TOOL_DECLARATIONS,
     stripAccents,
+    extractWakeCommand,
     parseOfflineVietnameseIntents,
     buildSystemPrompt,
     callGeminiApi,
