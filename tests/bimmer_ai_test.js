@@ -345,7 +345,7 @@ async function runAllTests() {
 
         assert.strictEqual(dm.settings.model, 'gemini-3-flash-preview'); // auto-migrated from retired 2.5-flash!
         assert.ok(capturedReqBody && capturedReqBody.generationConfig);
-        assert.strictEqual(capturedReqBody.generationConfig.thinkingConfig, undefined); // no invalid thinkingBudget on 3.x!
+        assert.deepStrictEqual(capturedReqBody.generationConfig.thinkingConfig, { thinkingLevel: 'minimal' }); // low-latency minimal thinking on 3-flash!
         assert.ok(dm.lastTurn.replyVi.indexOf('INTERNAL_THOUGHT') < 0);
         // Offline NLU backup executed `set_climate` even though Gemini only emitted `[TRANSCRIPT: ...]` text!
         assert.strictEqual(dm.vehicle.state.climate.tempDriverC, 21);

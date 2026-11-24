@@ -38,12 +38,21 @@ const mkdirp = (d) => {
 };
 
 const NODE22_BIN = '/var/opt/jap-node22/current/bin/node';
+const dnsCache = {};
+const sharedHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 45000, maxSockets: 6 });
+const insecureHttpsAgent = new https.Agent({ keepAlive: true, keepAliveMsecs: 45000, maxSockets: 4, rejectUnauthorized: false });
 
 function defaultFetchCmd() {
     if (fs.existsSync(NODE22_BIN)) {
         return [NODE22_BIN, '--max-http-header-size=65536', __filename, '--fetch'];
     }
     return [process.execPath, __filename, '--fetch'];
+}
+
+function workerCmdFromFetch(fetchCmd) {
+    const arr = Array.isArray(fetchCmd) && fetchCmd.length >= 2 ? fetchCmd.slice() : defaultFetchCmd();
+    arr[arr.length - 1] = '--worker';
+    return arr;
 }
 
 function options(over) {
@@ -114,6 +123,7 @@ function writeIfChanged(file, text, mode) {
 }
 
 function pickUid(o) {
+    if (o && isId(o._cachedUid)) return o._cachedUid;
     const kept = Number((readJson(path.join(o.stateDir, 'uids.json')) || {}).fetch);
     const cfg = mainappRanges(o);
     const inRange = (u) => !!cfg && cfg.ranges.some((r) => u >= r.min && u <= r.max);
@@ -133,6 +143,7 @@ function pickUid(o) {
     if (fs.existsSync(path.join(uplink, 'current')) || fs.existsSync(path.join(uplink, 'uids.d'))) {
         try { mkdirp(path.join(uplink, 'uids.d')); writeIfChanged(path.join(uplink, 'uids.d', SELF), uid + '\n', 0o644); } catch (e) {}
     }
+    if (o) o._cachedUid = uid;
     return uid;
 }
 
@@ -172,22 +183,57 @@ function customLookup(leaseFile, routeFile, preResolvedServers) {
             return cb(null, ips[0], 4);
         };
         if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return deliver([host]);
-        let idx = 0;
-        const tryNext = (lastErr) => {
-            if (idx >= servers.length) return cb(lastErr || new Error('DNS failed for ' + host));
-            const r = new dns.Resolver();
-            try { r.setServers([servers[idx++]]); } catch (e) { return tryNext(e); }
-            let done = false;
-            const timer = setTimeout(() => { if (!done) { done = true; tryNext(new Error('DNS timeout')); } }, 2800);
-            r.resolve4(host, (err, ips) => {
-                if (done) return;
-                done = true;
-                clearTimeout(timer);
-                if (err || !ips || !ips.length) return tryNext(err || new Error('no A record'));
-                deliver(ips);
-            });
+
+        const now = Date.now();
+        const cached = dnsCache[host];
+        if (cached && cached.expiresAt > now && cached.ips && cached.ips.length) {
+            return deliver(cached.ips);
+        }
+
+        // Parallel staggered DNS race across up to 4 servers: eliminates 2.8s stall when local ConnMan DNS drops!
+        const pool = servers.slice(0, 4);
+        let settled = false;
+        let pending = pool.length;
+        let lastErr = null;
+        const timers = [];
+
+        const finishErr = (err) => {
+            lastErr = err || lastErr;
+            pending--;
+            if (!settled && pending <= 0) {
+                settled = true;
+                timers.forEach(clearTimeout);
+                cb(lastErr || new Error('DNS failed for ' + host));
+            }
         };
-        tryNext(null);
+
+        pool.forEach((srv, idx) => {
+            const launch = () => {
+                if (settled) return;
+                const r = new dns.Resolver();
+                try { r.setServers([srv]); } catch (e) { return finishErr(e); }
+                let localDone = false;
+                const t = setTimeout(() => {
+                    if (!localDone) {
+                        localDone = true;
+                        finishErr(new Error('DNS timeout'));
+                    }
+                }, 1800);
+                timers.push(t);
+                r.resolve4(host, (err, ips) => {
+                    if (localDone || settled) return;
+                    localDone = true;
+                    clearTimeout(t);
+                    if (err || !ips || !ips.length) return finishErr(err || new Error('no A record'));
+                    settled = true;
+                    timers.forEach(clearTimeout);
+                    dnsCache[host] = { ips, expiresAt: Date.now() + 300000 };
+                    deliver(ips);
+                });
+            };
+            if (idx < 2) launch();
+            else timers.push(setTimeout(launch, 65));
+        });
     };
 }
 
@@ -196,7 +242,7 @@ function doHttp(q, lookup, strictTls) {
         let done = false, size = 0;
         const finish = (e, v) => { if (done) return; done = true; clearTimeout(timer); e ? reject(e) : resolve(v); };
         const bodyBuf = q.bodyBase64 ? Buffer.from(q.bodyBase64, 'base64') : (q.body ? Buffer.from(String(q.body), 'utf8') : null);
-        const headers = Object.assign({ 'User-Agent': 'bimmer-ai/0.1', Accept: 'application/json' }, q.headers || {});
+        const headers = Object.assign({ 'User-Agent': 'bimmer-ai/0.5', Accept: 'application/json', Connection: 'keep-alive' }, q.headers || {});
         if (bodyBuf) headers['Content-Length'] = bodyBuf.length;
 
         let transport = https;
@@ -221,6 +267,7 @@ function doHttp(q, lookup, strictTls) {
                 method: q.method || (bodyBuf ? 'POST' : 'GET'),
                 headers,
                 lookup,
+                agent: strictTls !== false ? sharedHttpsAgent : insecureHttpsAgent,
                 rejectUnauthorized: strictTls !== false,
             };
         }
@@ -256,6 +303,97 @@ function doHttpWithTlsFallback(q, lookup) {
     });
 }
 
+function prewarmHost(host, lookup) {
+    return new Promise((resolve) => {
+        if (!host || !/^[a-z0-9.-]+$/i.test(host)) return resolve(false);
+        let done = false;
+        const fin = (ok) => { if (!done) { done = true; clearTimeout(t); resolve(ok); } };
+        const req = https.request({
+            host: String(host),
+            servername: String(host),
+            family: 4,
+            autoSelectFamily: false,
+            path: '/',
+            method: 'HEAD',
+            headers: { Connection: 'keep-alive', 'User-Agent': 'bimmer-ai/0.5' },
+            lookup,
+            agent: sharedHttpsAgent,
+        }, (res) => {
+            res.resume();
+            res.on('end', () => fin(true));
+        });
+        const t = setTimeout(() => { try { req.abort(); } catch (e) {} fin(false); }, 3500);
+        req.on('error', () => fin(false));
+        req.end();
+    });
+}
+
+function ensurePersistentWorker(o, uid) {
+    if (o._worker && o._worker.child && !o._worker.dead) {
+        return o._worker;
+    }
+    const cmd = workerCmdFromFetch(o.fetchCmd);
+    let child;
+    try {
+        child = cp.spawn(cmd[0], cmd.slice(1), {
+            uid, gid: uid, cwd: '/', env: {}, stdio: ['pipe', 'pipe', 'ignore'],
+        });
+    } catch (e) {
+        return null;
+    }
+    if (typeof child.unref === 'function') child.unref();
+    const state = {
+        child,
+        dead: false,
+        seq: 0,
+        pending: {},
+        buf: '',
+    };
+    const failAll = (err) => {
+        if (state.dead) return;
+        state.dead = true;
+        if (o._worker === state) o._worker = null;
+        const pendingMap = state.pending;
+        state.pending = {};
+        Object.keys(pendingMap).forEach((k) => {
+            const p = pendingMap[k];
+            if (p) { clearTimeout(p.timer); p.reject(err); }
+        });
+    };
+    child.on('error', (e) => failAll(e));
+    child.stdin.on('error', () => {});
+    child.stdout.on('data', (chunk) => {
+        state.buf += chunk.toString('utf8');
+        let idx;
+        while ((idx = state.buf.indexOf('\n')) >= 0) {
+            const line = state.buf.slice(0, idx).trim();
+            state.buf = state.buf.slice(idx + 1);
+            if (!line) continue;
+            let msg = null;
+            try { msg = JSON.parse(line); } catch (e) {}
+            if (!msg || !msg.id) continue;
+            const waiter = state.pending[msg.id];
+            if (!waiter) continue;
+            delete state.pending[msg.id];
+            clearTimeout(waiter.timer);
+            if (msg.error) waiter.reject(new Error(msg.error));
+            else waiter.resolve(msg.res);
+        }
+    });
+    child.on('close', () => {
+        const pendingMap = state.pending;
+        state.pending = {};
+        state.dead = true;
+        if (o._worker === state) o._worker = null;
+        Object.keys(pendingMap).forEach((k) => {
+            clearTimeout(pendingMap[k].timer);
+            pendingMap[k].reject(new Error('uplink worker closed'));
+        });
+    });
+    o._worker = state;
+    return state;
+}
+
 function request(o, reqSpec) {
     if (o.baseUrl) {
         return doHttpWithTlsFallback(Object.assign({}, reqSpec, { baseUrl: o.baseUrl }), undefined);
@@ -264,46 +402,114 @@ function request(o, reqSpec) {
     if (uid === null || o.noSetuid) {
         return doHttpWithTlsFallback(reqSpec, customLookup(o.lease, o.route));
     }
+    const worker = ensurePersistentWorker(o, uid);
+    if (!worker) {
+        return Promise.reject(new Error('cannot start uplink worker'));
+    }
     return new Promise((resolve, reject) => {
-        let child;
-        try {
-            child = cp.spawn(o.fetchCmd[0], o.fetchCmd.slice(1), {
-                uid, gid: uid, cwd: '/', env: {}, stdio: ['pipe', 'pipe', 'ignore'],
-            });
-        } catch (e) { return reject(e); }
-        const chunks = [];
-        let size = 0, done = false;
-        const finish = (e, v) => {
-            if (done) return;
-            done = true;
-            clearTimeout(timer);
-            if (e) { try { child.kill('SIGKILL'); } catch (x) {} reject(e); } else resolve(v);
-        };
-        const timer = setTimeout(() => finish(new Error('uplink timeout')), (reqSpec.timeoutMs || 25000) + 2500);
-        child.on('error', finish);
-        child.stdin.on('error', () => {});
-        child.stdout.on('data', (c) => {
-            size += c.length;
-            if (size > 10e6) return finish(new Error('uplink output too large'));
-            chunks.push(c);
-        });
-        child.on('close', () => {
-            let r = null;
-            try { r = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) {}
-            if (!r) return finish(new Error('uplink helper empty reply'));
-            if (r.error) return finish(new Error(r.error));
-            return finish(null, {
+        const id = ++worker.seq;
+        const timer = setTimeout(() => {
+            if (worker.pending[id]) {
+                delete worker.pending[id];
+                reject(new Error('uplink timeout'));
+            }
+        }, (reqSpec.timeoutMs || 25000) + 2000);
+        worker.pending[id] = {
+            timer,
+            resolve: (r) => resolve({
                 status: r.status,
                 body: r.body !== undefined ? String(r.body) : '',
                 bodyBase64: r.bodyBase64 || '',
-            });
-        });
+            }),
+            reject,
+        };
         const servers = dnsServers(o.lease, o.route);
-        child.stdin.end(JSON.stringify(Object.assign({}, reqSpec, { lease: o.lease, route: o.route, dns: servers })));
+        const payload = Object.assign({}, reqSpec, { lease: o.lease, route: o.route, dns: servers });
+        try {
+            worker.child.stdin.write(JSON.stringify({ id, q: payload }) + '\n');
+        } catch (e) {
+            clearTimeout(timer);
+            delete worker.pending[id];
+            reject(e);
+        }
     });
 }
 
-if (require.main === module && process.argv[2] === '--fetch') {
+function warmup(o, hosts) {
+    const listHosts = Array.isArray(hosts) && hosts.length ? hosts : ['generativelanguage.googleapis.com', 'translate.googleapis.com'];
+    if (!o || o.baseUrl) return Promise.resolve(false);
+    const uid = pickUid(o);
+    if (uid === null || o.noSetuid) {
+        const lk = customLookup(o.lease, o.route);
+        return Promise.all(listHosts.map((h) => prewarmHost(h, lk))).then(() => true, () => false);
+    }
+    const worker = ensurePersistentWorker(o, uid);
+    if (!worker) return Promise.resolve(false);
+    return new Promise((resolve) => {
+        const id = ++worker.seq;
+        const timer = setTimeout(() => {
+            delete worker.pending[id];
+            resolve(false);
+        }, 4000);
+        worker.pending[id] = {
+            timer,
+            resolve: () => resolve(true),
+            reject: () => resolve(false),
+        };
+        const servers = dnsServers(o.lease, o.route);
+        try {
+            worker.child.stdin.write(JSON.stringify({ id, warmup: listHosts, lease: o.lease, route: o.route, dns: servers }) + '\n');
+        } catch (e) {
+            clearTimeout(timer);
+            delete worker.pending[id];
+            resolve(false);
+        }
+    });
+}
+
+function close(o) {
+    if (o && o._worker && o._worker.child) {
+        const c = o._worker.child;
+        o._worker.dead = true;
+        o._worker = null;
+        try { c.kill('SIGTERM'); } catch (e) {}
+    }
+}
+
+if (require.main === module && process.argv[2] === '--worker') {
+    let inBuf = '';
+    process.stdin.setEncoding('utf8');
+    process.stdin.on('data', (chunk) => {
+        inBuf += chunk;
+        let idx;
+        while ((idx = inBuf.indexOf('\n')) >= 0) {
+            const line = inBuf.slice(0, idx).trim();
+            inBuf = inBuf.slice(idx + 1);
+            if (!line) continue;
+            let msg;
+            try { msg = JSON.parse(line); } catch (e) { continue; }
+            const id = msg && msg.id;
+            if (!id) continue;
+            if (Array.isArray(msg.warmup)) {
+                const lk = customLookup(msg.lease, msg.route, msg.dns);
+                Promise.all(msg.warmup.map((h) => prewarmHost(h, lk)))
+                    .then(() => process.stdout.write(JSON.stringify({ id, res: { ok: true } }) + '\n'));
+                continue;
+            }
+            const q = msg.q || {};
+            if (!/^[a-z0-9.-]+$/i.test(String(q.host)) || String(q.path).charAt(0) !== '/') {
+                process.stdout.write(JSON.stringify({ id, error: 'bad host/path' }) + '\n');
+                continue;
+            }
+            doHttpWithTlsFallback(q, customLookup(q.lease, q.route, q.dns))
+                .then(
+                    (res) => process.stdout.write(JSON.stringify({ id, res }) + '\n'),
+                    (e) => process.stdout.write(JSON.stringify({ id, error: e.code ? e.code + ' ' + e.message : e.message }) + '\n')
+                );
+        }
+    });
+    process.stdin.on('end', () => process.exit(0));
+} else if (require.main === module && process.argv[2] === '--fetch') {
     const chunks = [];
     const out = (o) => process.stdout.write(JSON.stringify(o), () => process.exit(0));
     process.stdin.on('data', (d) => chunks.push(d));
@@ -325,4 +531,6 @@ module.exports = {
     dnsServers,
     customLookup,
     request,
+    warmup,
+    close,
 };

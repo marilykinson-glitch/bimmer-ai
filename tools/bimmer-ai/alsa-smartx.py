@@ -198,7 +198,7 @@ def _condition_and_boost_pcm(pcm_bytes, out_channels, out_rate=24000):
     if sys.byteorder != "little":
         samples.byteswap()
     if not samples:
-        return pcm_bytes, out_channels, 0, 0.0
+        return pcm_bytes, out_channels, out_rate, 0, 0.0
 
     if out_channels == 2 and len(samples) >= 4:
         left = samples[0::2]
@@ -218,6 +218,23 @@ def _condition_and_boost_pcm(pcm_bytes, out_channels, out_rate=24000):
     else:
         peak = max((abs(x) for x in samples), default=0)
 
+    # Resample 24,000 Hz -> 16,000 Hz (Gemini's native audio frontend rate) to cut 4G upload payload by 33%
+    if out_rate == 24000 and len(samples) >= 12:
+        if out_channels == 1:
+            out_len = (len(samples) * 2) // 3
+            samples = array.array("h", (samples[(i * 3) // 2] for i in range(out_len)))
+            out_rate = 16000
+        elif out_channels == 2:
+            in_f = len(samples) // 2
+            out_f = (in_f * 2) // 3
+            rs = array.array("h")
+            for i in range(out_f):
+                src = ((i * 3) // 2) * 2
+                rs.append(samples[src])
+                rs.append(samples[src + 1])
+            samples = rs
+            out_rate = 16000
+
     snr_db, floor_db = _measure_snr_and_floor(samples, out_channels, out_rate)
 
     if 55 <= peak < 18000:
@@ -231,7 +248,7 @@ def _condition_and_boost_pcm(pcm_bytes, out_channels, out_rate=24000):
 
     if sys.byteorder != "little":
         samples.byteswap()
-    return samples.tobytes(), out_channels, int(peak), snr_db
+    return samples.tobytes(), out_channels, out_rate, int(peak), snr_db
 
 
 def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels=1):
@@ -243,10 +260,13 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
     out_rate = hw_rate // decim
     out_channels = 2 if hw_ch >= 2 else 1
 
+    max_dur = max(float(duration_sec), 5.0) if float(duration_sec) >= 3.5 else float(duration_sec)
+    use_early_vad = float(duration_sec) >= 3.0
+
     pcm = _open_alsa_capture(asound, device, hw_rate, hw_ch)
     try:
-        total_hw_frames = max(2400, int(float(duration_sec) * hw_rate))
-        chunk_frames = min(2400, total_hw_frames)
+        total_hw_frames = max(2400, int(max_dur * hw_rate))
+        chunk_frames = max(480, int(hw_rate * 0.06))  # 60ms chunks for fast end-of-speech endpointing
         bytes_per_frame = hw_ch * 2
         buf = ctypes.create_string_buffer(chunk_frames * bytes_per_frame)
 
@@ -256,9 +276,13 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
         saw_nonzero = False
         zero_frames = 0
         max_zero_frames = int(hw_rate * 0.35)  # Fail over in 0.35s if pipe outputs pure digital zeros!
+        calib_dbs = []
+        floor_db = -45.0
+        voiced_chunks = 0
+        post_quiet_chunks = 0
         t0 = time.monotonic()
         first_frame_deadline = t0 + 0.75
-        hard_deadline = t0 + float(duration_sec) + 1.40
+        hard_deadline = t0 + max_dur + 1.20
 
         while frames_read < total_hw_frames and not STOP_FLAG:
             now = time.monotonic()
@@ -270,7 +294,7 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
             want = min(chunk_frames, total_hw_frames - frames_read)
             got = asound.snd_pcm_readi(pcm, buf, want)
             if got == EAGAIN or got == 0:
-                time.sleep(0.012)
+                time.sleep(0.010)
                 continue
             if got < 0:
                 rec = asound.snd_pcm_recover(pcm, int(got), 1)
@@ -292,6 +316,30 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
                         raise RuntimeError(f"digital zero stream (peak=0) on {device}")
             collected.extend(chunk_out)
             frames_read += got
+
+            # Dynamic End-of-Speech VAD: stop 0.54s after user finishes speaking (instead of waiting out full 4-5s timer!)
+            if use_early_vad and chunk_out:
+                db, pk = _fast_chunk_db_and_peak(chunk_out, out_channels)
+                if len(calib_dbs) < 4:
+                    if db > -85.0:
+                        calib_dbs.append(db)
+                        sc = sorted(calib_dbs)
+                        floor_db = max(-65.0, min(-26.0, sc[len(sc) // 2]))
+                else:
+                    is_voiced = (db >= max(-47.0, floor_db + 6.0)) and (pk >= 120)
+                    if is_voiced:
+                        voiced_chunks += 1
+                        post_quiet_chunks = 0
+                    else:
+                        if voiced_chunks < 4 and db > -85.0:
+                            floor_db = max(-65.0, min(-26.0, floor_db * 0.90 + db * 0.10))
+                        if voiced_chunks >= 5:
+                            post_quiet_chunks += 1
+                            if post_quiet_chunks >= 9 and frames_read >= int(hw_rate * 0.95):
+                                break
+                        elif frames_read >= int(hw_rate * 2.2) and voiced_chunks < 2:
+                            # Nobody spoke within 2.2s of pressing button -> finish early
+                            break
     finally:
         asound.snd_pcm_close(pcm)
 
@@ -299,14 +347,14 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
     if out_frames < max(800, out_rate // 5):
         raise RuntimeError(f"insufficient frames ({out_frames}) from {device}")
 
-    final_pcm, final_ch, peak, snr_db = _condition_and_boost_pcm(bytes(collected), out_channels, out_rate)
-    _write_wav_atomic(out_wav, final_ch, out_rate, final_pcm)
+    final_pcm, final_ch, final_rate, peak, snr_db = _condition_and_boost_pcm(bytes(collected), out_channels, out_rate)
+    _write_wav_atomic(out_wav, final_ch, final_rate, final_pcm)
 
     return {
         "ok": True,
         "device": device,
-        "frames": out_frames,
-        "sampleRate": out_rate,
+        "frames": len(final_pcm) // (final_ch * 2),
+        "sampleRate": final_rate,
         "channels": final_ch,
         "peak": peak,
         "snrDb": snr_db,
@@ -430,8 +478,8 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                 else:
                     quiet_streak += 1
 
-                # Allow natural 900ms pause right after "Hey Bimmer," (<30 chunks) and 720ms after command body, max 6.6s
-                hangover_chunks = 15 if len(active_chunks) < 30 else 12
+                # Allow natural 780ms pause right after "Hey Bimmer," (<28 chunks) and 540ms after command body, max 6.6s
+                hangover_chunks = 13 if len(active_chunks) < 28 else 9
                 hit_ceiling = len(active_chunks) >= 110
                 if quiet_streak >= hangover_chunks or hit_ceiling:
                     pcm_all = b"".join(active_chunks)
@@ -453,8 +501,8 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                             noise_db = clip_floor_db
                         emit_json({"event": "speech_cancel", "durationMs": dur_ms, "snrDb": clip_snr_db})
                     elif voiced_chunks >= 6 and dur_ms >= 550:
-                        final_pcm, final_ch, _, snr_out = _condition_and_boost_pcm(pcm_all, out_channels, out_rate)
-                        _write_wav_atomic(out_wav, final_ch, out_rate, final_pcm)
+                        final_pcm, final_ch, final_rate, _, snr_out = _condition_and_boost_pcm(pcm_all, out_channels, out_rate)
+                        _write_wav_atomic(out_wav, final_ch, final_rate, final_pcm)
                         last_emit_at = time.monotonic()
                         emit_json({
                             "event": "utterance",

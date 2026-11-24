@@ -28,7 +28,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.5.0';
+const VERSION = '0.5.1';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -298,6 +298,9 @@ class BimmerAiDaemon {
                 this.writeStatusFile();
             },
             onSpeechStart: (ev) => {
+                if (!this.cfg.simMode && this.settings.apiKey) {
+                    Up.warmup(this.uplinkOpts).catch(() => {});
+                }
                 if (typeof ev.db === 'number') {
                     this.micLevels = { leftDb: ev.db, rightDb: ev.db };
                     this.writeStatusFile();
@@ -470,12 +473,17 @@ class BimmerAiDaemon {
         const hasKey = !!(this.settings.apiKey && String(this.settings.apiKey).trim());
         const clipSec = hasKey ? this.settings.micDurationSec : 2;
 
+        // Pre-warm Keep-Alive TLS sockets to Gemini & TTS in parallel while user speaks!
+        if (hasKey && !this.cfg.simMode) {
+            Up.warmup(this.uplinkOpts).catch(() => {});
+        }
+
         // Release continuous VAD stream before opening one-shot PTT capture
         if (this.wakeMonitor) await this.wakeMonitor.killWorker();
 
         this.assistantState = 'listening';
         this.writeStatusFile();
-        await this.vehicle.pulseIpaLight('listenDriver');
+        this.vehicle.pulseIpaLight('listenDriver').catch(() => {});
         try {
             const cap = await AudioIO.captureCeilingMicClip({
                 device: dev,
@@ -917,6 +925,9 @@ class BimmerAiDaemon {
         }, 250);
 
         this.writeStatusFile();
+        if (this.settings.apiKey && !this.cfg.simMode) {
+            Up.warmup(this.uplinkOpts).catch(() => {});
+        }
         if (this.wakeMonitor) this.wakeMonitor.start();
         this.log('listening on ' + this.portalUrl().url);
         return this;
@@ -929,6 +940,7 @@ class BimmerAiDaemon {
             this.unduckTimer = null;
         }
         if (this.wakeMonitor) await this.wakeMonitor.stop();
+        Up.close(this.uplinkOpts);
         if (this.vehicle && typeof this.vehicle.closeRideTube === 'function') {
             this.vehicle.closeRideTube();
         }

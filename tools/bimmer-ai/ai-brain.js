@@ -455,15 +455,21 @@ const retiredGeminiModels = {};
 const VALID_TOOL_NAMES = {};
 TOOL_DECLARATIONS.forEach((td) => { VALID_TOOL_NAMES[td.name] = true; });
 
-function formatCompactToolSchema() {
-    return TOOL_DECLARATIONS.map((td) => {
-        const props = (td.parameters && td.parameters.properties) || {};
-        const argStr = Object.keys(props).map((k) => k + ':' + String(props[k].type || 'STRING').toLowerCase() + ' (' + props[k]['description'] + ')').join('; ');
-        return '- ' + td.name + '(' + argStr + '): ' + td['description'];
-    }).join('\n');
-}
-
-const COMPACT_TOOL_GUIDE = formatCompactToolSchema();
+const COMPACT_TOOL_GUIDE = [
+    '- set_climate(zone:"driver|passenger|both", tempC:16..28, deltaTempC:num, fanLevel:1..5, maxAc:bool, freshAir:bool, scentOn:bool, systemOn:bool)',
+    '- set_seat_comfort(seat:"driver|passenger|both", heatingLevel:0..3, coolingLevel:0..3, massage:bool, wheelHeat:bool, gentlemanMove:bool, memorySlot:1..3)',
+    '- set_ambient_light(color:"m_blue|ice_cyan|sunset_purple|neon_pink|m_red|amber|emerald|ice_white|oem|#RRGGBB", brightness:0..100, readingLight:bool, on:bool)',
+    '- control_windows_roof(target:"all|driver|passenger|rear|sunroof|blinds", action:"open|close|vent", percent:0..100)',
+    '- control_locks_trunk(action:"lock|unlock|open_trunk")',
+    '- control_mirrors(action:"fold|unfold")',
+    '- control_media(action:"play|pause|next|previous|mute|unmute|volume|youtube_search_play", query:str, volumePercent:0..85)',
+    '- set_exhaust_flap(mode:"open|close|oem")',
+    '- control_camera_360(view:"360|front|rear|side|off")',
+    '- navigate_to(destination:str)',
+    '- control_1cr_valet(action:"start_1cr|stop_1cr|valet_on|valet_off|snap_telegram")',
+    '- scan_vehicle_health()',
+    '- run_scene(scene:"chill_night|cool_down|cinema_park|focus_sport|normal", query:str)',
+].join('\n');
 
 function tryParseJsonObject(raw) {
     let s = String(raw || '').trim();
@@ -563,12 +569,14 @@ async function callGeminiApi(opts) {
         const candModel = modelQueue[mi];
         const genCfg = {
             temperature: opts.audioWavBase64 ? 0.0 : 0.25,
-            maxOutputTokens: 1536,
+            maxOutputTokens: useAudioJsonSchema ? 360 : 1024,
         };
         if (useAudioJsonSchema) {
             genCfg.responseMimeType = 'application/json';
         }
-        if (/^gemini-2\.5/i.test(candModel)) {
+        if (candModel === 'gemini-3-flash-preview') {
+            genCfg.thinkingConfig = { thinkingLevel: 'minimal' };
+        } else if (/^gemini-2\.5/i.test(candModel)) {
             genCfg.thinkingConfig = { thinkingBudget: 0 };
         }
 
