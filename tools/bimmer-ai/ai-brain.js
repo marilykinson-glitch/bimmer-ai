@@ -452,9 +452,39 @@ const GEMINI_FALLBACK_MODELS = [
 let lastHealthyGeminiModel = '';
 const retiredGeminiModels = {};
 
+const VALID_TOOL_NAMES = {};
+TOOL_DECLARATIONS.forEach((td) => { VALID_TOOL_NAMES[td.name] = true; });
+
+function formatCompactToolSchema() {
+    return TOOL_DECLARATIONS.map((td) => {
+        const props = (td.parameters && td.parameters.properties) || {};
+        const argStr = Object.keys(props).map((k) => k + ':' + String(props[k].type || 'STRING').toLowerCase() + ' (' + props[k]['description'] + ')').join('; ');
+        return '- ' + td.name + '(' + argStr + '): ' + td['description'];
+    }).join('\n');
+}
+
+const COMPACT_TOOL_GUIDE = formatCompactToolSchema();
+
+function tryParseJsonObject(raw) {
+    let s = String(raw || '').trim();
+    if (!s) return null;
+    s = s.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    const firstBrace = s.indexOf('{');
+    const lastBrace = s.lastIndexOf('}');
+    if (firstBrace < 0 || lastBrace <= firstBrace) return null;
+    try {
+        const obj = JSON.parse(s.slice(firstBrace, lastBrace + 1));
+        return (obj && typeof obj === 'object' && !Array.isArray(obj)) ? obj : null;
+    } catch (e) {
+        return null;
+    }
+}
+
 /**
  * Call Gemini `generateContent` with Multimodal Audio/Text + Function Declarations over `mgu-uplink`,
  * including automatic failover across `GEMINI_FALLBACK_MODELS` on 404 (retired model), 429, 503 (high demand), or timeout.
+ * For raw audio turns (`opts.audioWavBase64 && !opts.text`), enforces deterministic JSON output (`responseMimeType: "application/json"`)
+ * so verbatim `transcript` + `speechDetected` + `toolCalls` + `replyVi` are ALWAYS returned in a single ~2s roundtrip!
  */
 async function callGeminiApi(opts) {
     const apiKey = String(opts.apiKey || '').trim();
@@ -462,6 +492,7 @@ async function callGeminiApi(opts) {
     const requestedModel = String(opts.model || DEFAULT_GEMINI_MODEL).trim() || DEFAULT_GEMINI_MODEL;
     const sysText = buildSystemPrompt(opts.telemetry, opts.speakerZone, opts.ownerName);
     const wakeMode = !!opts.wakeMode;
+    const useAudioJsonSchema = !!(opts.audioWavBase64 && !opts.text);
 
     const userParts = [];
     if (opts.audioWavBase64) {
@@ -475,18 +506,30 @@ async function callGeminiApi(opts) {
             userParts.push({
                 text: [
                     'CHẾ ĐỘ NGHE NỀN RẢNH TAY (WAKE WORD "HEY BIMMER" / "Ê BIMMER"):',
-                    '1. Hãy nghe đoạn thu âm từ micro trần xe BMW.',
-                    '2. Kiểm tra xem người nói có chủ đích gọi trợ lý ở đầu câu bằng từ đánh thức ("Hey Bimmer", "Ê Bimmer", "Bimmer ơi", "Ơi Bimmer", "Ok Bimmer", "Hey BMW", "Trợ lý ơi", hoặc "Bimmer") hay không.',
-                    '3. Nếu đoạn thu âm chỉ là tiếng sôi/nhiễu nền, hoặc người trong xe nói chuyện riêng mà KHÔNG gọi trợ lý: BẮT BUỘC trả về đúng chuỗi duy nhất "[IGNORE]" và TUYỆT ĐỐI KHÔNG tự đoán chữ hay gọi bất kỳ tool nào.',
-                    '4. Nếu người nói CHỈ gọi tên đánh thức ("Hey Bimmer", "Ê Bimmer", "Bimmer ơi") mà chưa nêu yêu cầu: trả về "[WAKE_ONLY] [TRANSCRIPT: Hey Bimmer] Dạ ' + (opts.ownerName || 'đại ca') + ' cần gì em?" và không gọi tool.',
-                    '5. Chỉ khi nghe RÕ RÀNG tên đánh thức KÈM yêu cầu thật sự của người nói: mở đầu bằng "[TRANSCRIPT: <nguyên văn câu nghe được>]", gọi đúng tool tương ứng và trả lời ngắn gọn bằng tiếng Việt.',
+                    'Hãy nghe đoạn thu âm từ micro trần xe BMW và trả về DUY NHẤT 1 JSON object theo đúng cấu trúc:',
+                    '{"speechDetected":boolean,"transcript":"string","wakeOnly":boolean,"toolCalls":[{"name":"string","args":{}}],"replyVi":"string"}',
+                    'QUY TẮC BẮT BUỘC:',
+                    '1. Nếu đoạn thu âm chỉ có tiếng sôi nền, tiếng động cơ/điều hoà, tiếng ho/click, hoặc người trong xe nói chuyện riêng mà KHÔNG chủ đích gọi trợ lý ở đầu câu ("Hey Bimmer", "Ê Bimmer", "Bimmer ơi", "Ơi Bimmer", "Ok Bimmer", "Hey BMW", "Trợ lý ơi"):',
+                    '   Trả về {"speechDetected":false,"transcript":"","wakeOnly":false,"toolCalls":[],"replyVi":""}. TUYỆT ĐỐI KHÔNG tự đoán chữ hay gọi tool!',
+                    '2. Nếu người nói CHỈ gọi từ đánh thức mà chưa nêu yêu cầu:',
+                    '   Trả về {"speechDetected":true,"transcript":"<nguyên văn nghe được>","wakeOnly":true,"toolCalls":[],"replyVi":"Dạ ' + (opts.ownerName || 'đại ca') + ' cần gì em?"}.',
+                    '3. Chỉ khi nghe RÕ RÀNG từ đánh thức KÈM yêu cầu thật sự: ghi đúng nguyên văn tiếng Việt nghe được vào "transcript", điền mảng "toolCalls" từ danh sách tool bên dưới, và viết câu trả lời ngắn gọn vào "replyVi".',
+                    'DANH SÁCH TOOL HỢP LỆ:\n' + COMPACT_TOOL_GUIDE,
                 ].join('\n'),
             });
         } else {
             userParts.push({
                 text: opts.text
                     ? ('Người ngồi trên xe nói: "' + opts.text + '"')
-                    : 'Hãy nghe kỹ đoạn thu âm này. Nếu đoạn thu âm chỉ có tiếng sôi/nhiễu nền, bị đứt quãng hoặc KHÔNG nghe rõ tiếng người nói thật sự, BẮT BUỘC trả về đúng chuỗi duy nhất "[NO_SPEECH]" và TUYỆT ĐỐI KHÔNG tự bịa câu nói hay gọi bất kỳ tool nào. Chỉ khi nghe rõ câu tiếng Việt thật sự của người dùng, mở đầu bằng [TRANSCRIPT: <nguyên văn câu nghe được>], gọi tool tương ứng và trả lời ngắn gọn.',
+                    : [
+                        'Hãy nghe kỹ đoạn thu âm từ micro trần xe BMW và trả về DUY NHẤT 1 JSON object theo đúng cấu trúc:',
+                        '{"speechDetected":boolean,"transcript":"string","wakeOnly":false,"toolCalls":[{"name":"string","args":{}}],"replyVi":"string"}',
+                        'QUY TẮC BẮT BUỘC:',
+                        '1. Nếu đoạn thu âm chỉ có tiếng sôi/nhiễu nền, tiếng máy nổ, bị đứt quãng hoặc KHÔNG nghe rõ tiếng người nói thật sự:',
+                        '   Trả về {"speechDetected":false,"transcript":"","wakeOnly":false,"toolCalls":[],"replyVi":""}. TUYỆT ĐỐI KHÔNG tự bịa câu nói hay gọi bất kỳ tool nào!',
+                        '2. Chỉ khi nghe rõ câu nói tiếng Việt thật sự của người dùng: chép NGUYÊN VĂN từng chữ nghe được vào "transcript" (không tự sửa ý), chọn đúng các tool cần thực thi vào "toolCalls" (hoặc [] nếu chỉ hỏi chuyện), và viết câu trả lời ngắn gọn tự nhiên vào "replyVi".',
+                        'DANH SÁCH TOOL HỢP LỆ:\n' + COMPACT_TOOL_GUIDE,
+                    ].join('\n'),
             });
         }
     } else {
@@ -522,6 +565,9 @@ async function callGeminiApi(opts) {
             temperature: opts.audioWavBase64 ? 0.0 : 0.25,
             maxOutputTokens: 1536,
         };
+        if (useAudioJsonSchema) {
+            genCfg.responseMimeType = 'application/json';
+        }
         if (/^gemini-2\.5/i.test(candModel)) {
             genCfg.thinkingConfig = { thinkingBudget: 0 };
         }
@@ -529,9 +575,11 @@ async function callGeminiApi(opts) {
         const bodyObj = {
             systemInstruction: { parts: [{ text: sysText }] },
             contents,
-            tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
             generationConfig: genCfg,
         };
+        if (!useAudioJsonSchema) {
+            bodyObj.tools = [{ functionDeclarations: TOOL_DECLARATIONS }];
+        }
 
         const apiPath = '/v1beta/models/' + encodeURIComponent(candModel) + ':generateContent?key=' + encodeURIComponent(apiKey);
         try {
@@ -596,22 +644,53 @@ async function callGeminiApi(opts) {
     let rawReply = textChunks.join(' ').trim();
     let ignored = false;
     let wakeOnly = false;
-    if (/\[\s*(?:IGNORE|NO_SPEECH)\s*\]/i.test(rawReply) && toolCalls.length === 0) {
-        if (wakeMode) {
-            ignored = true;
-        }
-        rawReply = rawReply.replace(/\[\s*(?:IGNORE|NO_SPEECH)\s*\]\s*/gi, '').trim();
-    }
-    if (/\[\s*WAKE_ONLY\s*\]/i.test(rawReply)) {
-        wakeOnly = true;
-        rawReply = rawReply.replace(/\[\s*WAKE_ONLY\s*\]\s*/gi, '').trim();
-    }
-
     let transcript = opts.text || '';
-    const trMatch = /\[\s*TRANSCRIPT\s*:\s*([^\]]+)\]\s*/i.exec(rawReply);
-    if (trMatch) {
-        if (!transcript) transcript = trMatch[1].trim();
-        rawReply = rawReply.replace(trMatch[0], '').trim();
+
+    const jsonObj = tryParseJsonObject(rawReply);
+    if (jsonObj) {
+        const heard = jsonObj.speechDetected !== false && !jsonObj.ignored;
+        const jTranscript = String(jsonObj.transcript || '').trim();
+        if (!heard || (!jTranscript && !jsonObj.wakeOnly)) {
+            if (wakeMode) ignored = true;
+            return {
+                engine: 'gemini',
+                model,
+                ignored,
+                wakeOnly: false,
+                transcript: '',
+                toolCalls: [],
+                replyText: '',
+            };
+        }
+        transcript = transcript || jTranscript;
+        wakeOnly = !!jsonObj.wakeOnly;
+        rawReply = String(jsonObj.replyVi || jsonObj.reply || '').trim();
+        if (Array.isArray(jsonObj.toolCalls)) {
+            jsonObj.toolCalls.forEach((tc) => {
+                if (tc && tc.name && VALID_TOOL_NAMES[tc.name]) {
+                    toolCalls.push({
+                        name: tc.name,
+                        args: (tc.args && typeof tc.args === 'object') ? tc.args : {},
+                    });
+                }
+            });
+        }
+    } else {
+        if (/\[\s*(?:IGNORE|NO_SPEECH)\s*\]/i.test(rawReply) && toolCalls.length === 0) {
+            if (wakeMode) {
+                ignored = true;
+            }
+            rawReply = rawReply.replace(/\[\s*(?:IGNORE|NO_SPEECH)\s*\]\s*/gi, '').trim();
+        }
+        if (/\[\s*WAKE_ONLY\s*\]/i.test(rawReply)) {
+            wakeOnly = true;
+            rawReply = rawReply.replace(/\[\s*WAKE_ONLY\s*\]\s*/gi, '').trim();
+        }
+        const trMatch = /\[\s*TRANSCRIPT\s*:\s*([^\]]+)\]\s*/i.exec(rawReply);
+        if (trMatch) {
+            if (!transcript) transcript = trMatch[1].trim();
+            rawReply = rawReply.replace(trMatch[0], '').trim();
+        }
     }
 
     return {
@@ -707,11 +786,11 @@ async function processAssistantTurn(params) {
                 };
             }
             // HARD DETERMINISTIC WAKE GATE: Never trust LLM alone in `wakeMode`!
-            // Even if Gemini hallucinated toolCalls on cabin chatter ("Trời nóng quá nhỉ"), block & ignore if transcript lacks wake phrase!
-            if (wakeMode && transcript) {
-                const wkCheck = extractWakeCommand(transcript);
+            // Block & ignore if `transcript` is empty OR lacks an explicit wake phrase ("Hey Bimmer", "Ê Bimmer", etc.)!
+            if (wakeMode) {
+                const wkCheck = extractWakeCommand(transcript || '');
                 if (!wkCheck.matched) {
-                    return { at: Date.now(), engine: 'gemini', ignored: true, wakeOnly: false, speakerZone, transcript, replyVi: '', actions: [] };
+                    return { at: Date.now(), engine: 'gemini', ignored: true, wakeOnly: false, speakerZone, transcript: transcript || '', replyVi: '', actions: [] };
                 }
                 if (wkCheck.wakeOnly && (!gem.toolCalls || gem.toolCalls.length === 0)) {
                     return {

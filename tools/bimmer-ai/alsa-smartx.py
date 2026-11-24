@@ -161,19 +161,44 @@ def _fast_chunk_db_and_peak(pcm_bytes, channels=1):
     return round(db, 1), int(peak)
 
 
-def _condition_and_boost_pcm(pcm_bytes, out_channels):
+def _measure_snr_and_floor(samples, out_channels, out_rate):
+    if not samples:
+        return 0.0, -90.0
+    win = max(240, int(out_rate * 0.06)) * max(1, out_channels)
+    dbs = []
+    n = len(samples)
+    step = 4 if win >= 480 else 1
+    for i in range(0, n, win):
+        seg = samples[i : i + win : step]
+        if len(seg) < 16:
+            continue
+        acc = 0
+        for x in seg:
+            acc += x * x
+        rms = math.sqrt(acc / len(seg)) / 32768.0
+        dbs.append(20.0 * math.log10(rms) if rms > 1e-5 else -90.0)
+    if not dbs:
+        return 0.0, -90.0
+    dbs.sort()
+    p20 = dbs[int(len(dbs) * 0.20)]
+    p90 = dbs[min(len(dbs) - 1, int(len(dbs) * 0.90))]
+    return round(max(0.0, p90 - p20), 1), round(p20, 1)
+
+
+def _condition_and_boost_pcm(pcm_bytes, out_channels, out_rate=24000):
     """
-    Raw BMW MGU MEMS ceiling mics have ~24 dB headroom (normal speech sits around -37 dBFS, peak ~1000),
+    Raw BMW MGU MEMS ceiling mics have ~24 dB headroom (normal speech sits around -37..-28 dBFS),
     and 1-mic cars leave channel 1 at digital zero (-91 dBFS).
     1. Collapse dead second channel (<25 peak) to centered mono so Gemini gets full amplitude & half upload size.
-    2. Apply clean linear AGC boost (up to 16x / +24 dB, target peak 22000) while preserving exact L/R dB ratio.
+    2. Measure syllabic SNR (P90 - P20 chunk dB): only apply full +24 dB speech boost when voice modulation is present;
+       cap gain on stationary silence / V8 idle hum so background noise never gets amplified above -32 dBFS.
     """
     samples = array.array("h")
     samples.frombytes(pcm_bytes)
     if sys.byteorder != "little":
         samples.byteswap()
     if not samples:
-        return pcm_bytes, out_channels, 0
+        return pcm_bytes, out_channels, 0, 0.0
 
     if out_channels == 2 and len(samples) >= 4:
         left = samples[0::2]
@@ -193,15 +218,20 @@ def _condition_and_boost_pcm(pcm_bytes, out_channels):
     else:
         peak = max((abs(x) for x in samples), default=0)
 
+    snr_db, floor_db = _measure_snr_and_floor(samples, out_channels, out_rate)
+
     if 55 <= peak < 18000:
         gain = min(16.0, 22000.0 / float(peak))
+        if snr_db < 4.2 and floor_db > -80.0:
+            max_noise_gain = 10.0 ** ((-32.0 - floor_db) / 20.0)
+            gain = min(gain, max(1.0, max_noise_gain))
         if gain > 1.25:
             samples = array.array("h", (max(-32767, min(32767, int(x * gain))) for x in samples))
             peak = min(32767, int(peak * gain))
 
     if sys.byteorder != "little":
         samples.byteswap()
-    return samples.tobytes(), out_channels, int(peak)
+    return samples.tobytes(), out_channels, int(peak), snr_db
 
 
 def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels=1):
@@ -269,7 +299,7 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
     if out_frames < max(800, out_rate // 5):
         raise RuntimeError(f"insufficient frames ({out_frames}) from {device}")
 
-    final_pcm, final_ch, peak = _condition_and_boost_pcm(bytes(collected), out_channels)
+    final_pcm, final_ch, peak, snr_db = _condition_and_boost_pcm(bytes(collected), out_channels, out_rate)
     _write_wav_atomic(out_wav, final_ch, out_rate, final_pcm)
 
     return {
@@ -279,6 +309,7 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
         "sampleRate": out_rate,
         "channels": final_ch,
         "peak": peak,
+        "snrDb": snr_db,
         "bytes": len(final_pcm),
     }
 
@@ -308,13 +339,14 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
     pcm = _open_alsa_capture(asound, device, hw_rate, hw_ch)
     try:
         preroll = collections.deque(maxlen=12)  # 12 * 60ms = 720ms pre-roll
+        calib_dbs = []
         active_chunks = []
         in_speech = False
         hot_streak = 0
         quiet_streak = 0
         voiced_chunks = 0
         max_speech_db = -90.0
-        noise_db = -52.0
+        noise_db = -45.0
         frame_idx = 0
         got_any_frame = False
         zero_Peak_streak = 0
@@ -356,15 +388,26 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
             else:
                 zero_Peak_streak = 0
 
-            # Raw BMW MEMS ceiling mics sit around -54 dBFS idle and -40..-30 dBFS normal speech:
-            # trigger cleanly at +6.5 dB above rolling cabin noise floor (floor -48 dBFS, peak >= 90)
-            thresh_db = max(-48.0, min(-20.0, noise_db + 6.5))
-            is_hot = (db >= thresh_db) and (peak >= 90)
+            # Calibrate initial ambient noise floor over the first 6 chunks (360ms) so V8 engine / AC idle never false-triggers!
+            if len(calib_dbs) < 6:
+                preroll.append(chunk_pcm)
+                if db > -85.0:
+                    calib_dbs.append(db)
+                    s_cal = sorted(calib_dbs)
+                    noise_db = s_cal[len(s_cal) // 2]
+                continue
+
+            # Trigger cleanly at +7.0 dB above rolling cabin noise floor (floor -47 dBFS, peak >= 120)
+            thresh_db = max(-47.0, min(-18.0, noise_db + 7.0))
+            is_hot = (db >= thresh_db) and (peak >= 120)
 
             if not in_speech:
                 preroll.append(chunk_pcm)
                 if not is_hot and db > -85.0:
-                    noise_db = noise_db * 0.96 + db * 0.04
+                    noise_db = noise_db * 0.95 + db * 0.05
+                elif is_hot and db > -85.0:
+                    # Slow upward drift if cabin background noise stepped up (e.g. engine start or AC fan boost)
+                    noise_db = noise_db * 0.99 + db * 0.01
                 if is_hot:
                     hot_streak += 1
                     if hot_streak >= 3 and (now - last_emit_at) >= 1.2:
@@ -389,7 +432,8 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
 
                 # Allow natural 900ms pause right after "Hey Bimmer," (<30 chunks) and 720ms after command body, max 6.6s
                 hangover_chunks = 15 if len(active_chunks) < 30 else 12
-                if quiet_streak >= hangover_chunks or len(active_chunks) >= 110:
+                hit_ceiling = len(active_chunks) >= 110
+                if quiet_streak >= hangover_chunks or hit_ceiling:
                     pcm_all = b"".join(active_chunks)
                     dur_ms = int(round((len(pcm_all) / (out_channels * 2 * out_rate)) * 1000))
                     in_speech = False
@@ -397,9 +441,19 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                     hot_streak = 0
                     quiet_streak = 0
 
-                    # Require >= 6 voiced chunks (~360ms actual voice) & >= 550ms total to catch quick "Hey Bimmer!" while ignoring clicks
-                    if voiced_chunks >= 6 and dur_ms >= 550:
-                        final_pcm, final_ch, _ = _condition_and_boost_pcm(pcm_all, out_channels)
+                    raw_samples = array.array("h")
+                    raw_samples.frombytes(pcm_all)
+                    if sys.byteorder != "little":
+                        raw_samples.byteswap()
+                    clip_snr_db, clip_floor_db = _measure_snr_and_floor(raw_samples, out_channels, out_rate)
+
+                    # Stationary drone (AC / V8 idle step) hitting 6.6s ceiling with <3.5 dB modulation: re-anchor floor & drop!
+                    if clip_snr_db < 3.5:
+                        if clip_floor_db > -80.0:
+                            noise_db = clip_floor_db
+                        emit_json({"event": "speech_cancel", "durationMs": dur_ms, "snrDb": clip_snr_db})
+                    elif voiced_chunks >= 6 and dur_ms >= 550:
+                        final_pcm, final_ch, _, snr_out = _condition_and_boost_pcm(pcm_all, out_channels, out_rate)
                         _write_wav_atomic(out_wav, final_ch, out_rate, final_pcm)
                         last_emit_at = time.monotonic()
                         emit_json({
@@ -408,6 +462,7 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                             "durationMs": dur_ms,
                             "speechDb": round(max_speech_db, 1),
                             "noiseDb": round(noise_db, 1),
+                            "snrDb": snr_out,
                             "device": device,
                         })
                     else:

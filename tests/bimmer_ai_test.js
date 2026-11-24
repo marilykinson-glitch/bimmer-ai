@@ -658,6 +658,106 @@ async function runAllTests() {
         await new Promise((r) => rogueGemini.close(r));
     });
 
+    await step('v0.5.0 Hardening: JSON Audio Schema, Untranscribed Wake-Mode Block & Capacitive PTT Guard', async () => {
+        let testCase = 'silence_json';
+        let sawJsonMime = false;
+        const jsonGem = http.createServer((req, res) => {
+            const chunks = [];
+            req.on('data', (c) => chunks.push(c));
+            req.on('end', () => {
+                const body = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+                if (body.generationConfig && body.generationConfig.responseMimeType === 'application/json' && !body.tools) {
+                    sawJsonMime = true;
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                if (testCase === 'silence_json') {
+                    res.end(JSON.stringify({
+                        candidates: [{
+                            content: {
+                                parts: [{ text: '{"speechDetected":false,"transcript":"","wakeOnly":false,"toolCalls":[],"replyVi":""}' }],
+                            },
+                        }],
+                    }));
+                } else if (testCase === 'spoken_json') {
+                    res.end(JSON.stringify({
+                        candidates: [{
+                            content: {
+                                parts: [{
+                                    text: JSON.stringify({
+                                        speechDetected: true,
+                                        transcript: 'Chỉnh điều hoà ghế tài 22.5 độ',
+                                        wakeOnly: false,
+                                        toolCalls: [{ name: 'set_climate', args: { zone: 'driver', tempC: 22.5 } }],
+                                        replyVi: 'Dạ đại ca, em chỉnh điều hoà ghế tài 22.5 độ ngay!',
+                                    }),
+                                }],
+                            },
+                        }],
+                    }));
+                } else {
+                    // Untranscribed rogue functionCall without wake phrase in `wakeMode` MUST be blocked!
+                    res.end(JSON.stringify({
+                        candidates: [{
+                            content: {
+                                parts: [{ functionCall: { name: 'control_windows_roof', args: { target: 'sunroof', action: 'open' } } }],
+                            },
+                        }],
+                    }));
+                }
+            });
+        });
+        await new Promise((r) => jsonGem.listen(0, '127.0.0.1', r));
+
+        const vc = new VehicleBus.VehicleController();
+        const wavSample = AudioIO.buildStereoWav(new Array(2400).fill(0.3), new Array(2400).fill(0.02), 16000);
+        const upOpts = { baseUrl: 'http://127.0.0.1:' + jsonGem.address().port, noSetuid: true };
+
+        // 1. Silence JSON -> zero actions, polite retry message in PTT mode
+        const silTurn = await AiBrain.processAssistantTurn({
+            audioWavBase64: wavSample.toString('base64'),
+            audioMimeType: 'audio/wav',
+            wakeMode: false,
+            speakerZone: 'driver',
+            apiKey: 'JSON_KEY',
+            vehicleController: vc,
+            uplinkOpts: upOpts,
+        });
+        assert.strictEqual(sawJsonMime, true);
+        assert.strictEqual(silTurn.actions.length, 0);
+        assert.ok(silTurn.replyVi.indexOf('chưa nghe rõ') >= 0);
+
+        // 2. Spoken JSON -> exact verbatim `transcript` + actuated `set_climate`!
+        testCase = 'spoken_json';
+        const spkTurn = await AiBrain.processAssistantTurn({
+            audioWavBase64: wavSample.toString('base64'),
+            audioMimeType: 'audio/wav',
+            wakeMode: false,
+            speakerZone: 'driver',
+            apiKey: 'JSON_KEY',
+            vehicleController: vc,
+            uplinkOpts: upOpts,
+        });
+        assert.strictEqual(spkTurn.transcript, 'Chỉnh điều hoà ghế tài 22.5 độ');
+        assert.strictEqual(vc.state.climate.tempDriverC, 22.5);
+
+        // 3. Untranscribed functionCall in `wakeMode` MUST be blocked (`ignored: true`, sunroof untouched!)
+        testCase = 'untranscribed_wake_tool';
+        const rogueWake = await AiBrain.processAssistantTurn({
+            audioWavBase64: wavSample.toString('base64'),
+            audioMimeType: 'audio/wav',
+            wakeMode: true,
+            speakerZone: 'driver',
+            apiKey: 'JSON_KEY',
+            vehicleController: vc,
+            uplinkOpts: upOpts,
+        });
+        assert.strictEqual(rogueWake.ignored, true);
+        assert.strictEqual(rogueWake.actions.length, 0);
+        assert.strictEqual(vc.state.sunroof, 'closed');
+
+        await new Promise((r) => jsonGem.close(r));
+    });
+
     console.log('\nALL ' + passed + ' TEST SUITES PASSED!');
 }
 

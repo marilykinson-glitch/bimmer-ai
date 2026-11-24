@@ -304,6 +304,8 @@ class VehicleController {
         this.pttLongFired = false;
         this.pttHoldTimer = null;
         this.lastShortPttAt = 0;
+        this.lastPttDispatchAt = 0;
+        this.lastSpeechDialogState = null;
 
         // Persistent RideTube socket (`jap-ridetube-d` stops playback if client disconnects)
         this.rtSock = null;
@@ -668,11 +670,11 @@ class VehicleController {
             }
         });
 
-        // 2. Steering wheel Push-To-Talk button (`SteeringWheelPushButton` — unwrap any SP18 Franca struct member name)
+        // 2. Steering wheel Push-To-Talk button (`SteeringWheelPushButton.statusPTTButton1`)
+        //    IMPORTANT: Enum value `1` = `PTT_MINUS_TASTER_GEDRUECKT` (physical press), while `2` = `PTT_MINUS_TASTER_BERUEHRT`
+        //    (capacitive finger touch sensor on M5 wheel!). Treat `2` / `BERUEHRT` strictly as NOT pressed!
         await bindService('steering', 'de.bmw.infotainment.controlelements.SteeringWheelPushButton', [
             'statusPTTButton1',
-            'statusSpecialFunctionButton',
-            'statusSpecialFunctionButton2',
         ], [], (f, v) => {
             if (v === null || v === undefined) return;
             let raw = v;
@@ -688,14 +690,36 @@ class VehicleController {
             if (typeof raw === 'boolean') {
                 pressed = raw;
             } else if (typeof raw === 'number') {
-                pressed = (raw === 1 || raw === 2);
+                pressed = (raw === 1);
             } else {
-                const isReleased = /NICHT|LOSGELASSEN|RELEASE|IDLE|AUS|KEINE/.test(sRaw);
+                const isReleased = /NICHT|BERUEHRT|RESERVIERT|LOSGELASSEN|RELEASE|IDLE|AUS|KEINE/.test(sRaw);
                 const isActuated = /BETAETIGT|GEDRUECKT|PRESSED|KURZ|LANG|EIN|ACTIVE/.test(sRaw);
                 pressed = !isReleased && isActuated;
             }
             this.handleSteeringPttSignal(f, pressed, raw);
         });
+
+        // 2b. BMW Speech Dialog & Native Prompt Aborter (catches M-wheel PTT edge & silences "Không khả dụng" voice prompt)
+        await bindService('speechDialog', 'de.bmw.infotainment.speech.dialog.Dialog', ['dialogState'], [], (f, v) => {
+            if (v === null || v === undefined) return;
+            const prev = this.lastSpeechDialogState;
+            this.lastSpeechDialogState = v;
+            this.log('speechDialog.' + f + ' = ' + String(v));
+            const sVal = String(v).toUpperCase();
+            const isRunning = (v === 2 || sVal === 'RUNNING');
+            if (prev !== null && prev !== v && isRunning) {
+                this.abortNativeSpeechPrompt();
+                const now = Date.now();
+                if (!this.state.pttPressed && (now - this.lastPttDispatchAt) > 1500) {
+                    this.lastPttDispatchAt = now;
+                    if (this.opts.onPttEvent) {
+                        this.opts.onPttEvent({ button: 'speechDialog', kind: 'short_press', heldMs: 120 });
+                    }
+                }
+            }
+        }, 'HMISpeechHU');
+        await bindService('speechPrompter', 'de.bmw.infotainment.speech.prompter.Prompter', [], ['abortPrompt'], null, 'PALSpeechHU');
+        await bindService('voicePrompt', 'de.bmw.infotainment.speech.voiceprompt.VoicePrompt', [], ['abort']);
 
         // 3. Telephony & CarPlay voice call yield guard
         await bindService('voiceCall', 'de.bmw.infotainment.connectivity.telephony.VoiceCall', ['state'], [], (f, v) => {
@@ -792,6 +816,15 @@ class VehicleController {
         return true;
     }
 
+    abortNativeSpeechPrompt() {
+        const doAbort = () => {
+            this.callMethodIfAvailable('speechPrompter', 'abortPrompt', {}).catch(() => {});
+            this.callMethodIfAvailable('voicePrompt', 'abort', {}).catch(() => {});
+        };
+        setTimeout(doAbort, 60);
+        setTimeout(doAbort, 260);
+    }
+
     handleSteeringPttSignal(field, pressed, raw) {
         const now = Date.now();
         if (pressed === this.state.pttPressed && (!pressed || this.pttDownAt > 0)) return;
@@ -807,6 +840,7 @@ class VehicleController {
                 this.pttHoldTimer = null;
                 if (this.state.pttPressed && !this.pttLongFired) {
                     this.pttLongFired = true;
+                    this.lastPttDispatchAt = Date.now();
                     if (this.opts.onPttEvent) {
                         this.opts.onPttEvent({ button: field, kind: 'long_press', heldMs: Date.now() - this.pttDownAt });
                     }
@@ -823,8 +857,10 @@ class VehicleController {
             this.pttLongFired = false;
             if (alreadyLong) return;
             if (heldMs >= 30) {
+                this.abortNativeSpeechPrompt();
                 const isDouble = (now - this.lastShortPttAt) < 650;
                 this.lastShortPttAt = now;
+                this.lastPttDispatchAt = now;
                 if (this.opts.onPttEvent) {
                     this.opts.onPttEvent({ button: field, kind: isDouble ? 'double_press' : 'short_press', heldMs });
                 }
