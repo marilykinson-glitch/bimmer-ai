@@ -273,6 +273,86 @@ async function runAllTests() {
         assert.ok(memTurn.replyVi.indexOf('nhớ ghế số 2') >= 0);
     });
 
+    await step('Steering PTT German Enums, OAP HMI IPC Discovery & Gemini 2.5 thinkingBudget=0', async () => {
+        // 1. Verify SteeringWheelPushButton German enum strings ('TASTER_BETAETIGT' -> 'TASTER_NICHT_BETAETIGT')
+        const events = [];
+        const vc = new VehicleBus.VehicleController({
+            onPttEvent: (ev) => events.push(ev),
+        });
+        vc.handleSteeringPttSignal('statusPTTButton1', true, 'TASTER_BETAETIGT');
+        await new Promise((r) => setTimeout(r, 60));
+        vc.handleSteeringPttSignal('statusPTTButton1', false, 'TASTER_NICHT_BETAETIGT');
+        assert.strictEqual(events.length, 1);
+        assert.strictEqual(events[0].kind, 'short_press');
+
+        // 2. Verify OAP app discovery & fallback `oap_12209/data/command.json` polling
+        const tmpOap = fs.mkdtempSync(path.join(os.tmpdir(), 'bimmer-ai-oap-'));
+        const appRoot = path.join(tmpOap, 'oap', 'oap_12209');
+        const specDir = path.join(appRoot, 'source', 'javascript', 'kit');
+        const dataDir = path.join(appRoot, 'data');
+        fs.mkdirSync(path.join(tmpOap, 'oap'), 0o755);
+        fs.mkdirSync(appRoot, 0o755);
+        fs.mkdirSync(path.join(appRoot, 'source'), 0o755);
+        fs.mkdirSync(path.join(appRoot, 'source', 'javascript'), 0o755);
+        fs.mkdirSync(specDir, 0o755);
+        fs.mkdirSync(dataDir, 0o755);
+        fs.writeFileSync(path.join(specDir, 'app-spec.json'), JSON.stringify({ id: 'bimmer_ai' }));
+
+        let capturedReqBody = null;
+        const mockGem25 = http.createServer((req, res) => {
+            const c = [];
+            req.on('data', (d) => c.push(d));
+            req.on('end', () => {
+                capturedReqBody = JSON.parse(Buffer.concat(c).toString('utf8'));
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    candidates: [{
+                        content: {
+                            parts: [
+                                { thought: true, text: 'INTERNAL_THOUGHT_MUST_BE_FILTERED' },
+                                { text: '[TRANSCRIPT: Chỉnh điều hoà 21 độ] Đã hạ điều hoà xuống 21 độ mát rượi!' },
+                            ],
+                        },
+                    }],
+                }));
+            });
+        });
+        await new Promise((r) => mockGem25.listen(0, '127.0.0.1', r));
+
+        const dm = new BimmerAiDaemon({
+            run: path.join(tmpOap, 'run'),
+            state: path.join(tmpOap, 'state'),
+            oap: path.join(tmpOap, 'oap'),
+            host: '127.0.0.1',
+            port: 0,
+            simMode: true,
+            noNft: true,
+            quiet: true,
+            geminiBaseUrl: 'http://127.0.0.1:' + mockGem25.address().port,
+        });
+        await dm.start();
+        dm.saveSettings({ apiKey: 'TEST_KEY_25', model: 'gemini-2.5-flash', ttsEnabled: false });
+        assert.ok(dm.installedApp && dm.installedApp.id === 'bimmer_ai');
+
+        // Simulate HMI screen writing to fallback `oap_12209/data/command.json`
+        fs.writeFileSync(path.join(dataDir, 'command.json'), JSON.stringify({
+            id: 999,
+            cmd: 'quick_prompt',
+            arg: { text: 'Chỉnh điều hoà 21 độ', speakerZone: 'driver' },
+        }));
+        dm.pollHmiAppCommand();
+        await new Promise((r) => setTimeout(r, 250));
+
+        assert.ok(capturedReqBody && capturedReqBody.generationConfig.thinkingConfig);
+        assert.strictEqual(capturedReqBody.generationConfig.thinkingConfig.thinkingBudget, 0);
+        assert.ok(dm.lastTurn.replyVi.indexOf('INTERNAL_THOUGHT') < 0);
+        // Offline NLU backup executed `set_climate` even though Gemini only emitted `[TRANSCRIPT: ...]` text!
+        assert.strictEqual(dm.vehicle.state.climate.tempDriverC, 21);
+
+        await dm.stop();
+        await new Promise((r) => mockGem25.close(r));
+    });
+
     console.log('\nALL ' + passed + ' TEST SUITES PASSED!');
 }
 

@@ -301,6 +301,8 @@ class VehicleController {
         this.lockSeq = 1;
         this.preCinemaBackup = null;
         this.pttDownAt = 0;
+        this.pttLongFired = false;
+        this.pttHoldTimer = null;
         this.lastShortPttAt = 0;
 
         // Persistent RideTube socket (`jap-ridetube-d` stops playback if client disconnects)
@@ -672,9 +674,20 @@ class VehicleController {
             let raw = v;
             if (f === 'statusPTTButton1' && v.operationPushButtonPTTSteeringWheel !== undefined) raw = v.operationPushButtonPTTSteeringWheel;
             if (f === 'statusSpecialFunctionButton' && v.operationPushButtonSpecialFunction !== undefined) raw = v.operationPushButtonSpecialFunction;
-            if (raw === 3 || raw === 'SIGNAL_UNGUELTIG') return;
-            const pressed = (raw === 1 || raw === 'PTT_MINUS_TASTER_GEDRUECKT' || raw === 'TASTER_GEDRUECKT' || raw === true);
-            this.handleSteeringPttSignal(f, pressed);
+            if (raw === null || raw === undefined) return;
+            const sRaw = String(raw).toUpperCase();
+            if (raw === 3 || raw === 15 || raw === 255 || /UNGUELTIG|UNBEFUELLT|INVALID/.test(sRaw)) return;
+            let pressed = false;
+            if (typeof raw === 'boolean') {
+                pressed = raw;
+            } else if (typeof raw === 'number') {
+                pressed = (raw === 1 || raw === 2);
+            } else {
+                const isReleased = /NICHT|LOSGELASSEN|RELEASE|IDLE|AUS|KEINE/.test(sRaw);
+                const isActuated = /BETAETIGT|GEDRUECKT|PRESSED|KURZ|LANG|EIN|ACTIVE/.test(sRaw);
+                pressed = !isReleased && isActuated;
+            }
+            this.handleSteeringPttSignal(f, pressed, raw);
         });
 
         // 3. Telephony & CarPlay voice call yield guard
@@ -765,27 +778,47 @@ class VehicleController {
             } catch (e) {}
         }
 
-        this.log('vehicle-bus v0.3.1 ready. Available proxies: ' + this.state.availableProxies.join(', '));
+        this.log('vehicle-bus v0.3.2 ready. Available proxies: ' + this.state.availableProxies.join(', '));
         this.emitTelemetry();
         return true;
     }
 
-    handleSteeringPttSignal(field, pressed) {
+    handleSteeringPttSignal(field, pressed, raw) {
         const now = Date.now();
+        if (pressed === this.state.pttPressed && (!pressed || this.pttDownAt > 0)) return;
         this.state.pttPressed = pressed;
+        this.log('steering PTT signal: ' + field + ' raw=' + String(raw) + ' pressed=' + pressed);
+
         if (pressed) {
-            if (this.pttDownAt === 0) this.pttDownAt = now;
+            this.pttDownAt = now;
+            this.pttLongFired = false;
+            if (this.pttHoldTimer) clearTimeout(this.pttHoldTimer);
+            // Fire `long_press` immediately at 650ms while button is held so user can speak right away
+            this.pttHoldTimer = setTimeout(() => {
+                this.pttHoldTimer = null;
+                if (this.state.pttPressed && !this.pttLongFired) {
+                    this.pttLongFired = true;
+                    if (this.opts.onPttEvent) {
+                        this.opts.onPttEvent({ button: field, kind: 'long_press', heldMs: Date.now() - this.pttDownAt });
+                    }
+                }
+            }, 650);
         } else if (this.pttDownAt > 0) {
+            if (this.pttHoldTimer) {
+                clearTimeout(this.pttHoldTimer);
+                this.pttHoldTimer = null;
+            }
             const heldMs = now - this.pttDownAt;
+            const alreadyLong = this.pttLongFired;
             this.pttDownAt = 0;
-            if (heldMs >= 40 && heldMs < 700) {
-                const isDouble = (now - this.lastShortPttAt) < 600;
+            this.pttLongFired = false;
+            if (alreadyLong) return;
+            if (heldMs >= 30) {
+                const isDouble = (now - this.lastShortPttAt) < 650;
                 this.lastShortPttAt = now;
                 if (this.opts.onPttEvent) {
                     this.opts.onPttEvent({ button: field, kind: isDouble ? 'double_press' : 'short_press', heldMs });
                 }
-            } else if (heldMs >= 700 && this.opts.onPttEvent) {
-                this.opts.onPttEvent({ button: field, kind: 'long_press', heldMs });
             }
         }
     }
@@ -795,13 +828,16 @@ class VehicleController {
         const tryPair = async (srcId, snkId) => {
             const r = await this.proxies.audioCmd.callMethod('connect', { sourceID: srcId, sinkID: snkId }, 2500);
             if (r && (r.amError === 'E_OK' || r.amError === 'E_ALREADY_EXISTS' || r.amError === 0) && r.mainConnectionID !== undefined) {
-                return r.mainConnectionID;
+                return {
+                    connId: r.mainConnectionID,
+                    created: (r.amError === 'E_OK' || r.amError === 0),
+                };
             }
             return null;
         };
         try {
-            const id1 = await tryPair(route.sourceID, route.sinkID);
-            if (id1 !== null) return id1;
+            const tok1 = await tryPair(route.sourceID, route.sinkID);
+            if (tok1 !== null) return tok1;
             if (route.fallbackSourceID) return await tryPair(route.fallbackSourceID, route.sinkID);
         } catch (e) {}
         return null;
@@ -831,17 +867,21 @@ class VehicleController {
             setTimeout(() => { this.pulseIpaLight('off').catch(() => {}); }, 1800);
             return false;
         }
-        let connId = null;
+        let routeTok = null;
         try {
-            connId = await this.connectAudioRoute({ sourceID: 1046, sinkID: 1024 });
+            routeTok = await this.connectAudioRoute({ sourceID: 1046, sinkID: 1024 });
             await this.proxies.mediaPlayer.callMethod('playFile', { path: mp3File, languageCode: 0 }, 3500);
             setTimeout(() => {
-                if (connId !== null) this.disconnectAudioRoute(connId).catch(() => {});
+                if (routeTok && routeTok.created && routeTok.connId !== null) {
+                    this.disconnectAudioRoute(routeTok.connId).catch(() => {});
+                }
                 this.pulseIpaLight('off').catch(() => {});
             }, 3800);
             return true;
         } catch (e) {
-            if (connId !== null) await this.disconnectAudioRoute(connId);
+            if (routeTok && routeTok.created && routeTok.connId !== null) {
+                await this.disconnectAudioRoute(routeTok.connId);
+            }
             await this.pulseIpaLight('off');
             return false;
         }

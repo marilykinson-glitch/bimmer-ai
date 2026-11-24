@@ -27,7 +27,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.3.1';
+const VERSION = '0.3.2';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -90,7 +90,7 @@ function normalizeSettings(raw) {
         apiKey: typeof r.apiKey === 'string' ? r.apiKey.trim() : d.apiKey,
         model: typeof r.model === 'string' && r.model.trim() ? r.model.trim() : d.model,
         ownerName: typeof r.ownerName === 'string' && r.ownerName.trim() ? r.ownerName.trim().slice(0, 40) : d.ownerName,
-        pttTrigger: (ptt === 'short_press' || ptt === 'double_press' || ptt === 'disabled') ? ptt : d.pttTrigger,
+        pttTrigger: (ptt === 'short_press' || ptt === 'long_press' || ptt === 'double_press' || ptt === 'disabled') ? ptt : d.pttTrigger,
         micDevice: typeof r.micDevice === 'string' && r.micDevice.trim() ? r.micDevice.trim() : d.micDevice,
         micDurationSec: Math.max(2, Math.min(8, Math.round(Number(r.micDurationSec) || d.micDurationSec))),
         swapMicChannels: !!r.swapMicChannels,
@@ -154,24 +154,62 @@ async function fwOpen(nftBin, port) {
     } catch (e) { return 'skip'; }
 }
 
+function findInstalledApp(oapRoot) {
+    let dirs = [];
+    try { dirs = fs.readdirSync(oapRoot).filter((d) => /^oap_\d+$/.test(d)); } catch (e) { return null; }
+    for (let i = 0; i < dirs.length; i++) {
+        const rels = ['source/javascript/kit/app-spec.json', 'javascript/kit/app-spec.json'];
+        for (let k = 0; k < rels.length; k++) {
+            const spec = readJson(path.join(oapRoot, dirs[i], rels[k]));
+            if (spec && typeof spec.id === 'string' && APP_RE.test(spec.id)) {
+                return { id: spec.id, root: path.join(oapRoot, dirs[i]) };
+            }
+        }
+    }
+    return null;
+}
+
 /** Chown `/run/bimmer-ai/app` to the OAP UID of `bimmer_ai` so the HMI app can write zero-flash commands. */
-function grantAppRamFolder(oapRoot, runDir) {
+function grantAppRamFolder(oapRoot, runDir, procDir) {
     const appDir = path.join(runDir, 'app');
     mkdirp(appDir);
     try { fs.chmodSync(appDir, 0o775); } catch (e) {}
-    const mgr = path.join(oapRoot, 'oap_12201', 'data', 'apps');
-    let appUid = null;
-    try {
-        fs.readdirSync(mgr).forEach((name) => {
-            const info = readJson(path.join(mgr, name));
-            if (info && APP_RE.test(String(info.id || name)) && Number(info.userId) > 0) {
-                appUid = Number(info.userId);
+
+    const app = findInstalledApp(oapRoot);
+    let uid = null, gid = null;
+    if (app) {
+        try {
+            const pids = fs.readdirSync(procDir || '/proc').filter((d) => /^\d+$/.test(d));
+            for (let i = 0; i < pids.length; i++) {
+                try {
+                    const cmd = fs.readFileSync(path.join(procDir || '/proc', pids[i], 'cmdline'), 'latin1');
+                    if (cmd.indexOf(app.root) < 0) continue;
+                    const st = fs.readFileSync(path.join(procDir || '/proc', pids[i], 'status'), 'utf8');
+                    const u = /^Uid:\s+(\d+)/m.exec(st), g = /^Gid:\s+(\d+)/m.exec(st);
+                    if (u && g && Number(u[1]) > 0) { uid = Number(u[1]); gid = Number(g[1]); break; }
+                } catch (e) {}
             }
-        });
-    } catch (e) {}
-    if (appUid) {
-        try { fs.chownSync(appDir, appUid, appUid); } catch (e) {}
+            if (uid === null) {
+                const st = fs.statSync(path.join(app.root, 'data'));
+                uid = st.uid; gid = st.gid;
+            }
+        } catch (e) {}
     }
+    if (uid === null) {
+        const mgr = path.join(oapRoot, 'oap_12201', 'data', 'apps');
+        try {
+            fs.readdirSync(mgr).forEach((name) => {
+                const info = readJson(path.join(mgr, name));
+                if (info && APP_RE.test(String(info.id || name)) && Number(info.userId) > 0) {
+                    uid = Number(info.userId); gid = uid;
+                }
+            });
+        } catch (e) {}
+    }
+    if (uid && uid > 0 && typeof process.getuid === 'function' && process.getuid() === 0) {
+        try { fs.chownSync(appDir, uid, gid || uid); fs.chmodSync(appDir, 0o770); } catch (e) {}
+    }
+    return app;
 }
 
 class BimmerAiDaemon {
@@ -329,8 +367,8 @@ class BimmerAiDaemon {
     onSteeringWheelPtt(ev) {
         if (this.settings.pttTrigger === 'disabled') return;
         if (this.settings.pttTrigger === 'double_press' && ev.kind !== 'double_press') return;
-        if (this.settings.pttTrigger === 'short_press' && ev.kind !== 'short_press' && ev.kind !== 'double_press') return;
-        this.log('steering wheel PTT triggered (' + ev.kind + ') -> capturing ceiling mic');
+        if (this.settings.pttTrigger === 'long_press' && ev.kind !== 'long_press') return;
+        this.log('steering wheel PTT triggered (' + ev.kind + ', held=' + ev.heldMs + 'ms) -> capturing ceiling mic');
         this.captureAndProcessCeilingMic().catch((e) => this.log('PTT error: ' + e.message));
     }
 
@@ -345,13 +383,16 @@ class BimmerAiDaemon {
             return { ok: false, error: msg };
         }
 
-        const dev = this.settings.micDevice === 'auto' ? this.audioProbe.recommendedDevice : this.settings.micDevice;
-        if (!this.audioProbe.hasAlsaCapture && this.settings.micDevice === 'auto') {
-            const msg = 'Trên máy mô phỏng hãy dùng nút Giữ nói trên trình duyệt hoặc chọn câu lệnh thử nhanh!';
+        const dev = this.settings.micDevice || 'auto';
+        if (!this.audioProbe.hasAlsaCapture && dev === 'auto') {
+            const msg = 'Trên máy mô phỏng hãy dùng nút Mic trên trình duyệt hoặc chọn câu lệnh thử nhanh!';
             this.lastTurn = { at: Date.now(), engine: 'sim', speakerZone: 'driver', transcript: '(Nút Mic)', replyVi: msg, actions: [] };
             this.writeStatusFile();
             return { ok: false, error: msg };
         }
+
+        const hasKey = !!(this.settings.apiKey && String(this.settings.apiKey).trim());
+        const clipSec = hasKey ? this.settings.micDurationSec : 2;
 
         this.assistantState = 'listening';
         this.writeStatusFile();
@@ -359,33 +400,55 @@ class BimmerAiDaemon {
         try {
             const cap = await AudioIO.captureCeilingMicClip({
                 device: dev,
-                durationSec: this.settings.micDurationSec,
+                durationSec: clipSec,
                 outFile: path.join(this.cfg.run, 'capture.wav'),
                 swapChannels: this.settings.swapMicChannels,
                 connectAmRoute: (r) => this.vehicle.connectAudioRoute(r),
                 disconnectAmRoute: (cid) => this.vehicle.disconnectAudioRoute(cid),
                 isCallActive: () => !!this.vehicle.state.callActive,
+                onLog: (m) => this.log(m),
             });
             this.micLevels = { leftDb: cap.analysis.leftDb, rightDb: cap.analysis.rightDb };
             this.activeSpeakerZone = cap.analysis.speakerZone === 'passenger' ? 'passenger' : 'driver';
-            return await this.handleVoiceOrTextTurn({
+            this.audioProbe = AudioIO.probeOemAudioStack();
+
+            if (!hasKey) {
+                await this.vehicle.pulseIpaLight('off');
+                this.assistantState = 'idle';
+                const msg = 'Mic trần xe bắt tiếng tốt (' + cap.deviceUsed.split(':').pop() + ': ' + cap.analysis.leftDb + ' dB)! ' +
+                    'Chỉ cần dán Gemini API Key trong trang QR để giải mã giọng nói Mic trần tự do, hoặc bấm ô nhập chữ trên iPhone rồi ấn nút 🎙️ góc bàn phím để nói Offline ngay!';
+                this.lastTurn = {
+                    at: Date.now(),
+                    engine: 'mic_ok_need_key',
+                    speakerZone: this.activeSpeakerZone,
+                    transcript: '(Đã thu thử Mic trần ' + clipSec + 's · ' + cap.analysis.leftDb + ' dB)',
+                    replyVi: msg,
+                    actions: [],
+                };
+                this.writeStatusFile();
+                return { ok: true, turn: this.lastTurn };
+            }
+
+            const resTurn = await this.handleVoiceOrTextTurn({
                 audioWavBase64: cap.wavBuffer.toString('base64'),
                 audioMimeType: 'audio/wav',
                 speakerZone: this.activeSpeakerZone,
             });
+            return { ok: true, turn: resTurn };
         } catch (e) {
             await this.vehicle.pulseIpaLight('off');
             this.assistantState = 'idle';
+            this.log('ceiling mic error: ' + e.message);
             this.lastTurn = {
                 at: Date.now(),
                 engine: 'audio_err',
                 speakerZone: 'driver',
                 transcript: '(Thu âm Mic trần)',
-                replyVi: 'Không mở được cổng thu âm (' + e.message + '). Mở trang QR để dò cổng ALSA.',
+                replyVi: 'Không thu được Mic trần (' + e.message.slice(0, 120) + '). Kiểm tra cổng ALSA trong trang QR.',
                 actions: [],
             };
             this.writeStatusFile();
-            return { ok: false, error: e.message };
+            return { ok: false, error: e.message, turn: this.lastTurn };
         }
     }
 
@@ -442,10 +505,9 @@ class BimmerAiDaemon {
             const prevVol = this.vehicle.state.media.volumePercent;
             const wasPlaying = this.vehicle.state.media.playing;
             if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
-                await this.vehicle.callMethodIfAvailable('audioCmd', 'setVolumeInPercent', {
-                    sourceID: 1046,
+                await this.vehicle.callMethodIfAvailable('audioCmd', 'setVolume', {
                     sinkID: 1,
-                    percentValue: this.settings.duckVolumePercent,
+                    volume: this.settings.duckVolumePercent,
                 });
             }
             const mp3 = await AudioIO.synthesizeVietnameseMp3(turn.replyVi, this.uplinkOpts, Up);
@@ -464,10 +526,9 @@ class BimmerAiDaemon {
             }
             if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
                 setTimeout(() => {
-                    this.vehicle.callMethodIfAvailable('audioCmd', 'setVolumeInPercent', {
-                        sourceID: 1046,
+                    this.vehicle.callMethodIfAvailable('audioCmd', 'setVolume', {
                         sinkID: 1,
-                        percentValue: prevVol,
+                        volume: prevVol,
                     }).catch(() => {});
                 }, 3200);
             }
@@ -480,16 +541,20 @@ class BimmerAiDaemon {
         return Object.assign({}, turn, { ttsAudioBase64, telemetry: this.vehicle.state });
     }
 
-    /** Poll commands sent from the iDrive 7 HMI screen (`apps/bimmer_ai`). */
+    /** Poll commands sent from the iDrive 7 HMI screen (both RAM /run and fallback oap data dir). */
     pollHmiAppCommand() {
         const candidates = [
             path.join(this.cfg.run, 'app', 'command.json'),
         ];
+        if (this.installedApp && this.installedApp.root) {
+            candidates.push(path.join(this.installedApp.root, 'data', 'command.json'));
+        }
         for (let i = 0; i < candidates.length; i++) {
             const c = readJson(candidates[i]);
             if (!c || !c.id || c.id === this.lastCmdId) continue;
             this.lastCmdId = c.id;
             try { fs.unlinkSync(candidates[i]); } catch (e) {}
+            this.log('HMI app command: ' + c.cmd);
             this.executeHmiCommand(c.cmd, c.arg || {}).catch((e) => this.log('hmi cmd error: ' + e.message));
         }
     }
@@ -631,7 +696,7 @@ class BimmerAiDaemon {
     }
 
     async start() {
-        grantAppRamFolder(this.cfg.oap, this.cfg.run);
+        this.installedApp = grantAppRamFolder(this.cfg.oap, this.cfg.run, this.cfg.proc);
         await this.vehicle.initHardwareBus();
         if (!this.cfg.noNft && !this.cfg.simMode) {
             await fwOpen(this.cfg.nft, this.cfg.port);
@@ -654,8 +719,8 @@ class BimmerAiDaemon {
         if (actualAddr && actualAddr.port) this.cfg.port = actualAddr.port;
 
         this.pollTimer = setInterval(() => {
+            this.installedApp = grantAppRamFolder(this.cfg.oap, this.cfg.run, this.cfg.proc);
             this.pollHmiAppCommand();
-            grantAppRamFolder(this.cfg.oap, this.cfg.run);
             this.vehicle.pollCompanionApps();
             this.writeStatusFile();
         }, 700);

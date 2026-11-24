@@ -441,14 +441,19 @@ async function callGeminiApi(opts) {
     });
     contents.push({ role: 'user', parts: userParts });
 
+    const genCfg = {
+        temperature: 0.3,
+        maxOutputTokens: 1024,
+    };
+    if (/^gemini-2\.5/i.test(model)) {
+        genCfg.thinkingConfig = { thinkingBudget: 0 };
+    }
+
     const bodyObj = {
         systemInstruction: { parts: [{ text: sysText }] },
         contents,
         tools: [{ functionDeclarations: TOOL_DECLARATIONS }],
-        generationConfig: {
-            temperature: 0.35,
-            maxOutputTokens: 350,
-        },
+        generationConfig: genCfg,
     };
 
     const apiPath = '/v1beta/models/' + encodeURIComponent(model) + ':generateContent?key=' + encodeURIComponent(apiKey);
@@ -483,7 +488,7 @@ async function callGeminiApi(opts) {
                 args: p.functionCall.args || {},
             });
         }
-        if (typeof p.text === 'string' && p.text.trim()) {
+        if (!p.thought && typeof p.text === 'string' && p.text.trim()) {
             textChunks.push(p.text.trim());
         }
     });
@@ -547,8 +552,8 @@ async function processAssistantTurn(params) {
         }
     }
 
-    // Fallback or pure Offline NLU when offline / no API key / audio-less local command
-    if (engine === 'offline' && transcript) {
+    // Fallback or supplement with Offline NLU if offline OR if Gemini transcribed audio text without emitting toolCalls
+    if ((engine === 'offline' || toolCalls.length === 0) && transcript) {
         toolCalls = parseOfflineVietnameseIntents(transcript, speakerZone);
     }
 

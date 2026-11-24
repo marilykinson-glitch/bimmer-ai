@@ -1,14 +1,14 @@
 'use strict';
 /**
- * audio-io.js - OEM BMW MGU SmartXbar / AVB Ceiling Microphone Capture, 2-Zone Speaker Localization & TTS.
+ * audio-io.js - OEM BMW MGU SmartXbar / AVB Ceiling Microphone Capture, Auto-Failover, 2-Zone Localization & TTS (`v0.3.2`).
  *
- * Verified on real BMW MGU (iDrive 7) hardware:
- *   - Ceiling microphones enter MGU as `DOMAIN_RAM` `Microphones` (`sourceID: 129`) -> `ECNR_Uplink_Source` (`sourceID: 389`),
- *     exposed in `/run/smartx` via Intel SmartXbar (`/usr/share/alsa/alsa.conf.d/50-smartx.conf` & `libasound.so.2`).
- *   - Uses `/var/opt/mgu-python/current/bin/python3` + `alsa-smartx.py` (`ctypes` `libasound.so.2`) when `arecord` is absent.
- *   - Supports both 2-Mic Stereo streams (`avb:MGU_GW_3_SOURCE_CF_2MIC_6REF` / `smartx:SpeechSink_CF_2MIC_1REF_SPEECH`)
- *     for Driver (Left) vs Passenger (Right) speaker localization, and 24 kHz Hardware Echo-Cancelled ECNR streams
- *     (`smartx:VoiceNotesSink_CF_24_MONO` / `smartx:AndroidAutoSink_CF_24_MONO`).
+ * Key upgrades in `v0.3.2`:
+ *   1. Automatic multi-pipe failover across `VoiceNotesSink` (Harman ECNR 24kHz), `SpeechSink` (2-Mic Stereo 24kHz),
+ *      `AndroidAutoSink` (Harman ECNR 24kHz), and `avb:MGU_GW_3_SOURCE_CF_2MIC_6REF` (2-Mic 48->16kHz), remembering
+ *      the last working non-zero pipe (`lastWorkingHw`) so subsequent PTT presses open instantaneously.
+ *   2. Unlinks stale `capture.wav` before every recording so crashed/busy attempts can never reuse an old file.
+ *   3. Only disconnects GENIVI AudioManager routes that were newly created by us (`routeToken.created === true`),
+ *      never tearing down BMW's persistent `129 -> 387` (`SpeechSink`) connection.
  *
  * Node 8 compatible, zero external npm dependencies.
  */
@@ -21,31 +21,13 @@ const SMARTX_HELPER = path.join(__dirname, 'alsa-smartx.py');
 
 const SMARTX_PROFILES = [
     {
-        match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_6REF_c',
-        hw: 'avb:MGU_GW_3_SOURCE_CF_2MIC_6REF',
-        rate: 48000,
-        hwChannels: 8,
-        amRoute: null,
-        label: 'Cặp Mic trần 2 vùng + 6 kênh khử vọng (AVB 2MIC_6REF)',
-        score: 95,
-    },
-    {
         match: 'smartx_VoiceNotesSink_CF_24_MONO_c',
         hw: 'smartx:VoiceNotesSink_CF_24_MONO',
         rate: 24000,
         hwChannels: 1,
         amRoute: { sourceID: 389, sinkID: 389, fallbackSourceID: 129 },
         label: 'Mic trần khử ồn Harman ECNR 24kHz (VoiceNotesSink)',
-        score: 90,
-    },
-    {
-        match: 'smartx_AndroidAutoSink_CF_24_MONO_c',
-        hw: 'smartx:AndroidAutoSink_CF_24_MONO',
-        rate: 24000,
-        hwChannels: 1,
-        amRoute: { sourceID: 389, sinkID: 390, fallbackSourceID: 129 },
-        label: 'Mic trần khử ồn Harman ECNR 24kHz (AndroidAutoSink)',
-        score: 88,
+        score: 96,
     },
     {
         match: 'smartx_SpeechSink_CF_2MIC_1REF_SPEECH_c',
@@ -54,9 +36,29 @@ const SMARTX_PROFILES = [
         hwChannels: 3,
         amRoute: { sourceID: 129, sinkID: 387 },
         label: 'Cặp Mic trần 2 vùng SpeechSink (2MIC_1REF)',
+        score: 94,
+    },
+    {
+        match: 'smartx_AndroidAutoSink_CF_24_MONO_c',
+        hw: 'smartx:AndroidAutoSink_CF_24_MONO',
+        rate: 24000,
+        hwChannels: 1,
+        amRoute: { sourceID: 389, sinkID: 390, fallbackSourceID: 129 },
+        label: 'Mic trần khử ồn Harman ECNR 24kHz (AndroidAutoSink)',
+        score: 90,
+    },
+    {
+        match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_6REF_c',
+        hw: 'avb:MGU_GW_3_SOURCE_CF_2MIC_6REF',
+        rate: 48000,
+        hwChannels: 8,
+        amRoute: null,
+        label: 'Cặp Mic trần 2 vùng + 6 kênh khử vọng (AVB 2MIC_6REF)',
         score: 85,
     },
 ];
+
+let lastWorkingHw = '';
 
 function readTextSafe(file) {
     try { return fs.readFileSync(file, 'utf8'); } catch (e) { return ''; }
@@ -66,9 +68,10 @@ function listDirSafe(dir) {
     try { return fs.readdirSync(dir); } catch (e) { return []; }
 }
 
-/**
- * Inspect Intel SmartXbar (`/run/smartx`) and ALSA (`/proc/asound`) capture streams on the MGU head unit.
- */
+function unlinkSafe(file) {
+    try { if (fs.existsSync(file)) fs.unlinkSync(file); } catch (e) {}
+}
+
 function probeOemAudioStack(opts) {
     const o = Object.assign({
         procAsound: '/proc/asound',
@@ -85,7 +88,6 @@ function probeOemAudioStack(opts) {
 
     const captureStreams = [];
 
-    // 1. Intel SmartXbar / AVB roof microphone pipes on real BMW MGU
     SMARTX_PROFILES.forEach((p) => {
         if (smartxNodes.indexOf(p.match) >= 0) {
             captureStreams.push({
@@ -96,12 +98,11 @@ function probeOemAudioStack(opts) {
                 amRoute: p.amRoute,
                 label: p.label,
                 backend: 'smartx-libasound',
-                score: p.score,
+                score: p.hw === lastWorkingHw ? p.score + 10 : p.score,
             });
         }
     });
 
-    // 2. Standard ALSA `/proc/asound/pcm` capture devices
     pcmRaw.split('\n').forEach((line) => {
         const trimmed = line.trim();
         if (!trimmed || trimmed.toLowerCase().indexOf('capture') < 0) return;
@@ -142,9 +143,6 @@ function probeOemAudioStack(opts) {
     };
 }
 
-/**
- * Parse a 16-bit PCM WAV buffer and compute Left/Right dBFS RMS to detect Driver (Left) vs Passenger (Right) speaker.
- */
 function analyzeStereoMicBuffer(buf, opts) {
     const o = Object.assign({
         swapChannels: false,
@@ -153,7 +151,7 @@ function analyzeStereoMicBuffer(buf, opts) {
     }, opts || {});
 
     if (!Buffer.isBuffer(buf) || buf.length < 64) {
-        return { channels: 0, sampleRate: 16000, durationMs: 0, leftDb: -90, rightDb: -90, speakerZone: 'driver', confidence: 0 };
+        return { channels: 0, sampleRate: 16000, durationMs: 0, leftDb: -90, rightDb: -90, peak: 0, speakerZone: 'driver', confidence: 0 };
     }
 
     let offset = 0;
@@ -180,20 +178,25 @@ function analyzeStereoMicBuffer(buf, opts) {
     }
 
     if (bitsPerSample !== 16 || (channels !== 1 && channels !== 2)) {
-        return { channels, sampleRate, durationMs: 0, leftDb: -40, rightDb: -40, speakerZone: 'driver', confidence: 0.2 };
+        return { channels, sampleRate, durationMs: 0, leftDb: -40, rightDb: -40, peak: 100, speakerZone: 'driver', confidence: 0.2 };
     }
 
     const bytesPerFrame = channels * 2;
     const totalFrames = Math.floor((buf.length - offset) / bytesPerFrame);
     if (totalFrames <= 0) {
-        return { channels, sampleRate, durationMs: 0, leftDb: -90, rightDb: -90, speakerZone: 'driver', confidence: 0 };
+        return { channels, sampleRate, durationMs: 0, leftDb: -90, rightDb: -90, peak: 0, speakerZone: 'driver', confidence: 0 };
     }
 
-    let sumSqL = 0, sumSqR = 0;
+    let sumSqL = 0, sumSqR = 0, peak = 0;
     for (let i = 0; i < totalFrames; i++) {
         const base = offset + i * bytesPerFrame;
-        const sL = buf.readInt16LE(base) / 32768.0;
-        const sR = channels === 2 ? (buf.readInt16LE(base + 2) / 32768.0) : sL;
+        const rawL = buf.readInt16LE(base);
+        const rawR = channels === 2 ? buf.readInt16LE(base + 2) : rawL;
+        const absL = Math.abs(rawL), absR = Math.abs(rawR);
+        if (absL > peak) peak = absL;
+        if (absR > peak) peak = absR;
+        const sL = rawL / 32768.0;
+        const sR = rawR / 32768.0;
         sumSqL += sL * sL;
         sumSqR += sR * sR;
     }
@@ -215,6 +218,7 @@ function analyzeStereoMicBuffer(buf, opts) {
             durationMs,
             leftDb: driverDb,
             rightDb: driverDb,
+            peak,
             speakerZone: 'driver',
             confidence: 0.5,
         };
@@ -226,8 +230,8 @@ function analyzeStereoMicBuffer(buf, opts) {
     let confidence = 0.5;
 
     if (peakDb < o.noiseFloorDb) {
-        speakerZone = 'cabin';
-        confidence = 0.1;
+        speakerZone = 'driver';
+        confidence = 0.2;
     } else if (diffDb >= o.zoneThresholdDb) {
         speakerZone = 'driver';
         confidence = Math.min(0.99, +(0.55 + (diffDb / 15)).toFixed(2));
@@ -245,6 +249,7 @@ function analyzeStereoMicBuffer(buf, opts) {
         durationMs,
         leftDb: driverDb,
         rightDb: passengerDb,
+        peak,
         speakerZone,
         confidence,
     };
@@ -277,46 +282,13 @@ function buildStereoWav(leftSamples, rightSamples, sampleRate) {
     return buf;
 }
 
-/**
- * Capture a bounded WAV clip from the OEM ceiling mic via `mgu-python` + `libasound.so.2` (or `arecord` fallback),
- * automatically connecting/disconnecting any required GENIVI AudioManager mic route and yielding on phone calls.
- */
-async function captureCeilingMicClip(opts) {
-    const o = Object.assign({
-        mguPython: MGU_PYTHON,
-        smartxHelper: SMARTX_HELPER,
-        arecordBin: 'arecord',
-        device: 'avb:MGU_GW_3_SOURCE_CF_2MIC_6REF',
-        rate: 24000,
-        hwChannels: 1,
-        amRoute: null,
-        connectAmRoute: null,
-        disconnectAmRoute: null,
-        durationSec: 4,
-        outFile: '/run/bimmer-ai/capture.wav',
-        swapChannels: false,
-        isCallActive: () => false,
-    }, opts || {});
-
-    if (o.isCallActive()) {
-        throw new Error('Đang có cuộc gọi điện thoại / CarPlay — Bimmer AI tự nhường Mic zin.');
+async function captureSingleDevice(profile, o) {
+    let routeToken = null;
+    if (profile.amRoute && typeof o.connectAmRoute === 'function') {
+        try { routeToken = await o.connectAmRoute(profile.amRoute); } catch (e) { routeToken = null; }
     }
 
-    // Look up matching SmartX profile metadata if device matches one of our known pipes
-    for (let i = 0; i < SMARTX_PROFILES.length; i++) {
-        if (SMARTX_PROFILES[i].hw === o.device) {
-            o.rate = SMARTX_PROFILES[i].rate;
-            o.hwChannels = SMARTX_PROFILES[i].hwChannels;
-            if (!o.amRoute) o.amRoute = SMARTX_PROFILES[i].amRoute;
-            break;
-        }
-    }
-
-    let connId = null;
-    if (o.amRoute && typeof o.connectAmRoute === 'function') {
-        try { connId = await o.connectAmRoute(o.amRoute); } catch (e) { connId = null; }
-    }
-
+    unlinkSafe(o.outFile);
     const usePythonLibasound = fs.existsSync(o.mguPython) && fs.existsSync(o.smartxHelper);
 
     try {
@@ -325,15 +297,15 @@ async function captureCeilingMicClip(opts) {
             if (usePythonLibasound) {
                 child = cp.spawn(o.mguPython, [
                     o.smartxHelper,
-                    String(o.device),
+                    String(profile.hw),
                     o.outFile,
                     String(Math.max(1, Math.min(10, o.durationSec))),
-                    String(o.rate || 24000),
-                    String(o.hwChannels || 1),
+                    String(profile.rate || 24000),
+                    String(profile.hwChannels || 1),
                 ], { stdio: ['ignore', 'pipe', 'pipe'] });
             } else {
                 child = cp.spawn(o.arecordBin, [
-                    '-q', '-D', String(o.device), '-f', 'S16_LE', '-c', '2', '-r', '16000',
+                    '-q', '-D', String(profile.hw), '-f', 'S16_LE', '-c', '2', '-r', '16000',
                     '-d', String(Math.max(1, Math.min(10, Math.round(o.durationSec)))), '-t', 'wav', o.outFile,
                 ], { stdio: ['ignore', 'pipe', 'pipe'] });
             }
@@ -348,8 +320,8 @@ async function captureCeilingMicClip(opts) {
             }, 150);
 
             const timer = setTimeout(() => {
-                try { child.kill('SIGTERM'); } catch (e) {}
-            }, (o.durationSec + 3) * 1000);
+                try { child.kill('SIGKILL'); } catch (e) {}
+            }, Math.round((o.durationSec + 2.2) * 1000));
 
             child.stdout.on('data', (d) => { out += d.toString('utf8'); });
             child.stderr.on('data', (d) => { out += d.toString('utf8'); });
@@ -361,22 +333,117 @@ async function captureCeilingMicClip(opts) {
             child.on('close', (code) => {
                 clearInterval(callWatch);
                 clearTimeout(timer);
-                if (abortedForCall) return reject(new Error('Đã ngắt thu âm ngay lập tức để nhường Mic cho cuộc gọi.'));
-                if (code !== 0 && !fs.existsSync(o.outFile)) {
-                    return reject(new Error('Thu âm (' + o.device + '): ' + (out.trim() || ('exit ' + code))));
+                if (abortedForCall) {
+                    const abortErr = new Error('Đã ngắt thu âm ngay lập tức để nhường Mic cho cuộc gọi.');
+                    abortErr.callAborted = true;
+                    return reject(abortErr);
                 }
-                resolve();
+                if (code !== 0 || !fs.existsSync(o.outFile)) {
+                    let detail = out.trim();
+                    try {
+                        const j = JSON.parse(detail);
+                        if (j && j.error) detail = j.error;
+                    } catch (e) {}
+                    return reject(new Error(profile.hw + ': ' + (detail || ('exit ' + code))));
+                }
+                resolve(out);
             });
         });
-    } finally {
-        if (connId !== null && typeof o.disconnectAmRoute === 'function') {
-            try { await o.disconnectAmRoute(connId); } catch (e) {}
+    } catch (err) {
+        if (routeToken && routeToken.created && routeToken.connId !== null && typeof o.disconnectAmRoute === 'function') {
+            try { await o.disconnectAmRoute(routeToken.connId); } catch (e) {}
         }
+        throw err;
+    }
+
+    if (routeToken && routeToken.created && routeToken.connId !== null && typeof o.disconnectAmRoute === 'function') {
+        try { await o.disconnectAmRoute(routeToken.connId); } catch (e) {}
     }
 
     const wav = fs.readFileSync(o.outFile);
     const analysis = analyzeStereoMicBuffer(wav, { swapChannels: o.swapChannels });
-    return { wavBuffer: wav, file: o.outFile, analysis };
+    return { wavBuffer: wav, file: o.outFile, deviceUsed: profile.hw, analysis };
+}
+
+/**
+ * Capture a bounded WAV clip from the OEM ceiling mic with automatic SmartXbar failover.
+ */
+async function captureCeilingMicClip(opts) {
+    const o = Object.assign({
+        mguPython: MGU_PYTHON,
+        smartxHelper: SMARTX_HELPER,
+        arecordBin: 'arecord',
+        device: 'auto',
+        rate: 24000,
+        hwChannels: 1,
+        amRoute: null,
+        connectAmRoute: null,
+        disconnectAmRoute: null,
+        durationSec: 4,
+        outFile: '/run/bimmer-ai/capture.wav',
+        swapChannels: false,
+        isCallActive: () => false,
+        onLog: null,
+    }, opts || {});
+
+    if (o.isCallActive()) {
+        throw new Error('Đang có cuộc gọi điện thoại / CarPlay — Bimmer AI tự nhường Mic zin.');
+    }
+
+    // Build ordered candidate list (prefer `lastWorkingHw`, then all present SmartX pipes)
+    const candidates = [];
+    const addCandidate = (prof) => {
+        if (!prof || !prof.hw) return;
+        for (let i = 0; i < candidates.length; i++) {
+            if (candidates[i].hw === prof.hw) return;
+        }
+        candidates.push(prof);
+    };
+
+    if (o.device && o.device !== 'auto') {
+        let matched = null;
+        for (let i = 0; i < SMARTX_PROFILES.length; i++) {
+            if (SMARTX_PROFILES[i].hw === o.device) { matched = SMARTX_PROFILES[i]; break; }
+        }
+        addCandidate(matched || { hw: o.device, rate: o.rate || 24000, hwChannels: o.hwChannels || 1, amRoute: o.amRoute });
+    }
+
+    if (lastWorkingHw) {
+        for (let i = 0; i < SMARTX_PROFILES.length; i++) {
+            if (SMARTX_PROFILES[i].hw === lastWorkingHw) addCandidate(SMARTX_PROFILES[i]);
+        }
+    }
+
+    const smartxNodes = listDirSafe('/run/smartx');
+    SMARTX_PROFILES.forEach((p) => {
+        if (!smartxNodes.length || smartxNodes.indexOf(p.match) >= 0) {
+            addCandidate(p);
+        }
+    });
+
+    const errors = [];
+    let bestZeroClip = null;
+
+    for (let idx = 0; idx < candidates.length; idx++) {
+        const cand = candidates[idx];
+        try {
+            const clip = await captureSingleDevice(cand, o);
+            if (clip.analysis.peak > 0) {
+                lastWorkingHw = cand.hw;
+                if (o.onLog) o.onLog('mic capture ok on ' + cand.hw + ' (peak=' + clip.analysis.peak + ', L=' + clip.analysis.leftDb + 'dB, R=' + clip.analysis.rightDb + 'dB)');
+                return clip;
+            }
+            if (!bestZeroClip) bestZeroClip = clip;
+            errors.push(cand.hw + ': digital zero (peak=0)');
+        } catch (err) {
+            if (err && err.callAborted) throw err;
+            errors.push(err.message);
+            if (o.onLog) o.onLog('mic failover (' + err.message + ')');
+        }
+    }
+
+    if (bestZeroClip) return bestZeroClip;
+    throw new Error(errors.join(' | ') || 'Không tìm thấy luồng Mic trần SmartX khả dụng');
 }
 
 async function synthesizeVietnameseMp3(text, uplinkOpts, uplinkModule) {

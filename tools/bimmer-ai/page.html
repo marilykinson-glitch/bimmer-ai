@@ -247,8 +247,9 @@
           <label>Cách gọi trên vô-lăng & Tên xưng hô:</label>
           <div style="display:flex;gap:8px">
             <select id="cfgPtt" style="flex:1">
-              <option value="short_press">Nhấn 1 lần nút Mic vô-lăng</option>
-              <option value="double_press">Nhấn đúp nút Mic vô-lăng</option>
+              <option value="short_press">Nhấn nút Mic vô-lăng (Bất kỳ)</option>
+              <option value="long_press">Nhấn giữ nút Mic &gt; 0.7 giây</option>
+              <option value="double_press">Nhấn đúp 2 lần nhanh</option>
               <option value="disabled">Tắt nút vô-lăng</option>
             </select>
             <input id="cfgOwner" placeholder="Đại ca" style="width:120px">
@@ -333,19 +334,19 @@
 
   function triggerCarCeilingMic() {
     var btn = document.getElementById('btnCarMic');
-    if (latestState && latestState.settings && !latestState.settings.hasApiKey && !latestState.simMode) {
-      document.getElementById('lastReply').textContent = '⚠️ Để thu âm tự do từ Mic trần xe BMW, hãy dán Gemini API Key ở khung Cấu hình bên phải (miễn phí tại aistudio.google.com/apikey) rồi bấm Lưu! Hoặc chạm ô nhập chữ rồi bấm nút 🎙️ trên bàn phím điện thoại để nói Offline ngay.';
-      document.getElementById('cfgApiKey').focus();
-      return;
-    }
+    var hasKey = !!(latestState && latestState.settings && latestState.settings.hasApiKey);
+    var sec = hasKey ? ((latestState && latestState.settings && latestState.settings.micDurationSec) || 4) : 2;
     btn.className = 'btn btn-mic rec';
-    btn.textContent = '🔴 Nghe 4s...';
-    document.getElementById('lastReply').textContent = '🎙️ Đang thu âm 4 giây từ cặp Mic trần trên xe — đại ca nói lệnh luôn đi!';
+    btn.textContent = '🔴 Nghe ' + sec + 's...';
+    document.getElementById('lastReply').textContent = '🎙️ Đang thu âm ' + sec + ' giây từ cặp Mic trần trên xe — đại ca nói lệnh luôn đi!';
     api('/api/audio/ptt', 'POST', {}).then(function(res) {
       btn.className = 'btn btn-mic';
       btn.textContent = '🚘 Mic Xe';
       if (res && res.state) renderState(res.state);
       if (res && res.turn) playTtsOrFallback(res.turn);
+      if (!hasKey && res && res.ok) {
+        document.getElementById('cfgApiKey').focus();
+      }
     }).catch(function() {
       btn.className = 'btn btn-mic';
       btn.textContent = '🚘 Mic Xe';

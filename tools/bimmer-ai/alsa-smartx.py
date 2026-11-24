@@ -1,26 +1,28 @@
 #!/usr/bin/env python3
 """
-alsa-smartx.py - Native ALSA / Intel SmartXbar PCM WAV recorder for BMW MGU (iDrive 7).
+alsa-smartx.py - Non-blocking ALSA / Intel SmartXbar PCM WAV recorder for BMW MGU (iDrive 7).
 
-Runs on `/var/opt/mgu-python/current/bin/python3` using `/usr/lib/libasound.so.2` via `ctypes`
-(since Yocto Linux on MGU uses Intel SmartXbar `/run/smartx` and does not ship `arecord`).
-
-Supports:
-  - 1-channel 24 kHz Hardware ECNR streams (`smartx:VoiceNotesSink_CF_24_MONO`, `smartx:AndroidAutoSink_CF_24_MONO`)
-  - Multi-channel 2-Mic streams (`avb:MGU_GW_3_SOURCE_CF_2MIC_6REF`, `smartx:SpeechSink_CF_2MIC_1REF_SPEECH`)
-    extracting Channel 0 (Driver ceiling mic) and Channel 1 (Passenger ceiling mic) into a standard 2-channel WAV!
+Key reliability guarantees:
+  1. Keeps `SND_PCM_NONBLOCK` enabled with a 0.9s first-frame watchdog + full duration deadline so
+     unrouted or busy SmartX/AVB pipes fail fast (<0.9s) instead of hanging inside `libasound.so.2`.
+  2. Extracts Ch0 (Driver ceiling mic) + Ch1 (Passenger ceiling mic) from 3ch/8ch pipes and
+     downsamples 48 kHz -> 16 kHz (`3:1`) for fast upload over mobile hotspot.
+  3. Reports exact `frames` and `peak` amplitude so `audio-io.js` can automatically fail over
+     if a pipe returns digital zeros (`peak == 0`).
 """
+import array
 import ctypes
 import json
 import os
-import struct
 import sys
+import time
 import wave
 
 SND_PCM_STREAM_CAPTURE = 1
 SND_PCM_NONBLOCK = 1
 SND_PCM_FORMAT_S16_LE = 2
 SND_PCM_ACCESS_RW_INTERLEAVED = 3
+EAGAIN = -11
 
 
 def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels=1):
@@ -33,66 +35,103 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
         err = asound.snd_strerror(rc).decode("utf-8", "replace")
         raise RuntimeError(f"snd_pcm_open({device}): {err} ({rc})")
 
+    hw_rate = int(rate)
+    hw_ch = max(1, int(hw_channels))
+    decim = 3 if hw_rate == 48000 else 1
+    out_rate = hw_rate // decim
+    out_channels = 2 if hw_ch >= 2 else 1
+
     try:
-        asound.snd_pcm_nonblock(pcm, 0)
+        asound.snd_pcm_nonblock(pcm, 1)
         rc = asound.snd_pcm_set_params(
             pcm,
             SND_PCM_FORMAT_S16_LE,
             SND_PCM_ACCESS_RW_INTERLEAVED,
-            int(hw_channels),
-            int(rate),
+            hw_ch,
+            hw_rate,
             1,
             100000,
         )
         if rc < 0:
             err = asound.snd_strerror(rc).decode("utf-8", "replace")
-            raise RuntimeError(f"snd_pcm_set_params({device}, ch={hw_channels}, rate={rate}): {err} ({rc})")
+            raise RuntimeError(f"snd_pcm_set_params({device}, ch={hw_ch}, rate={hw_rate}): {err} ({rc})")
 
-        total_frames = max(1600, int(float(duration_sec) * int(rate)))
-        chunk_frames = min(2400, total_frames)
-        bytes_per_frame = int(hw_channels) * 2
+        asound.snd_pcm_prepare(pcm)
+        asound.snd_pcm_start(pcm)
+
+        total_hw_frames = max(2400, int(float(duration_sec) * hw_rate))
+        chunk_frames = min(2400, total_hw_frames)
+        bytes_per_frame = hw_ch * 2
         buf = ctypes.create_string_buffer(chunk_frames * bytes_per_frame)
 
-        out_channels = 2 if int(hw_channels) >= 2 else 1
         collected = bytearray()
         frames_read = 0
+        frame_idx = 0
+        t0 = time.monotonic()
+        first_frame_deadline = t0 + 0.90
+        hard_deadline = t0 + float(duration_sec) + 1.40
 
-        while frames_read < total_frames:
-            want = min(chunk_frames, total_frames - frames_read)
-            got = asound.snd_pcm_readi(pcm, buf, want)
-            if got < 0:
-                got = asound.snd_pcm_recover(pcm, got, 1)
-                if got < 0:
-                    break
-                continue
-            if got == 0:
+        while frames_read < total_hw_frames:
+            now = time.monotonic()
+            if frames_read == 0 and now > first_frame_deadline:
+                raise RuntimeError(f"no audio frames within 0.9s on {device}")
+            if now > hard_deadline:
                 break
+
+            want = min(chunk_frames, total_hw_frames - frames_read)
+            got = asound.snd_pcm_readi(pcm, buf, want)
+            if got == EAGAIN or got == 0:
+                time.sleep(0.012)
+                continue
+            if got < 0:
+                rec = asound.snd_pcm_recover(pcm, got, 1)
+                if rec < 0:
+                    err = asound.snd_strerror(got).decode("utf-8", "replace")
+                    raise RuntimeError(f"snd_pcm_readi({device}): {err} ({got})")
+                time.sleep(0.010)
+                continue
+
             raw = buf.raw[: got * bytes_per_frame]
-            if int(hw_channels) <= 2:
+            if hw_ch == 1 and decim == 1:
+                collected.extend(raw)
+            elif hw_ch == 2 and decim == 1:
                 collected.extend(raw)
             else:
-                # Extract Ch0 (Driver Mic) and Ch1 (Passenger Mic) from 2MIC_1REF (3ch) or 2MIC_6REF (8ch)
-                step = bytes_per_frame
-                for off in range(0, len(raw), step):
-                    collected.extend(raw[off : off + 4])
+                sample_bytes = 4 if out_channels == 2 else 2
+                for f in range(got):
+                    if decim == 1 or (frame_idx % decim) == 0:
+                        off = f * bytes_per_frame
+                        collected.extend(raw[off : off + sample_bytes])
+                    frame_idx += 1
             frames_read += got
     finally:
         asound.snd_pcm_close(pcm)
 
-    tmp_path = out_wav + ".tmp"
+    out_frames = len(collected) // (out_channels * 2)
+    if out_frames < max(800, out_rate // 5):
+        raise RuntimeError(f"insufficient frames ({out_frames}) from {device}")
+
+    samples = array.array("h")
+    samples.frombytes(collected)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    peak = max((abs(x) for x in samples), default=0)
+
+    tmp_path = out_wav + ".tmp." + str(os.getpid())
     with wave.open(tmp_path, "wb") as wf:
         wf.setnchannels(out_channels)
         wf.setsampwidth(2)
-        wf.setframerate(int(rate))
+        wf.setframerate(out_rate)
         wf.writeframes(bytes(collected))
     os.replace(tmp_path, out_wav)
 
     return {
         "ok": True,
         "device": device,
-        "frames": frames_read,
-        "sampleRate": int(rate),
+        "frames": out_frames,
+        "sampleRate": out_rate,
         "channels": out_channels,
+        "peak": int(peak),
         "bytes": len(collected),
     }
 

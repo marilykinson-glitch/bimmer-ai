@@ -37,6 +37,15 @@ const mkdirp = (d) => {
     try { fs.mkdirSync(d); } catch (e) { if (e.code !== 'EEXIST') throw e; }
 };
 
+const NODE22_BIN = '/var/opt/jap-node22/current/bin/node';
+
+function defaultFetchCmd() {
+    if (fs.existsSync(NODE22_BIN)) {
+        return [NODE22_BIN, '--max-http-header-size=65536', __filename, '--fetch'];
+    }
+    return [process.execPath, __filename, '--fetch'];
+}
+
 function options(over) {
     return Object.assign({
         stateDir: '/var/opt/bimmer-ai/state',
@@ -47,7 +56,7 @@ function options(over) {
         mainapps: MAINAPPS,
         lease: '/run/mgu-uplink/lease.json',
         route: '/proc/net/route',
-        fetchCmd: [process.execPath, __filename, '--fetch'],
+        fetchCmd: defaultFetchCmd(),
         noSetuid: false,
         baseUrl: '',
         log: () => {},
