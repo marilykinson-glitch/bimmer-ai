@@ -21,40 +21,67 @@ const SMARTX_HELPER = path.join(__dirname, 'alsa-smartx.py');
 
 const SMARTX_PROFILES = [
     {
+        match: 'smartx_SpeechSink_CF_2MIC_6REF_c',
+        hw: 'smartx:SpeechSink_CF_2MIC_6REF',
+        rate: 24000,
+        hwChannels: 8,
+        amRoute: { sourceID: 129, sinkID: 387 },
+        label: 'Cặp Mic trần 2 vùng SpeechSink 6-Ref Harman/B&W (2MIC_6REF · 24kHz)',
+        score: 99,
+    },
+    {
         match: 'smartx_SpeechSink_CF_2MIC_1REF_SPEECH_c',
         hw: 'smartx:SpeechSink_CF_2MIC_1REF_SPEECH',
         rate: 24000,
         hwChannels: 3,
         amRoute: { sourceID: 129, sinkID: 387 },
-        label: 'Cặp Mic trần 2 vùng SpeechSink (2MIC_1REF · Phân biệt Tài/Phụ)',
-        score: 98,
+        label: 'Cặp Mic trần 2 vùng SpeechSink 1-Ref (2MIC_1REF · 24kHz)',
+        score: 97,
+    },
+    {
+        match: 'smartx_SpeechSink_CF_1MIC_6REF_c',
+        hw: 'smartx:SpeechSink_CF_1MIC_6REF',
+        rate: 24000,
+        hwChannels: 7,
+        amRoute: { sourceID: 129, sinkID: 387 },
+        label: 'Mic trần SpeechSink 6-Ref (1MIC_6REF · 24kHz)',
+        score: 95,
+    },
+    {
+        match: 'smartx_FingerPrintSink_CF_48_STEREO_c',
+        hw: 'smartx:FingerPrintSink_CF_48_STEREO',
+        rate: 48000,
+        hwChannels: 2,
+        amRoute: { sourceID: 129, sinkID: 256 },
+        label: 'Cổng Mic nhận diện âm thanh FingerPrintSink (48->16kHz Stereo)',
+        score: 93,
+    },
+    {
+        match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_6REF_c',
+        hw: 'avb:MGU_GW_3_SOURCE_CF_2MIC_6REF',
+        rate: 24000,
+        hwChannels: 8,
+        amRoute: null,
+        label: 'Cặp Mic trần 2 vùng trực tiếp RAM AVB (2MIC_6REF · 24kHz)',
+        score: 91,
+    },
+    {
+        match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_1REF_SPEECH_c',
+        hw: 'avb:MGU_GW_3_SOURCE_CF_2MIC_1REF_SPEECH',
+        rate: 24000,
+        hwChannels: 3,
+        amRoute: null,
+        label: 'Cặp Mic trần 2 vùng trực tiếp RAM AVB (2MIC_1REF · 24kHz)',
+        score: 89,
     },
     {
         match: 'smartx_VoiceNotesSink_CF_24_MONO_c',
         hw: 'smartx:VoiceNotesSink_CF_24_MONO',
         rate: 24000,
         hwChannels: 1,
-        amRoute: { sourceID: 389, sinkID: 389, fallbackSourceID: 129 },
-        label: 'Mic trần khử ồn Harman ECNR 24kHz (VoiceNotesSink)',
-        score: 95,
-    },
-    {
-        match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_6REF_c',
-        hw: 'avb:MGU_GW_3_SOURCE_CF_2MIC_6REF',
-        rate: 48000,
-        hwChannels: 8,
-        amRoute: null,
-        label: 'Cặp Mic trần 2 vùng + 6 kênh khử vọng (AVB 2MIC_6REF)',
-        score: 91,
-    },
-    {
-        match: 'smartx_AndroidAutoSink_CF_24_MONO_c',
-        hw: 'smartx:AndroidAutoSink_CF_24_MONO',
-        rate: 24000,
-        hwChannels: 1,
-        amRoute: { sourceID: 389, sinkID: 390, fallbackSourceID: 129 },
-        label: 'Mic trần khử ồn Harman ECNR 24kHz (AndroidAutoSink)',
-        score: 88,
+        amRoute: { sourceID: 129, sinkID: 389 },
+        label: 'Mic trần Harman ECNR 24kHz (VoiceNotesSink)',
+        score: 85,
     },
 ];
 
@@ -422,7 +449,6 @@ async function captureCeilingMicClip(opts) {
     });
 
     const errors = [];
-    let bestZeroClip = null;
 
     for (let idx = 0; idx < candidates.length; idx++) {
         const cand = candidates[idx];
@@ -433,7 +459,6 @@ async function captureCeilingMicClip(opts) {
                 if (o.onLog) o.onLog('mic capture ok on ' + cand.hw + ' (peak=' + clip.analysis.peak + ', L=' + clip.analysis.leftDb + 'dB, R=' + clip.analysis.rightDb + 'dB)');
                 return clip;
             }
-            if (!bestZeroClip) bestZeroClip = clip;
             errors.push(cand.hw + ': digital zero (peak=0)');
         } catch (err) {
             if (err && err.callAborted) throw err;
@@ -442,7 +467,6 @@ async function captureCeilingMicClip(opts) {
         }
     }
 
-    if (bestZeroClip) return bestZeroClip;
     throw new Error(errors.join(' | ') || 'Không tìm thấy luồng Mic trần SmartX khả dụng');
 }
 

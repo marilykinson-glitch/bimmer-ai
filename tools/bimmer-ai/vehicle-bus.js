@@ -770,8 +770,10 @@ class VehicleController {
                 const sinks = await this.proxies.audioCmd.callMethod('getListMainSinks', {}, 2500);
                 const list = (sinks && sinks.listMainSinks) || [];
                 for (let i = 0; i < list.length; i++) {
-                    if (list[i].sinkID === 1 && typeof list[i].volume === 'number') {
-                        this.state.media.volumePercent = list[i].volume;
+                    if (list[i].sinkID === 1) {
+                        if (typeof list[i].volume === 'number' && list[i].volume > 0) {
+                            this.state.media.volumePercent = list[i].volume;
+                        }
                         this.state.media.muted = list[i].muteState === 'MS_MUTED' || list[i].muteState === 1;
                     }
                 }
@@ -869,16 +871,26 @@ class VehicleController {
         }
         let routeTok = null;
         try {
-            routeTok = await this.connectAudioRoute({ sourceID: 1046, sinkID: 1024 });
-            await this.proxies.mediaPlayer.callMethod('playFile', { path: mp3File, languageCode: 0 }, 3500);
+            const retryDelays = [0, 220, 450];
+            for (let di = 0; di < retryDelays.length; di++) {
+                if (retryDelays[di]) await new Promise((r) => setTimeout(r, retryDelays[di]));
+                routeTok = await this.connectAudioRoute({ sourceID: 1046, sinkID: 1024 });
+                if (routeTok) break;
+            }
+            const pf = await this.proxies.mediaPlayer.callMethod('playFile', { path: mp3File, languageCode: 7695972 }, 4000);
+            if (pf && pf.EntError && pf.EntError !== 'OK' && pf.EntError !== 0) {
+                throw new Error('playFile ' + pf.EntError);
+            }
             setTimeout(() => {
+                this.callMethodIfAvailable('mediaPlayer', 'sendButtonEvent', { button: 'STOP', action: 'PRESS' }).catch(() => {});
                 if (routeTok && routeTok.created && routeTok.connId !== null) {
                     this.disconnectAudioRoute(routeTok.connId).catch(() => {});
                 }
                 this.pulseIpaLight('off').catch(() => {});
-            }, 3800);
+            }, 4200);
             return true;
         } catch (e) {
+            this.log('playTtsOnCarSpeakers warning: ' + e.message);
             if (routeTok && routeTok.created && routeTok.connId !== null) {
                 await this.disconnectAudioRoute(routeTok.connId);
             }

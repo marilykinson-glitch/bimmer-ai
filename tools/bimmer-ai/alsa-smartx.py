@@ -39,6 +39,37 @@ signal.signal(signal.SIGTERM, _handle_sig)
 signal.signal(signal.SIGINT, _handle_sig)
 
 
+def _load_asound():
+    asound = ctypes.CDLL("libasound.so.2")
+    asound.snd_strerror.argtypes = [ctypes.c_int]
+    asound.snd_strerror.restype = ctypes.c_char_p
+    asound.snd_pcm_open.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_char_p, ctypes.c_int, ctypes.c_int]
+    asound.snd_pcm_open.restype = ctypes.c_int
+    asound.snd_pcm_nonblock.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    asound.snd_pcm_nonblock.restype = ctypes.c_int
+    asound.snd_pcm_set_params.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.c_uint,
+        ctypes.c_uint,
+        ctypes.c_int,
+        ctypes.c_uint,
+    ]
+    asound.snd_pcm_set_params.restype = ctypes.c_int
+    asound.snd_pcm_prepare.argtypes = [ctypes.c_void_p]
+    asound.snd_pcm_prepare.restype = ctypes.c_int
+    asound.snd_pcm_start.argtypes = [ctypes.c_void_p]
+    asound.snd_pcm_start.restype = ctypes.c_int
+    asound.snd_pcm_readi.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
+    asound.snd_pcm_readi.restype = ctypes.c_long
+    asound.snd_pcm_recover.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
+    asound.snd_pcm_recover.restype = ctypes.c_int
+    asound.snd_pcm_close.argtypes = [ctypes.c_void_p]
+    asound.snd_pcm_close.restype = ctypes.c_int
+    return asound
+
+
 def _open_alsa_capture(asound, device, hw_rate, hw_ch):
     pcm = ctypes.c_void_p()
     rc = asound.snd_pcm_open(ctypes.byref(pcm), device.encode("utf-8"), SND_PCM_STREAM_CAPTURE, SND_PCM_NONBLOCK)
@@ -119,8 +150,7 @@ def _fast_chunk_db_and_peak(pcm_bytes):
 
 
 def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels=1):
-    asound = ctypes.CDLL("libasound.so.2")
-    asound.snd_strerror.restype = ctypes.c_char_p
+    asound = _load_asound()
 
     hw_rate = int(rate)
     hw_ch = max(1, int(hw_channels))
@@ -138,14 +168,17 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
         collected = bytearray()
         frames_read = 0
         frame_idx = 0
+        saw_nonzero = False
+        zero_frames = 0
+        max_zero_frames = int(hw_rate * 0.35)  # Fail over in 0.35s if pipe outputs pure digital zeros!
         t0 = time.monotonic()
-        first_frame_deadline = t0 + 0.90
+        first_frame_deadline = t0 + 0.75
         hard_deadline = t0 + float(duration_sec) + 1.40
 
         while frames_read < total_hw_frames and not STOP_FLAG:
             now = time.monotonic()
             if frames_read == 0 and now > first_frame_deadline:
-                raise RuntimeError(f"no audio frames within 0.9s on {device}")
+                raise RuntimeError(f"no audio frames within 0.75s on {device}")
             if now > hard_deadline:
                 break
 
@@ -155,15 +188,23 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
                 time.sleep(0.012)
                 continue
             if got < 0:
-                rec = asound.snd_pcm_recover(pcm, got, 1)
+                rec = asound.snd_pcm_recover(pcm, int(got), 1)
                 if rec < 0:
-                    err = asound.snd_strerror(got).decode("utf-8", "replace")
+                    err = asound.snd_strerror(int(got)).decode("utf-8", "replace")
                     raise RuntimeError(f"snd_pcm_readi({device}): {err} ({got})")
+                asound.snd_pcm_start(pcm)
                 time.sleep(0.010)
                 continue
 
             raw = buf.raw[: got * bytes_per_frame]
             chunk_out, frame_idx = _extract_pcm_chunk(raw, got, hw_ch, out_channels, decim, frame_idx)
+            if not saw_nonzero:
+                if any(b != 0 for b in chunk_out):
+                    saw_nonzero = True
+                else:
+                    zero_frames += got
+                    if zero_frames >= max_zero_frames:
+                        raise RuntimeError(f"digital zero stream (peak=0) on {device}")
             collected.extend(chunk_out)
             frames_read += got
     finally:
@@ -196,8 +237,7 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
     """
     Continuous low-CPU (<0.2%) VAD loop with 720ms pre-roll ring buffer for "Hey Bimmer" / "Ê Bimmer".
     """
-    asound = ctypes.CDLL("libasound.so.2")
-    asound.snd_strerror.restype = ctypes.c_char_p
+    asound = _load_asound()
 
     hw_rate = int(rate)
     hw_ch = max(1, int(hw_channels))
@@ -236,10 +276,11 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                 time.sleep(0.018)
                 continue
             if got < 0:
-                rec = asound.snd_pcm_recover(pcm, got, 1)
+                rec = asound.snd_pcm_recover(pcm, int(got), 1)
                 if rec < 0:
-                    err = asound.snd_strerror(got).decode("utf-8", "replace")
+                    err = asound.snd_strerror(int(got)).decode("utf-8", "replace")
                     raise RuntimeError(f"vad_read_err({device}): {err} ({got})")
+                asound.snd_pcm_start(pcm)
                 time.sleep(0.015)
                 continue
 

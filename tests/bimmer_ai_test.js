@@ -511,9 +511,30 @@ async function runAllTests() {
             Module._load = origLoad;
         }
 
-        // 1. Primary SmartX profile MUST be 2-Zone Stereo `SpeechSink_CF_2MIC_1REF_SPEECH` (`hwChannels: 3`)
-        assert.strictEqual(AudioIO.SMARTX_PROFILES[0].hw, 'smartx:SpeechSink_CF_2MIC_1REF_SPEECH');
-        assert.strictEqual(AudioIO.SMARTX_PROFILES[0].hwChannels, 3);
+        // 1. Primary SmartX profile MUST be 2-Zone 6-Ref Stereo `SpeechSink_CF_2MIC_6REF` (`hwChannels: 8, rate: 24000`)
+        assert.strictEqual(AudioIO.SMARTX_PROFILES[0].hw, 'smartx:SpeechSink_CF_2MIC_6REF');
+        assert.strictEqual(AudioIO.SMARTX_PROFILES[0].hwChannels, 8);
+        assert.strictEqual(AudioIO.SMARTX_PROFILES[0].rate, 24000);
+        assert.strictEqual(AudioIO.SMARTX_PROFILES[1].hw, 'smartx:SpeechSink_CF_2MIC_1REF_SPEECH');
+
+        // 1b. Node 22 `autoSelectFamily` `{ all: true }` DNS `customLookup` regression test (fixes `ERR_INVALID_IP_ADDRESS: undefined`)
+        const UpMod = require('../tools/bimmer-ai/uplink');
+        const lookupFn = UpMod.customLookup('', '', ['1.1.1.1']);
+        await new Promise((resolve, reject) => {
+            lookupFn('127.0.0.1', { all: true }, (err, res) => {
+                if (err) return reject(err);
+                assert.ok(Array.isArray(res) && res[0].address === '127.0.0.1' && res[0].family === 4);
+                resolve();
+            });
+        });
+        await new Promise((resolve, reject) => {
+            lookupFn('127.0.0.1', {}, (err, addr, fam) => {
+                if (err) return reject(err);
+                assert.strictEqual(addr, '127.0.0.1');
+                assert.strictEqual(fam, 4);
+                resolve();
+            });
+        });
 
         // 2. Casual "BMW" / "Bim" chatter rejected, while fillers + "Hey BMW" + "Trợ lý ơi" + stripped remainder work!
         assert.strictEqual(AiBrain.extractWakeCommand('BMW mới ra bản CS đẹp quá').matched, false);

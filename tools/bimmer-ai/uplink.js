@@ -154,12 +154,24 @@ function dnsServers(leaseFile, routeFile) {
     return out;
 }
 
-function customLookup(leaseFile, routeFile) {
-    const servers = dnsServers(leaseFile, routeFile);
+function customLookup(leaseFile, routeFile, preResolvedServers) {
+    const servers = Array.isArray(preResolvedServers) && preResolvedServers.length
+        ? preResolvedServers
+        : dnsServers(leaseFile, routeFile);
     if (!servers.length) return undefined;
     return function (host, opts, cb) {
-        if (typeof opts === 'function') cb = opts;
-        if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return cb(null, host, 4);
+        if (typeof opts === 'function') {
+            cb = opts;
+            opts = {};
+        }
+        const wantAll = !!(opts && opts.all);
+        const deliver = (ips) => {
+            if (wantAll) {
+                return cb(null, ips.map((address) => ({ address, family: 4 })));
+            }
+            return cb(null, ips[0], 4);
+        };
+        if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return deliver([host]);
         let idx = 0;
         const tryNext = (lastErr) => {
             if (idx >= servers.length) return cb(lastErr || new Error('DNS failed for ' + host));
@@ -172,7 +184,7 @@ function customLookup(leaseFile, routeFile) {
                 done = true;
                 clearTimeout(timer);
                 if (err || !ips || !ips.length) return tryNext(err || new Error('no A record'));
-                cb(null, ips[0], 4);
+                deliver(ips);
             });
         };
         tryNext(null);
@@ -203,6 +215,8 @@ function doHttp(q, lookup, strictTls) {
             reqOpts = {
                 host: String(q.host),
                 servername: String(q.host),
+                family: 4,
+                autoSelectFamily: false,
                 path: String(q.path),
                 method: q.method || (bodyBuf ? 'POST' : 'GET'),
                 headers,
@@ -284,7 +298,8 @@ function request(o, reqSpec) {
                 bodyBase64: r.bodyBase64 || '',
             });
         });
-        child.stdin.end(JSON.stringify(Object.assign({}, reqSpec, { lease: o.lease, route: o.route })));
+        const servers = dnsServers(o.lease, o.route);
+        child.stdin.end(JSON.stringify(Object.assign({}, reqSpec, { lease: o.lease, route: o.route, dns: servers })));
     });
 }
 
@@ -296,7 +311,7 @@ if (require.main === module && process.argv[2] === '--fetch') {
         let q;
         try { q = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch (e) { return out({ error: 'bad request' }); }
         if (!/^[a-z0-9.-]+$/i.test(String(q.host)) || String(q.path).charAt(0) !== '/') return out({ error: 'bad host/path' });
-        doHttpWithTlsFallback(q, customLookup(q.lease, q.route))
+        doHttpWithTlsFallback(q, customLookup(q.lease, q.route, q.dns))
             .then(out, (e) => out({ error: e.code ? e.code + ' ' + e.message : e.message }));
     });
 }
@@ -308,5 +323,6 @@ module.exports = {
     mainappRanges,
     takenIds,
     dnsServers,
+    customLookup,
     request,
 };
