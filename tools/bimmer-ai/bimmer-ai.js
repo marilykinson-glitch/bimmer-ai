@@ -27,7 +27,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.3.0';
+const VERSION = '0.3.1';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 

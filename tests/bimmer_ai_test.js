@@ -232,6 +232,47 @@ async function runAllTests() {
         await new Promise((r) => mockGemini.close(r));
     });
 
+    await step('SP18 Franca Schema Coercer (`coerceByDataRef`) & Seat Memory NLU', async () => {
+        const mockDatatypes = {
+            'de.bmw.ClimateTypes.OperationOnDR': {
+                type: 'enum',
+                defaultValue: 3,
+                items: { AUS: 0, EIN: 1, KEINE_AUSWAHL: 2, SIGNAL_UNBEFUELLT: 3 },
+            },
+            'de.bmw.ClimateTypes.OperationManualBlowerLevel': {
+                type: 'enum',
+                defaultValue: 15,
+                items: { STUFE_1: 1, STUFE_2: 2, STUFE_3: 3, SIGNAL_UNBEFUELLT: 15 },
+            },
+            'de.bmw.ClimateTypes.OperationAirConditioningFrontWrapper': {
+                type: 'struct',
+                members: [
+                    { name: 'operationOnDR', dataRef: 'de.bmw.ClimateTypes.OperationOnDR', defaultValue: 3 },
+                    { name: 'operationTemperatureTargetDR', dataRef: 'UInt8', defaultValue: 255 },
+                    { name: 'operationManualBlowerLevelDR', dataRef: 'de.bmw.ClimateTypes.OperationManualBlowerLevel', defaultValue: 15 },
+                ],
+            },
+        };
+        const coerced = VehicleBus.coerceByDataRef(
+            mockDatatypes,
+            'de.bmw.ClimateTypes.OperationAirConditioningFrontWrapper',
+            { operationTemperatureTargetDR: 44, operationManualBlowerLevelDR: 3 }
+        );
+        assert.strictEqual(coerced.operationOnDR, 'SIGNAL_UNBEFUELLT');
+        assert.strictEqual(coerced.operationTemperatureTargetDR, 44);
+        assert.strictEqual(coerced.operationManualBlowerLevelDR, 'STUFE_3');
+
+        const vc = new VehicleBus.VehicleController();
+        const memTurn = await AiBrain.processAssistantTurn({
+            text: 'Gọi nhớ ghế số 2 đi',
+            speakerZone: 'driver',
+            vehicleController: vc,
+        });
+        assert.strictEqual(memTurn.actions.length, 1);
+        assert.strictEqual(memTurn.actions[0].tool, 'set_seat_comfort');
+        assert.ok(memTurn.replyVi.indexOf('nhớ ghế số 2') >= 0);
+    });
+
     console.log('\nALL ' + passed + ' TEST SUITES PASSED!');
 }
 

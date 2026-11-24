@@ -58,6 +58,7 @@ const TOOL_DECLARATIONS = [
                 massage: { type: 'BOOLEAN', description: 'Bật hoặc tắt massage ghế' },
                 wheelHeat: { type: 'BOOLEAN', description: 'Bật hoặc tắt sưởi vô-lăng' },
                 gentlemanMove: { type: 'BOOLEAN', description: 'Dịch gọn ghế phụ lên trước (chỉ khi xe đỗ P)' },
+                memorySlot: { type: 'NUMBER', description: 'Gọi vị trí nhớ ghế số 1, 2 hoặc 3' },
             },
         },
     },
@@ -254,8 +255,13 @@ function parseOfflineVietnameseIntents(rawText, speakerZone) {
     if (/\bsuoi vo\s*lang\b/.test(s)) {
         seatArgs.wheelHeat = !/\btat\s+suoi vo\s*lang\b/.test(s);
     }
-    if (/\bdich ghe phu|gentleman\b/.test(s)) {
+    if (/\bdich ghe phu|ghe ong chu|gentleman\b/.test(s)) {
         seatArgs.gentlemanMove = true;
+    }
+    const memM = /\bnho\s+ghe\s*(?:so\s*)?([123])\b/.exec(s);
+    if (memM) {
+        seatArgs.seat = zoneHint;
+        seatArgs.memorySlot = Number(memM[1]);
     }
     if (Object.keys(seatArgs).length > 0) calls.push({ name: 'set_seat_comfort', args: seatArgs });
 
