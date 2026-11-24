@@ -170,13 +170,14 @@
         </div>
 
         <div class="chips">
-          <span class="chip" onclick="quickAsk('Trời nóng quá, bật Max AC, làm mát ghế rồi đổi đèn sang xanh băng', 'driver')">❄️ Hạ nhiệt + Đèn xanh băng</span>
-          <span class="chip" onclick="quickAsk('Lạnh quá tăng nhiệt độ với bật sưởi ghế cho em', 'passenger')">🔥 [Ghế Phụ] Kêu lạnh</span>
-          <span class="chip" onclick="quickAsk('Chế độ chill đêm rồi mở nhạc Lofi trên YouTube đi', 'driver')">🟣 Chill đêm + YouTube Lofi</span>
-          <span class="chip" onclick="quickAsk('Mở van bô cho nổ giòn thử coi', 'driver')">🏎️ Mở van bô (Check dầu 75°C)</span>
-          <span class="chip" onclick="quickAsk('Mở cốp với mở chốt cửa xe đi', 'driver')">🔓 Mở cốp & cửa (Test khoá tốc độ)</span>
-          <span class="chip" onclick="quickAsk('Chế độ rạp phim đợi vợ', 'driver')">🎬 Rạp phim (Số P)</span>
-          <span class="chip" onclick="quickAsk('Khám sức khoẻ xe xem bình 12V với áp suất lốp sao rồi', 'driver')">🩺 Khám sức khoẻ xe</span>
+          <span class="chip" onclick="quickAsk('Đổi đèn viền sang màu tím độ sáng 90%', 'driver')">🟣 Đổi đèn Tím 90%</span>
+          <span class="chip" onclick="quickAsk('Chỉnh điều hoà 20 độ mức gió 4', 'driver')">❄️ Điều hoà 20°C + Gió 4</span>
+          <span class="chip" onclick="quickAsk('Lạnh quá tăng nhiệt độ với bật sưởi ghế cho em', 'passenger')">🔥 [Ghế Phụ] Tăng nhiệt + Sưởi</span>
+          <span class="chip" onclick="quickAsk('Âm lượng 35% rồi mở nhạc Lofi trên YouTube đi', 'driver')">🎵 Loa 35% + YouTube Lofi</span>
+          <span class="chip" onclick="quickAsk('Mở chốt cửa xe đi', 'driver')">🔓 Mở chốt cửa xe</span>
+          <span class="chip" onclick="quickAsk('Khoá cửa xe lại', 'driver')">🔒 Khoá chốt cửa</span>
+          <span class="chip" onclick="quickAsk('Hé cửa sổ trời ra', 'driver')">🌤️ Hé cửa sổ trời</span>
+          <span class="chip" onclick="quickAsk('Khám sức khoẻ xe xem bình 12V với xăng dầu ổn không', 'driver')">🩺 Khám sức khoẻ xe</span>
         </div>
 
         <div class="reply-card">
@@ -422,10 +423,12 @@
     gb.className = 'badge ' + (moving ? 'warn' : 'ok');
 
     var ap = s.audioProbe || {};
-    document.getElementById('micProbeBadge').textContent = ap.hasAlsaCapture ? ('Mic ALSA: ' + ap.recommendedDevice) : 'Mic: Trình duyệt / Mô phỏng';
-    document.getElementById('alsaInfo').textContent = ap.hasAlsaCapture
-      ? ('Đã tìm thấy ' + ap.captureStreams.length + ' luồng thu ALSA. Khuyên dùng: ' + ap.recommendedDevice)
-      : 'Trên Mac dùng nút 🎤 Nói (trình duyệt). Khi cài lên đầu BMW MGU sẽ tự bắt luồng /proc/asound/pcm của cặp Mic trần.';
+    var availCount = (t.availableProxies && t.availableProxies.length) || 0;
+    document.getElementById('micProbeBadge').textContent = ap.hasAlsaCapture ? ('Mic: ' + ap.recommendedDevice.split(':').pop().slice(0, 18)) : 'Mic: Mô phỏng';
+    document.getElementById('alsaInfo').textContent =
+      (t.liveCar ? ('SOME/IP sống (' + availCount + ' cổng: ' + (t.availableProxies || []).join(', ') + ')' + (t.lastBusTrace ? (' · Lệnh cuối: ' + t.lastBusTrace) : ''))
+                 : 'Chế độ mô phỏng trên máy tính.') +
+      (ap.hasAlsaCapture ? (' | Mic ALSA: ' + ap.recommendedDevice) : '');
 
     var who = turn.speakerZone === 'passenger' ? '[GHẾ PHỤ]' : '[GHẾ TÀI]';
     document.getElementById('lastTranscript').textContent = who + ' ' + (turn.transcript || '');
@@ -433,8 +436,9 @@
 
     var tagsHtml = '';
     (turn.actions || []).forEach(function(act) {
-      var cls = act.blocked ? 'act-tag blocked' : (act.deferred ? 'act-tag deferred' : 'act-tag');
-      var pfx = act.blocked ? '⛔ Chặn: ' : (act.deferred ? '⏳ Hẹn điều kiện: ' : '✅ ');
+      var failed = !act.ok || act.blocked;
+      var cls = failed ? 'act-tag blocked' : (act.deferred ? 'act-tag deferred' : 'act-tag');
+      var pfx = act.blocked ? '⛔ Chặn an toàn: ' : (!act.ok ? '⚠️ Không hỗ trợ/Lỗi: ' : (act.deferred ? '⏳ Hẹn điều kiện: ' : '✅ Đã thực thi: '));
       tagsHtml += '<span class="' + cls + '">' + pfx + act.tool + '</span>';
     });
     document.getElementById('actionTags').innerHTML = tagsHtml;

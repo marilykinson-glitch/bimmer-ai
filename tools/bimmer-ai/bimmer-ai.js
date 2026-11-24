@@ -27,7 +27,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.2.0';
+const VERSION = '0.3.0';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -442,7 +442,7 @@ class BimmerAiDaemon {
             const prevVol = this.vehicle.state.media.volumePercent;
             const wasPlaying = this.vehicle.state.media.playing;
             if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
-                await this.vehicle.callProxySafe('audioCmd', 'setVolumeInPercent', {
+                await this.vehicle.callMethodIfAvailable('audioCmd', 'setVolumeInPercent', {
                     sourceID: 1046,
                     sinkID: 1,
                     percentValue: this.settings.duckVolumePercent,
@@ -464,7 +464,7 @@ class BimmerAiDaemon {
             }
             if (wasPlaying && prevVol > this.settings.duckVolumePercent) {
                 setTimeout(() => {
-                    this.vehicle.callProxySafe('audioCmd', 'setVolumeInPercent', {
+                    this.vehicle.callMethodIfAvailable('audioCmd', 'setVolumeInPercent', {
                         sourceID: 1046,
                         sinkID: 1,
                         percentValue: prevVol,
