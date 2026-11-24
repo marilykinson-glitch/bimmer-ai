@@ -668,12 +668,19 @@ class VehicleController {
             }
         });
 
-        // 2. Steering wheel Push-To-Talk button (`SteeringWheelPushButton`)
-        await bindService('steering', 'de.bmw.infotainment.controlelements.SteeringWheelPushButton', ['statusPTTButton1', 'statusSpecialFunctionButton'], [], (f, v) => {
-            if (!v) return;
+        // 2. Steering wheel Push-To-Talk button (`SteeringWheelPushButton` — unwrap any SP18 Franca struct member name)
+        await bindService('steering', 'de.bmw.infotainment.controlelements.SteeringWheelPushButton', [
+            'statusPTTButton1',
+            'statusSpecialFunctionButton',
+            'statusSpecialFunctionButton2',
+        ], [], (f, v) => {
+            if (v === null || v === undefined) return;
             let raw = v;
-            if (f === 'statusPTTButton1' && v.operationPushButtonPTTSteeringWheel !== undefined) raw = v.operationPushButtonPTTSteeringWheel;
-            if (f === 'statusSpecialFunctionButton' && v.operationPushButtonSpecialFunction !== undefined) raw = v.operationPushButtonSpecialFunction;
+            if (raw && typeof raw === 'object') {
+                const keys = Object.keys(raw);
+                if (!keys.length) return;
+                raw = raw[keys[0]];
+            }
             if (raw === null || raw === undefined) return;
             const sRaw = String(raw).toUpperCase();
             if (raw === 3 || raw === 15 || raw === 255 || /UNGUELTIG|UNBEFUELLT|INVALID/.test(sRaw)) return;

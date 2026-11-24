@@ -477,16 +477,16 @@ async function callGeminiApi(opts) {
                     'CHẾ ĐỘ NGHE NỀN RẢNH TAY (WAKE WORD "HEY BIMMER" / "Ê BIMMER"):',
                     '1. Hãy nghe đoạn thu âm từ micro trần xe BMW.',
                     '2. Kiểm tra xem người nói có chủ đích gọi trợ lý ở đầu câu bằng từ đánh thức ("Hey Bimmer", "Ê Bimmer", "Bimmer ơi", "Ơi Bimmer", "Ok Bimmer", "Hey BMW", "Trợ lý ơi", hoặc "Bimmer") hay không.',
-                    '3. Nếu người trong xe chỉ đang nói chuyện riêng với nhau (kể cả khi nhắc chữ xe BMW trong câu chuyện), hát, hoặc tạp âm mà KHÔNG gọi trợ lý: BẮT BUỘC trả về đúng chuỗi duy nhất "[IGNORE]" và TUYỆT ĐỐI KHÔNG gọi bất kỳ tool nào.',
+                    '3. Nếu đoạn thu âm chỉ là tiếng sôi/nhiễu nền, hoặc người trong xe nói chuyện riêng mà KHÔNG gọi trợ lý: BẮT BUỘC trả về đúng chuỗi duy nhất "[IGNORE]" và TUYỆT ĐỐI KHÔNG tự đoán chữ hay gọi bất kỳ tool nào.',
                     '4. Nếu người nói CHỈ gọi tên đánh thức ("Hey Bimmer", "Ê Bimmer", "Bimmer ơi") mà chưa nêu yêu cầu: trả về "[WAKE_ONLY] [TRANSCRIPT: Hey Bimmer] Dạ ' + (opts.ownerName || 'đại ca') + ' cần gì em?" và không gọi tool.',
-                    '5. Nếu người nói gọi tên đánh thức KÈM yêu cầu (ví dụ "Hey Bimmer chỉnh điều hoà 21 độ"): BẮT BUỘC mở đầu phần text bằng "[TRANSCRIPT: <nguyên văn câu người nói bao gồm cả từ Hey Bimmer>]", gọi các tool tương ứng, và trả lời ngắn gọn bằng tiếng Việt.',
+                    '5. Chỉ khi nghe RÕ RÀNG tên đánh thức KÈM yêu cầu thật sự của người nói: mở đầu bằng "[TRANSCRIPT: <nguyên văn câu nghe được>]", gọi đúng tool tương ứng và trả lời ngắn gọn bằng tiếng Việt.',
                 ].join('\n'),
             });
         } else {
             userParts.push({
                 text: opts.text
                     ? ('Người ngồi trên xe nói: "' + opts.text + '"')
-                    : 'Đoạn thu âm này do tài xế CHỦ ĐỘNG BẤM NÚT RA LỆNH GIỌNG NÓI (KHÔNG được trả về [IGNORE]). Hãy nghe hiểu câu tiếng Việt, gọi ngay các tool điều khiển xe phù hợp (nếu có), mở đầu bằng [TRANSCRIPT: <câu người dùng nói>] rồi trả lời ngắn gọn bằng tiếng Việt.',
+                    : 'Hãy nghe kỹ đoạn thu âm này. Nếu đoạn thu âm chỉ có tiếng sôi/nhiễu nền, bị đứt quãng hoặc KHÔNG nghe rõ tiếng người nói thật sự, BẮT BUỘC trả về đúng chuỗi duy nhất "[NO_SPEECH]" và TUYỆT ĐỐI KHÔNG tự bịa câu nói hay gọi bất kỳ tool nào. Chỉ khi nghe rõ câu tiếng Việt thật sự của người dùng, mở đầu bằng [TRANSCRIPT: <nguyên văn câu nghe được>], gọi tool tương ứng và trả lời ngắn gọn.',
             });
         }
     } else {
@@ -519,7 +519,7 @@ async function callGeminiApi(opts) {
     for (let mi = 0; mi < modelQueue.length; mi++) {
         const candModel = modelQueue[mi];
         const genCfg = {
-            temperature: 0.25,
+            temperature: opts.audioWavBase64 ? 0.0 : 0.25,
             maxOutputTokens: 1536,
         };
         if (/^gemini-2\.5/i.test(candModel)) {
@@ -596,11 +596,11 @@ async function callGeminiApi(opts) {
     let rawReply = textChunks.join(' ').trim();
     let ignored = false;
     let wakeOnly = false;
-    if (/\[\s*IGNORE\s*\]/i.test(rawReply) && toolCalls.length === 0) {
+    if (/\[\s*(?:IGNORE|NO_SPEECH)\s*\]/i.test(rawReply) && toolCalls.length === 0) {
         if (wakeMode) {
             ignored = true;
         }
-        rawReply = rawReply.replace(/\[\s*IGNORE\s*\]\s*/gi, '').trim();
+        rawReply = rawReply.replace(/\[\s*(?:IGNORE|NO_SPEECH)\s*\]\s*/gi, '').trim();
     }
     if (/\[\s*WAKE_ONLY\s*\]/i.test(rawReply)) {
         wakeOnly = true;
