@@ -28,7 +28,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.4.3';
+const VERSION = '0.4.4';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -69,7 +69,7 @@ function writeAtomic(file, data, mode) {
 function defaultSettings() {
     return {
         apiKey: '',
-        model: 'gemini-3.5-flash-lite',
+        model: 'gemini-3-flash-preview',
         ownerName: 'Đại ca',
         handsFreeWake: true,            // Always-on "Hey Bimmer" / "Ê Bimmer" ceiling-mic VAD listener
         pttTrigger: 'short_press',      // short_press | long_press | double_press | disabled
@@ -88,7 +88,7 @@ function normalizeModelName(rawModel, fallback) {
     const m = typeof rawModel === 'string' ? rawModel.trim() : '';
     if (!m) return fallback;
     if (/^gemini-(?:1\.5|2\.0|2\.5)-flash(?:-lite)?$/i.test(m)) {
-        return 'gemini-3.5-flash-lite';
+        return 'gemini-3-flash-preview';
     }
     return m;
 }

@@ -439,15 +439,15 @@ function extractWakeCommand(rawText) {
     return { matched: true, wakeOnly: false, remainder: stripped || remNorm };
 }
 
-const DEFAULT_GEMINI_MODEL = 'gemini-3.5-flash-lite';
+const DEFAULT_GEMINI_MODEL = 'gemini-3-flash-preview';
 const GEMINI_FALLBACK_MODELS = [
-    'gemini-3.5-flash-lite',
     'gemini-3-flash-preview',
+    'gemini-3.5-flash-lite',
     'gemini-3.1-flash-lite',
     'gemini-3.7-flash',
     'gemini-3.8-flash',
-    'gemini-flash-lite-latest',
     'gemini-flash-latest',
+    'gemini-flash-lite-latest',
 ];
 let lastHealthyGeminiModel = '';
 const retiredGeminiModels = {};
@@ -486,7 +486,7 @@ async function callGeminiApi(opts) {
             userParts.push({
                 text: opts.text
                     ? ('Người ngồi trên xe nói: "' + opts.text + '"')
-                    : 'Hãy nghe đoạn thu âm tiếng Việt từ micro trên trần xe này, thực thi các công cụ điều khiển xe phù hợp (nếu có), và trả lời ngắn gọn bằng tiếng Việt. Mở đầu phần text bằng định dạng [TRANSCRIPT: <câu người dùng nói>] rồi xuống dòng trả lời.',
+                    : 'Đoạn thu âm này do tài xế CHỦ ĐỘNG BẤM NÚT RA LỆNH GIỌNG NÓI (KHÔNG được trả về [IGNORE]). Hãy nghe hiểu câu tiếng Việt, gọi ngay các tool điều khiển xe phù hợp (nếu có), mở đầu bằng [TRANSCRIPT: <câu người dùng nói>] rồi trả lời ngắn gọn bằng tiếng Việt.',
             });
         }
     } else {
@@ -495,8 +495,10 @@ async function callGeminiApi(opts) {
 
     const contents = [];
     (opts.history || []).slice(-6).forEach((h) => {
-        if (h && h.user) contents.push({ role: 'user', parts: [{ text: h.user }] });
-        if (h && h.ai) contents.push({ role: 'model', parts: [{ text: h.ai }] });
+        if (!h || !h.user || !h.ai) return;
+        if (/\[\s*IGNORE/i.test(h.ai) || h.user === '(Thu âm giọng nói)') return;
+        contents.push({ role: 'user', parts: [{ text: h.user }] });
+        contents.push({ role: 'model', parts: [{ text: h.ai }] });
     });
     contents.push({ role: 'user', parts: userParts });
 
@@ -594,16 +596,19 @@ async function callGeminiApi(opts) {
     let rawReply = textChunks.join(' ').trim();
     let ignored = false;
     let wakeOnly = false;
-    if (/\[IGNORE\]/i.test(rawReply) && toolCalls.length === 0) {
-        ignored = true;
+    if (/\[\s*IGNORE\s*\]/i.test(rawReply) && toolCalls.length === 0) {
+        if (wakeMode) {
+            ignored = true;
+        }
+        rawReply = rawReply.replace(/\[\s*IGNORE\s*\]\s*/gi, '').trim();
     }
-    if (/\[WAKE_ONLY\]/i.test(rawReply)) {
+    if (/\[\s*WAKE_ONLY\s*\]/i.test(rawReply)) {
         wakeOnly = true;
-        rawReply = rawReply.replace(/\[WAKE_ONLY\]\s*/gi, '').trim();
+        rawReply = rawReply.replace(/\[\s*WAKE_ONLY\s*\]\s*/gi, '').trim();
     }
 
     let transcript = opts.text || '';
-    const trMatch = /\[TRANSCRIPT:\s*([^\]]+)\]\s*/i.exec(rawReply);
+    const trMatch = /\[\s*TRANSCRIPT\s*:\s*([^\]]+)\]\s*/i.exec(rawReply);
     if (trMatch) {
         if (!transcript) transcript = trMatch[1].trim();
         rawReply = rawReply.replace(trMatch[0], '').trim();
@@ -765,10 +770,12 @@ async function processAssistantTurn(params) {
     } else if (!finalReply) {
         if (!transcript && params.audioWavBase64 && !params.apiKey) {
             finalReply = 'Để nhận diện thu âm giọng nói tự do từ Mic trần, hãy nhập Gemini API Key trong trang QR (hoặc dùng nút Mic trình duyệt / gõ lệnh Offline ngay bên dưới).';
+        } else if (onlineError) {
+            finalReply = 'Đang mất kết nối mạng hoặc khoá API (' + onlineError.slice(0, 70) + '). Em vẫn sẵn sàng nhận các lệnh điều khiển xe Offline: mở nhạc, chỉnh điều hoà, đổi màu đèn, mở kính, khám xe!';
+        } else if (engine === 'gemini' && params.audioWavBase64) {
+            finalReply = 'Em chưa nghe rõ câu lệnh vừa rồi — đại ca đọc lại giúp em nhé!';
         } else {
-            finalReply = onlineError
-                ? ('Đang mất kết nối mạng hoặc khoá API (' + onlineError.slice(0, 70) + '). Em vẫn sẵn sàng nhận các lệnh điều khiển xe Offline: mở nhạc, chỉnh điều hoà, đổi màu đèn, mở kính, khám xe!')
-                : 'Em nghe rõ nhưng chưa khớp lệnh điều khiển xe Offline. Đại ca thử nói kiểu: "Chỉnh máy lạnh 22 độ", "Đổi đèn màu tím", "Mở nhạc Lofi trên YouTube", hoặc nhập Gemini API Key để chém gió mọi chủ đề nhé!';
+            finalReply = 'Em nghe rõ nhưng chưa khớp lệnh điều khiển xe Offline. Đại ca thử nói kiểu: "Chỉnh máy lạnh 22 độ", "Đổi đèn màu tím", "Mở nhạc Lofi trên YouTube", hoặc nhập Gemini API Key để chém gió mọi chủ đề nhé!';
         }
     }
 

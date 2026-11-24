@@ -343,7 +343,7 @@ async function runAllTests() {
         dm.pollHmiAppCommand();
         await new Promise((r) => setTimeout(r, 250));
 
-        assert.strictEqual(dm.settings.model, 'gemini-3.5-flash-lite'); // auto-migrated from retired 2.5-flash!
+        assert.strictEqual(dm.settings.model, 'gemini-3-flash-preview'); // auto-migrated from retired 2.5-flash!
         assert.ok(capturedReqBody && capturedReqBody.generationConfig);
         assert.strictEqual(capturedReqBody.generationConfig.thinkingConfig, undefined); // no invalid thinkingBudget on 3.x!
         assert.ok(dm.lastTurn.replyVi.indexOf('INTERNAL_THOUGHT') < 0);
@@ -381,7 +381,7 @@ async function runAllTests() {
             req.on('end', () => {
                 res.writeHead(200, { 'Content-Type': 'application/json' });
                 if (mode === 'ignore') {
-                    res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[IGNORE]' }] } }] }));
+                    res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[IGNORE ]' }] } }] }));
                 } else if (mode === 'wake_only') {
                     res.end(JSON.stringify({ candidates: [{ content: { parts: [{ text: '[WAKE_ONLY] [TRANSCRIPT: Hey Bimmer] Dạ Đại ca cần gì em?' }] } }] }));
                 } else {

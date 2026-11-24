@@ -127,7 +127,7 @@ def _write_wav_atomic(out_wav, out_channels, out_rate, pcm_bytes):
         raise
 
 
-def _fast_chunk_db_and_peak(pcm_bytes):
+def _fast_chunk_db_and_peak(pcm_bytes, channels=1):
     samples = array.array("h")
     samples.frombytes(pcm_bytes)
     if sys.byteorder != "little":
@@ -135,6 +135,18 @@ def _fast_chunk_db_and_peak(pcm_bytes):
     n = len(samples)
     if n == 0:
         return -90.0, 0
+    if channels == 2 and n >= 8:
+        sub_l = samples[0::4]
+        sub_r = samples[1::4]
+        peak_l = max((abs(x) for x in sub_l), default=0)
+        peak_r = max((abs(x) for x in sub_r), default=0)
+        rms_l = math.sqrt(sum(x * x for x in sub_l) / len(sub_l)) / 32768.0 if sub_l else 0.0
+        rms_r = math.sqrt(sum(x * x for x in sub_r) / len(sub_r)) / 32768.0 if sub_r else 0.0
+        rms = max(rms_l, rms_r)
+        peak = max(peak_l, peak_r)
+        db = 20.0 * math.log10(rms) if rms > 1e-5 else -90.0
+        return round(db, 1), int(peak)
+
     step = 4 if n >= 32 else 1
     sub = samples[::step]
     peak = 0
@@ -147,6 +159,49 @@ def _fast_chunk_db_and_peak(pcm_bytes):
     rms = math.sqrt(acc / len(sub)) / 32768.0
     db = 20.0 * math.log10(rms) if rms > 1e-5 else -90.0
     return round(db, 1), int(peak)
+
+
+def _condition_and_boost_pcm(pcm_bytes, out_channels):
+    """
+    Raw BMW MGU MEMS ceiling mics have ~24 dB headroom (normal speech sits around -37 dBFS, peak ~1000),
+    and 1-mic cars leave channel 1 at digital zero (-91 dBFS).
+    1. Collapse dead second channel (<25 peak) to centered mono so Gemini gets full amplitude & half upload size.
+    2. Apply clean linear AGC boost (up to 16x / +24 dB, target peak 22000) while preserving exact L/R dB ratio.
+    """
+    samples = array.array("h")
+    samples.frombytes(pcm_bytes)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    if not samples:
+        return pcm_bytes, out_channels, 0
+
+    if out_channels == 2 and len(samples) >= 4:
+        left = samples[0::2]
+        right = samples[1::2]
+        peak_l = max((abs(x) for x in left), default=0)
+        peak_r = max((abs(x) for x in right), default=0)
+        if peak_r < 25 and peak_l >= 60:
+            samples = left
+            out_channels = 1
+            peak = peak_l
+        elif peak_l < 25 and peak_r >= 60:
+            samples = right
+            out_channels = 1
+            peak = peak_r
+        else:
+            peak = max(peak_l, peak_r)
+    else:
+        peak = max((abs(x) for x in samples), default=0)
+
+    if 55 <= peak < 18000:
+        gain = min(16.0, 22000.0 / float(peak))
+        if gain > 1.25:
+            samples = array.array("h", (max(-32767, min(32767, int(x * gain))) for x in samples))
+            peak = min(32767, int(peak * gain))
+
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples.tobytes(), out_channels, int(peak)
 
 
 def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels=1):
@@ -214,17 +269,17 @@ def record_smartx_wav(device, out_wav, duration_sec=4.0, rate=24000, hw_channels
     if out_frames < max(800, out_rate // 5):
         raise RuntimeError(f"insufficient frames ({out_frames}) from {device}")
 
-    _, peak = _fast_chunk_db_and_peak(collected)
-    _write_wav_atomic(out_wav, out_channels, out_rate, bytes(collected))
+    final_pcm, final_ch, peak = _condition_and_boost_pcm(bytes(collected), out_channels)
+    _write_wav_atomic(out_wav, final_ch, out_rate, final_pcm)
 
     return {
         "ok": True,
         "device": device,
         "frames": out_frames,
         "sampleRate": out_rate,
-        "channels": out_channels,
+        "channels": final_ch,
         "peak": peak,
-        "bytes": len(collected),
+        "bytes": len(final_pcm),
     }
 
 
@@ -293,7 +348,7 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
             if not chunk_pcm:
                 continue
 
-            db, peak = _fast_chunk_db_and_peak(chunk_pcm)
+            db, peak = _fast_chunk_db_and_peak(chunk_pcm, out_channels)
             if peak == 0:
                 zero_Peak_streak += 1
                 if zero_Peak_streak == 25:  # 1.5s of pure digital zeros -> tell supervisor to try next pipe
@@ -301,9 +356,10 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
             else:
                 zero_Peak_streak = 0
 
-            # Dynamic threshold: at least -37 dBFS AND +9.5 dB above rolling cabin noise floor
-            thresh_db = max(-37.0, min(-18.0, noise_db + 9.5))
-            is_hot = (db >= thresh_db) and (peak >= 320)
+            # Raw BMW MEMS ceiling mics sit around -54 dBFS idle and -40..-30 dBFS normal speech:
+            # trigger cleanly at +6.5 dB above rolling cabin noise floor (floor -48 dBFS, peak >= 90)
+            thresh_db = max(-48.0, min(-20.0, noise_db + 6.5))
+            is_hot = (db >= thresh_db) and (peak >= 90)
 
             if not in_speech:
                 preroll.append(chunk_pcm)
@@ -341,9 +397,10 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
                     hot_streak = 0
                     quiet_streak = 0
 
-                    # Require >= 7 voiced chunks (~420ms actual voice) & >= 600ms total to ignore door slams / clicks
-                    if voiced_chunks >= 7 and dur_ms >= 600:
-                        _write_wav_atomic(out_wav, out_channels, out_rate, pcm_all)
+                    # Require >= 6 voiced chunks (~360ms actual voice) & >= 550ms total to catch quick "Hey Bimmer!" while ignoring clicks
+                    if voiced_chunks >= 6 and dur_ms >= 550:
+                        final_pcm, final_ch, _ = _condition_and_boost_pcm(pcm_all, out_channels)
+                        _write_wav_atomic(out_wav, final_ch, out_rate, final_pcm)
                         last_emit_at = time.monotonic()
                         emit_json({
                             "event": "utterance",
