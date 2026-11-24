@@ -164,8 +164,9 @@
         </div>
 
         <div class="cmd-row">
-          <button class="btn btn-mic" id="btnBrowserMic" onclick="toggleBrowserSpeech()">🎤 Nói</button>
-          <input id="cmdInput" placeholder="Nhập hoặc bấm Nói: ví dụ 'Trời nóng quá bật Max AC đổi đèn tím'..." onkeydown="if(event.key==='Enter')sendAsk()">
+          <button class="btn btn-mic" id="btnCarMic" onclick="triggerCarCeilingMic()" title="Thu âm 4 giây từ cặp Mic trần zin của xe">🚘 Mic Xe</button>
+          <button class="btn btn-mic" id="btnBrowserMic" onclick="toggleBrowserSpeech()" title="Nói qua trình duyệt hoặc bàn phím điện thoại">🎤 ĐT</button>
+          <input id="cmdInput" enterkeyhint="send" placeholder="Chạm ô này bấm 🎙️ trên bàn phím ĐT để đọc tiếng Việt..." onkeydown="if(event.key==='Enter')sendAsk()">
           <button class="btn btn-primary" onclick="sendAsk()">Gửi AI</button>
         </div>
 
@@ -330,27 +331,59 @@
 
   function quickAsk(txt, z) { sendAsk(txt, z); }
 
+  function triggerCarCeilingMic() {
+    var btn = document.getElementById('btnCarMic');
+    if (latestState && latestState.settings && !latestState.settings.hasApiKey && !latestState.simMode) {
+      document.getElementById('lastReply').textContent = '⚠️ Để thu âm tự do từ Mic trần xe BMW, hãy dán Gemini API Key ở khung Cấu hình bên phải (miễn phí tại aistudio.google.com/apikey) rồi bấm Lưu! Hoặc chạm ô nhập chữ rồi bấm nút 🎙️ trên bàn phím điện thoại để nói Offline ngay.';
+      document.getElementById('cfgApiKey').focus();
+      return;
+    }
+    btn.className = 'btn btn-mic rec';
+    btn.textContent = '🔴 Nghe 4s...';
+    document.getElementById('lastReply').textContent = '🎙️ Đang thu âm 4 giây từ cặp Mic trần trên xe — đại ca nói lệnh luôn đi!';
+    api('/api/audio/ptt', 'POST', {}).then(function(res) {
+      btn.className = 'btn btn-mic';
+      btn.textContent = '🚘 Mic Xe';
+      if (res && res.state) renderState(res.state);
+      if (res && res.turn) playTtsOrFallback(res.turn);
+    }).catch(function() {
+      btn.className = 'btn btn-mic';
+      btn.textContent = '🚘 Mic Xe';
+    });
+  }
+
+  function focusDictationHint() {
+    var inp = document.getElementById('cmdInput');
+    inp.focus();
+    document.getElementById('lastReply').textContent = '💡 Trên iPhone/Safari (mạng LAN không HTTPS): chỉ cần bấm nút Micro 🎙️ góc dưới bàn phím vừa hiện lên để đọc tiếng Việt rồi bấm Gửi AI!';
+  }
+
   function toggleBrowserSpeech() {
     var SR = window.SpeechRecognition || window.webkitSpeechRecognition;
     var btn = document.getElementById('btnBrowserMic');
-    if (!SR) {
-      alert('Trình duyệt này không hỗ trợ Web Speech trực tiếp. Hãy gõ câu lệnh hoặc bấm các chip thử nhanh!');
+    if (!SR || (location.protocol === 'http:' && location.hostname !== '127.0.0.1' && location.hostname !== 'localhost' && /iPhone|iPad|iPod/i.test(navigator.userAgent))) {
+      focusDictationHint();
       return;
     }
-    if (recObj) { recObj.stop(); recObj = null; btn.className = 'btn btn-mic'; btn.textContent = '🎤 Nói'; return; }
+    if (recObj) { recObj.stop(); recObj = null; btn.className = 'btn btn-mic'; btn.textContent = '🎤 ĐT'; return; }
     recObj = new SR();
     recObj.lang = 'vi-VN';
     recObj.interimResults = false;
     btn.className = 'btn btn-mic rec';
-    btn.textContent = '🔴 Đang nghe...';
+    btn.textContent = '🔴 Nghe...';
     recObj.onresult = function(e) {
       var transcript = e.results[0][0].transcript;
       document.getElementById('cmdInput').value = transcript;
       sendAsk(transcript, currentZone);
     };
-    recObj.onend = function() { recObj = null; btn.className = 'btn btn-mic'; btn.textContent = '🎤 Nói'; };
-    recObj.onerror = function() { recObj = null; btn.className = 'btn btn-mic'; btn.textContent = '🎤 Nói'; };
-    recObj.start();
+    recObj.onend = function() { recObj = null; btn.className = 'btn btn-mic'; btn.textContent = '🎤 ĐT'; };
+    recObj.onerror = function() {
+      recObj = null;
+      btn.className = 'btn btn-mic';
+      btn.textContent = '🎤 ĐT';
+      focusDictationHint();
+    };
+    try { recObj.start(); } catch (e) { focusDictationHint(); }
   }
 
   function pushSim() {
