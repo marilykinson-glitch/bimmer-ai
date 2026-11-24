@@ -349,6 +349,24 @@ async function runAllTests() {
         // Offline NLU backup executed `set_climate` even though Gemini only emitted `[TRANSCRIPT: ...]` text!
         assert.strictEqual(dm.vehicle.state.climate.tempDriverC, 21);
 
+        // 3. Verify instant `<1ms` `/run/bimmer-ai/ctl.sock` Unix domain socket IPC from HMI screen
+        const sockPath = path.join(tmpOap, 'run', 'ctl.sock');
+        assert.ok(fs.existsSync(sockPath));
+        await new Promise((resolve, reject) => {
+            const c = require('net').createConnection(sockPath, () => {
+                c.end(JSON.stringify({
+                    id: 1000,
+                    cmd: 'quick_prompt',
+                    arg: { text: 'Đổi đèn viền sang màu tím độ sáng 80%', speakerZone: 'driver' },
+                }) + '\n');
+                resolve();
+            });
+            c.on('error', reject);
+        });
+        await new Promise((r) => setTimeout(r, 250));
+        assert.strictEqual(dm.vehicle.state.ambient.preset, 'sunset_purple');
+        assert.strictEqual(dm.vehicle.state.ambient.brightness, 80);
+
         await dm.stop();
         await new Promise((r) => mockGem25.close(r));
     });

@@ -82,7 +82,7 @@ function drawVoiceAndQrPane(cv, G, t, lx, top, v, act) {
     cv.circle(cx, cy, pulseR + 8, G.withAlpha(orbColor, 0.18));
     cv.circle(cx, cy, pulseR, G.withAlpha(orbColor, 0.88));
     cv.circle(cx, cy, 10, '#ffffff');
-    if (cv.target && act.triggerMic) cv.target(lx, top, 104, 112, act.triggerMic, 'aiTapOrb');
+    if (cv.target && act.triggerMic) cv.target(lx, top, w, 112, act.triggerMic, 'aiTapOrb');
 
     const stateVi = state === 'listening' ? 'ĐANG NGHE MIC TRẦN…'
         : (state === 'thinking' ? 'ĐANG XỬ LÝ LỆNH…'
@@ -156,7 +156,7 @@ function draw(cv, G, t, v, act) {
 
     const lx = 48;
     const top = G.TOP + 16;
-    const bottom = (G.pageBottom ? G.pageBottom(cv) : G.BOTTOM) - 8;
+    const bottom = G.pageBottom(cv) - (cv.own ? G.MARGIN : 8);
 
     if (v.viewMode === 'guards') {
         drawGuardsPane(cv, G, t, lx, top, v.guards || {}, act);

@@ -16,6 +16,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
+const net = require('net');
 const http = require('http');
 const urlMod = require('url');
 const crypto = require('crypto');
@@ -27,7 +28,7 @@ const VehicleBus = require('./vehicle-bus');
 const AudioIO = require('./audio-io');
 const AiBrain = require('./ai-brain');
 
-const VERSION = '0.3.2';
+const VERSION = '0.3.3';
 const FW_TAG = 'bimmer-ai';
 const APP_RE = /^bimmer_ai\d*$/;
 
@@ -695,8 +696,48 @@ class BimmerAiDaemon {
         return sendJson(404, { ok: false, error: 'Not found' });
     }
 
+    startCtlSocket() {
+        const sockPath = path.join(this.cfg.run, 'ctl.sock');
+        try { fs.chmodSync(this.cfg.run, 0o755); } catch (e) {}
+        try { if (fs.existsSync(sockPath)) fs.unlinkSync(sockPath); } catch (e) {}
+        return new Promise((resolve) => {
+            const srv = net.createServer((client) => {
+                let buf = '';
+                client.setEncoding('utf8');
+                client.on('data', (chunk) => {
+                    buf += chunk;
+                    let idx;
+                    while ((idx = buf.indexOf('\n')) >= 0) {
+                        const line = buf.slice(0, idx).trim();
+                        buf = buf.slice(idx + 1);
+                        if (!line) continue;
+                        try {
+                            const c = JSON.parse(line);
+                            if (c && c.cmd) {
+                                if (c.id) this.lastCmdId = c.id;
+                                this.log('HMI ctl.sock command: ' + c.cmd);
+                                this.executeHmiCommand(c.cmd, c.arg || {}).catch((e) => this.log('ctl.sock error: ' + e.message));
+                            }
+                        } catch (e) {}
+                    }
+                });
+                client.on('error', () => {});
+            });
+            srv.on('error', (e) => {
+                this.log('ctl.sock warning: ' + e.message);
+                resolve(null);
+            });
+            srv.listen(sockPath, () => {
+                try { fs.chmodSync(sockPath, 0o666); } catch (e) {}
+                this.ctlServer = srv;
+                resolve(srv);
+            });
+        });
+    }
+
     async start() {
         this.installedApp = grantAppRamFolder(this.cfg.oap, this.cfg.run, this.cfg.proc);
+        await this.startCtlSocket();
         await this.vehicle.initHardwareBus();
         if (!this.cfg.noNft && !this.cfg.simMode) {
             await fwOpen(this.cfg.nft, this.cfg.port);
@@ -718,12 +759,18 @@ class BimmerAiDaemon {
         const actualAddr = this.server.address();
         if (actualAddr && actualAddr.port) this.cfg.port = actualAddr.port;
 
+        let tickCount = 0;
         this.pollTimer = setInterval(() => {
-            this.installedApp = grantAppRamFolder(this.cfg.oap, this.cfg.run, this.cfg.proc);
+            tickCount++;
+            if (tickCount % 4 === 1) {
+                this.installedApp = grantAppRamFolder(this.cfg.oap, this.cfg.run, this.cfg.proc);
+                this.vehicle.pollCompanionApps();
+            }
             this.pollHmiAppCommand();
-            this.vehicle.pollCompanionApps();
-            this.writeStatusFile();
-        }, 700);
+            if (tickCount % 2 === 0) {
+                this.writeStatusFile();
+            }
+        }, 250);
 
         this.writeStatusFile();
         this.log('listening on ' + this.portalUrl().url);
@@ -732,6 +779,11 @@ class BimmerAiDaemon {
 
     async stop() {
         if (this.pollTimer) clearInterval(this.pollTimer);
+        if (this.ctlServer) {
+            await new Promise((resolve) => this.ctlServer.close(resolve));
+            this.ctlServer = null;
+            try { fs.unlinkSync(path.join(this.cfg.run, 'ctl.sock')); } catch (e) {}
+        }
         if (this.server) {
             await new Promise((resolve) => this.server.close(resolve));
             this.server = null;
