@@ -1,8 +1,8 @@
 {
   "id": "bimmer_ai",
   "title": "Bimmer AI",
-  "description": "Trợ lý ảo Tiếng Việt & Giả lập Âm thanh Ống xả Bowers & Wilkins (6 động cơ ăn theo chế độ lái Sport/Comfort/Eco Pro) chạy trực tiếp trên BMW iDrive 7 (MGU): nghe từ Mic trần zin 2 vùng + nút Mic vô-lăng, điều khiển điều hoà, đèn nội thất RGB, cửa kính, rèm, ghế massage, pô B&W ASD, YouTube TV và đọc lỗi xe.",
-  "version": "0.6.0",
+  "description": "Trợ lý ảo Tiếng Việt chuyên sâu chạy trực tiếp trên BMW iDrive 7 (MGU): nghe từ Mic trần zin 2 vùng + nút Mic vô-lăng, điều khiển điều hoà, đèn nội thất RGB, cửa kính, rèm, ghế massage, YouTube TV và đọc lỗi xe với chốt an toàn thông minh.",
+  "version": "0.6.1",
   "vendor": "custom",
   "loggingId": "OAAI",
   "signals": {},
@@ -15,10 +15,6 @@
         [
           "BTN_MIC",
           "Nói lệnh AI"
-        ],
-        [
-          "BTN_ASD",
-          "Pô B&W"
         ],
         [
           "BTN_SCENE",

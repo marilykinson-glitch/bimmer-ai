@@ -348,10 +348,25 @@ function ensurePersistentWorker(o, uid) {
         seq: 0,
         pending: {},
         buf: '',
+        idleTimer: null,
     };
+    const resetIdle = () => {
+        if (state.idleTimer) clearTimeout(state.idleTimer);
+        state.idleTimer = setTimeout(() => {
+            if (!state.dead && Object.keys(state.pending).length === 0) {
+                state.dead = true;
+                if (o._worker === state) o._worker = null;
+                try { child.kill('SIGTERM'); } catch (e) {}
+            }
+        }, 90000);
+        if (state.idleTimer && typeof state.idleTimer.unref === 'function') state.idleTimer.unref();
+    };
+    resetIdle();
+    state.resetIdle = resetIdle;
     const failAll = (err) => {
         if (state.dead) return;
         state.dead = true;
+        if (state.idleTimer) { clearTimeout(state.idleTimer); state.idleTimer = null; }
         if (o._worker === state) o._worker = null;
         const pendingMap = state.pending;
         state.pending = {};
@@ -406,6 +421,7 @@ function request(o, reqSpec) {
     if (!worker) {
         return Promise.reject(new Error('cannot start uplink worker'));
     }
+    if (worker.resetIdle) worker.resetIdle();
     return new Promise((resolve, reject) => {
         const id = ++worker.seq;
         const timer = setTimeout(() => {
@@ -477,6 +493,8 @@ function close(o) {
 }
 
 if (require.main === module && process.argv[2] === '--worker') {
+    process.on('uncaughtException', () => {});
+    process.on('unhandledRejection', () => {});
     let inBuf = '';
     process.stdin.setEncoding('utf8');
     process.stdin.on('data', (chunk) => {
@@ -493,7 +511,10 @@ if (require.main === module && process.argv[2] === '--worker') {
             if (Array.isArray(msg.warmup)) {
                 const lk = customLookup(msg.lease, msg.route, msg.dns);
                 Promise.all(msg.warmup.map((h) => prewarmHost(h, lk)))
-                    .then(() => process.stdout.write(JSON.stringify({ id, res: { ok: true } }) + '\n'));
+                    .then(
+                        () => process.stdout.write(JSON.stringify({ id, res: { ok: true } }) + '\n'),
+                        () => process.stdout.write(JSON.stringify({ id, res: { ok: false } }) + '\n')
+                    );
                 continue;
             }
             const q = msg.q || {};
@@ -510,6 +531,8 @@ if (require.main === module && process.argv[2] === '--worker') {
     });
     process.stdin.on('end', () => process.exit(0));
 } else if (require.main === module && process.argv[2] === '--fetch') {
+    process.on('uncaughtException', () => process.exit(0));
+    process.on('unhandledRejection', () => process.exit(0));
     const chunks = [];
     const out = (o) => process.stdout.write(JSON.stringify(o), () => process.exit(0));
     process.stdin.on('data', (d) => chunks.push(d));

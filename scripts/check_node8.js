@@ -18,7 +18,6 @@ const FILES = [
     'tools/bimmer-ai/safety-gate.js',
     'tools/bimmer-ai/vehicle-bus.js',
     'tools/bimmer-ai/audio-io.js',
-    'tools/bimmer-ai/asd-synth.js',
     'tools/bimmer-ai/ai-brain.js',
     'tools/bimmer-ai/uplink.js',
 ];

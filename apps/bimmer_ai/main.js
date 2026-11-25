@@ -1,14 +1,15 @@
 'use strict';
 /**
- * main.js - iDrive 7 60fps App Entry Point for Bimmer AI (`apps/bimmer_ai`, `v0.6.0`).
+ * main.js - Instant Zero-Lag iDrive 7 App Entry Point for Bimmer AI (`apps/bimmer_ai`, `v0.6.1`).
  *
- * Key architecture:
- *   1. Instant `<1ms` Unix domain socket IPC (`/run/bimmer-ai/ctl.sock`, `0666`) with automatic fallback
- *      to `/run/bimmer-ai/app/command.json` and `<dataDir>/command.json`.
- *   2. Immediate `<16ms` optimistic visual feedback on screen (`ĐANG NGHE MIC TRẦN…`, `Pô B&W (ASD)` selection, etc.).
- *   3. Full support for touch + iDrive rotary controller + 3 header tabs (`Trợ lý Bimmer AI`, `Pô B&W (ASD)`, `Quyền an toàn`).
+ * Key Performance & Stability Guarantees:
+ *   1. Asynchronous background polling of compact `/run/bimmer-ai/hmi.json` (~1.1 KB) outside `render()` —
+ *      zero synchronous `fs.readFileSync` inside `render()` or `ctx.onTab`.
+ *   2. Software-path `lastSoftWords` short-circuit: skips `new Canvas(1600, 520)` + `play()` completely when
+ *      recorded GPU/Recorder words haven't changed (`0.0%` idle CPU on both GPU and non-GPU MGU setups).
+ *   3. Instant `<1ms` Unix domain socket IPC (`/run/bimmer-ai/ctl.sock`) with optimistic visual feedback.
  *
- * Node 8 compatible.
+ * Node 8 (ES2017) compatible.
  */
 const fs = require('fs');
 const net = require('net');
@@ -19,23 +20,21 @@ const { Recorder } = require('./kit/record');
 const UI = require('./ui');
 
 const RUN = process.env.BA_RUN || '/run/bimmer-ai';
-const STALE_MS = 8000;
+const STALE_MS = 10000;
 const SCENES = ['chill đêm', 'hạ nhiệt', 'rạp phim', 'thể thao', 'mặc định'];
-const SHORT_NAMES = {
-    m5_v8: 'M5 V8 S63',
-    m3_s58: 'M3/M4 I6 S58',
-    amg_v8: 'AMG V8 4.0',
-    gt3_flat6: '911 GT3 F6',
-    v10_na: 'Supercar V10',
-    iconic_m: 'IconicSounds M',
-};
 
 mgu.run({
     async start(ctx) {
         const { ui, log } = ctx;
-        const version = (ctx.spec && ctx.spec.version) ? ('Bản ' + ctx.spec.version) : 'Bản 0.6.0';
-        let status = null, readAt = 0, cmdId = Date.now();
+        const version = (ctx.spec && ctx.spec.version) ? ('Bản ' + ctx.spec.version) : 'Bản 0.6.1';
+        let status = null, cmdId = Date.now();
         let viewMode = 'main', sceneIdx = 0, animTick = 0;
+        let lastStatusSig = '';
+        let pollingStatus = false;
+
+        // Software-path frame-skip cache (`0%` CPU when steady on non-GPU MGU setups)
+        let lastSoftWords = null;
+        let lastSoftPushAt = 0;
 
         // Instant optimistic feedback before daemon status roundtrip completes
         let pendingUntil = 0;
@@ -44,8 +43,6 @@ mgu.run({
         let pendingTurn = null;
         let optimisticHandsFree = null;
         let optimisticHandsFreeUntil = 0;
-        let optimisticAsd = null;
-        let optimisticAsdUntil = 0;
 
         const localGuards = {
             locksAndTrunk: true,
@@ -55,37 +52,18 @@ mgu.run({
             mediaAndYoutube: true,
             exhaustAndDiag: true,
         };
-        const localAsd = {
-            enabled: false,
-            engine: 'm5_v8',
-            engineShort: 'M5 V8 S63',
-            volumePercent: 75,
-            modeFollow: true,
-            burbles: true,
-            effectiveMode: 'comfort',
-            effectiveModeLabel: 'COMFORT',
-            modeGainPercent: 65,
-            revDemoActive: false,
-        };
         let localTurn = {
             speakerZone: 'driver',
-            transcript: 'Bật giả lập tiếng pô BMW M5 V8',
-            replyVi: 'Sẵn sàng! Chạm tab "Pô B&W (ASD)" hoặc đọc lệnh để bật/tắt 6 tiếng động cơ ăn theo chế độ lái.',
+            transcript: 'Chỉnh điều hoà 22 độ với đổi đèn viền tím',
+            replyVi: 'Sẵn sàng! Bấm "Nói lệnh AI", nút Mic vô-lăng hoặc quét cổng QR để ra lệnh tiếng Việt.',
         };
 
-        function readStatus(now) {
-            if (now - readAt < 220) return;
-            readAt = now;
-            let s = null;
-            try { s = JSON.parse(fs.readFileSync(path.join(RUN, 'status.json'), 'utf8')); } catch (e) { s = null; }
-            status = (s && typeof s.at === 'number' && Math.abs(now - s.at) < STALE_MS) ? s : null;
+        function applyParsedStatus(s, now) {
+            const fresh = (s && typeof s.at === 'number' && Math.abs(now - s.at) < STALE_MS) ? s : null;
+            status = fresh;
             if (status && pendingUntil > 0) {
                 const curTurnAt = (status.lastTurn && status.lastTurn.at) || 0;
-                if (status.assistantState && status.assistantState !== 'idle') {
-                    pendingUntil = 0;
-                    pendingTurn = null;
-                    pendingState = '';
-                } else if (curTurnAt > pendingBaseTurnAt) {
+                if ((status.assistantState && status.assistantState !== 'idle') || curTurnAt > pendingBaseTurnAt) {
                     pendingUntil = 0;
                     pendingTurn = null;
                     pendingState = '';
@@ -93,20 +71,53 @@ mgu.run({
             }
         }
 
-        function currentAsdState() {
-            const base = (status && status.asd) || localAsd;
-            return Object.assign({}, base, optimisticAsd || {});
+        function readInitialStatusSync() {
+            const now = Date.now();
+            const hmiFile = path.join(RUN, 'hmi.json');
+            const fullFile = path.join(RUN, 'status.json');
+            let raw = '';
+            try { raw = fs.readFileSync(hmiFile, 'utf8'); } catch (e) {
+                try { raw = fs.readFileSync(fullFile, 'utf8'); } catch (e2) { raw = ''; }
+            }
+            if (!raw) return;
+            try {
+                const parsed = JSON.parse(raw);
+                applyParsedStatus(parsed, now);
+                lastStatusSig = JSON.stringify(Object.assign({}, parsed, { at: 0 }));
+            } catch (e) {}
         }
 
-        function patchOptimisticAsd(patch, holdMs) {
-            const cur = currentAsdState();
-            const next = Object.assign({}, cur, patch || {});
-            if (next.engine && SHORT_NAMES[next.engine]) {
-                next.engineShort = SHORT_NAMES[next.engine];
-            }
-            Object.assign(localAsd, next);
-            optimisticAsd = next;
-            optimisticAsdUntil = Date.now() + (holdMs || 1800);
+        function pollStatusAsync() {
+            if (pollingStatus) return;
+            pollingStatus = true;
+            const hmiFile = path.join(RUN, 'hmi.json');
+            const fullFile = path.join(RUN, 'status.json');
+            const handleRaw = (err, raw) => {
+                pollingStatus = false;
+                const now = Date.now();
+                if (err || !raw) {
+                    if (status !== null) {
+                        status = null;
+                        lastStatusSig = '';
+                        repaint();
+                    }
+                    return;
+                }
+                try {
+                    const parsed = JSON.parse(raw);
+                    const prevUp = !!status;
+                    applyParsedStatus(parsed, now);
+                    const sig = JSON.stringify(Object.assign({}, parsed, { at: 0 }));
+                    if (sig !== lastStatusSig || prevUp !== !!status) {
+                        lastStatusSig = sig;
+                        repaint();
+                    }
+                } catch (e) {}
+            };
+            fs.readFile(hmiFile, 'utf8', (err, raw) => {
+                if (!err && raw) return handleRaw(null, raw);
+                fs.readFile(fullFile, 'utf8', handleRaw);
+            });
         }
 
         function setOptimistic(stateName, userText, aiText, holdMs) {
@@ -118,7 +129,6 @@ mgu.run({
                 replyVi: aiText,
             };
             pendingUntil = Date.now() + (holdMs || 5500);
-            readAt = 0;
         }
 
         function writeFallbackCommand(cmd, payload) {
@@ -143,26 +153,25 @@ mgu.run({
             const payload = JSON.stringify(msgObj);
             const sockPath = path.join(RUN, 'ctl.sock');
 
-            if (fs.existsSync(sockPath)) {
-                try {
-                    let sent = false;
-                    const s = net.createConnection(sockPath, () => {
-                        sent = true;
-                        s.end(payload + '\n');
-                    });
-                    s.on('error', () => {
-                        if (!sent) writeFallbackCommand(cmd, payload);
-                    });
-                    readAt = 0;
-                    return;
-                } catch (e) {}
-            }
+            try {
+                let sent = false;
+                const s = net.createConnection(sockPath, () => {
+                    sent = true;
+                    s.end(payload + '\n');
+                });
+                s.on('error', () => {
+                    if (!sent) writeFallbackCommand(cmd, payload);
+                });
+                setTimeout(pollStatusAsync, 120);
+                return;
+            } catch (e) {}
             writeFallbackCommand(cmd, payload);
-            readAt = 0;
+            setTimeout(pollStatusAsync, 150);
         }
 
         let loop = null;
-        function repaint() {
+        function repaint(forceSoft) {
+            if (forceSoft) lastSoftWords = null;
             return loop && loop.kick ? loop.kick() : render();
         }
 
@@ -186,52 +195,7 @@ mgu.run({
                         replyVi: 'Xe sạch lỗi! Bình 12V đạt 12.6V, dầu máy 86°C, 4 lốp cân đều 2.4 bar.',
                     };
                 }
-                return repaint();
-            },
-            openAsd: () => {
-                viewMode = viewMode === 'asd' ? 'main' : 'asd';
-                return repaint();
-            },
-            asdToggle: () => {
-                const cur = currentAsdState();
-                patchOptimisticAsd({ enabled: !cur.enabled }, 2000);
-                send('asd_set', { enabled: !cur.enabled });
-                return repaint();
-            },
-            asdSelectEngine: (engineId) => {
-                const cur = currentAsdState();
-                const sameAndOn = (cur.engine === engineId && cur.enabled);
-                patchOptimisticAsd({
-                    enabled: true,
-                    engine: engineId,
-                    revDemoActive: sameAndOn ? true : cur.revDemoActive,
-                }, sameAndOn ? 3200 : 2000);
-                send('asd_set', sameAndOn ? { enabled: true, engine: engineId, revDemo: true } : { enabled: true, engine: engineId });
-                return repaint();
-            },
-            asdRevDemo: () => {
-                patchOptimisticAsd({ enabled: true, revDemoActive: true }, 3800);
-                send('asd_rev_demo', {});
-                return repaint();
-            },
-            asdSetVolume: (vol) => {
-                patchOptimisticAsd({ volumePercent: vol }, 2000);
-                send('asd_set', { volumePercent: vol });
-                return repaint();
-            },
-            asdToggleModeFollow: () => {
-                const cur = currentAsdState();
-                const nextVal = !(cur.modeFollow !== false);
-                patchOptimisticAsd({ modeFollow: nextVal }, 2000);
-                send('asd_set', { modeFollow: nextVal });
-                return repaint();
-            },
-            asdToggleBurbles: () => {
-                const cur = currentAsdState();
-                const nextVal = !(cur.burbles !== false);
-                patchOptimisticAsd({ burbles: nextVal }, 2000);
-                send('asd_set', { burbles: nextVal });
-                return repaint();
+                return repaint(true);
             },
             cycleScene: () => {
                 const sc = SCENES[sceneIdx % SCENES.length];
@@ -246,7 +210,7 @@ mgu.run({
                         replyVi: 'Đã kích hoạt kịch bản "' + sc + '" cho toàn bộ khoang lái.',
                     };
                 }
-                return repaint();
+                return repaint(true);
             },
             healthCheck: () => {
                 send('health_check', {});
@@ -259,42 +223,41 @@ mgu.run({
                         replyVi: 'Tất cả các hộp sạch lỗi: Bình 12.6V, dầu máy 86°C, nước mát 84°C, lốp 2.4 bar.',
                     };
                 }
-                return repaint();
+                return repaint(true);
             },
             quickCool: () => {
                 send('quick_prompt', { text: 'Trời nóng quá bật Max AC làm mát ghế đi', speakerZone: 'driver' });
                 if (status) {
                     setOptimistic('thinking', 'Trời nóng quá bật Max AC làm mát ghế đi', 'Đang bật Max AC 16°C & quạt làm mát ghế…', 3500);
                 }
-                return repaint();
+                return repaint(true);
             },
             toggleView: () => {
                 viewMode = viewMode === 'guards' ? 'main' : 'guards';
-                return repaint();
+                return repaint(true);
             },
             toggleHandsFree: () => {
                 const cur = optimisticHandsFree !== null
                     ? optimisticHandsFree
-                    : !((status && status.settings && status.settings.handsFreeWake === false));
+                    : !!(status && status.settings && status.settings.handsFreeWake);
                 optimisticHandsFree = !cur;
                 optimisticHandsFreeUntil = Date.now() + 2500;
                 send('toggle_hands_free', {});
-                return repaint();
+                return repaint(true);
             },
             toggleGuard: (domain) => {
                 localGuards[domain] = !localGuards[domain];
                 send('toggle_guard', { domain });
-                return repaint();
+                return repaint(true);
             },
             nextIp: () => {
                 send('next_ip', {});
-                return repaint();
+                return repaint(true);
             },
         };
 
         function buildModel() {
             const now = Date.now();
-            readStatus(now);
             if (pendingUntil > 0 && now > pendingUntil) {
                 pendingUntil = 0;
                 pendingTurn = null;
@@ -304,15 +267,14 @@ mgu.run({
                 optimisticHandsFreeUntil = 0;
                 optimisticHandsFree = null;
             }
-            if (optimisticAsdUntil > 0 && now > optimisticAsdUntil) {
-                optimisticAsdUntil = 0;
-                optimisticAsd = null;
-            }
-            animTick++;
             const s = status;
             const hostOf = (u) => String(u || '').replace(/^http:\/\//, '').replace(/\/\?pin=\d+$/, '');
             const liveState = s ? s.assistantState : 'idle';
-            const mergedSettings = Object.assign({ hasApiKey: false, handsFreeWake: true }, (s && s.settings) || {});
+            const effState = (liveState && liveState !== 'idle') ? liveState : (pendingState || liveState || 'idle');
+            if (effState !== 'idle') {
+                animTick = (animTick + 1) & 1023;
+            }
+            const mergedSettings = Object.assign({ hasApiKey: false, handsFreeWake: false }, (s && s.settings) || {});
             if (optimisticHandsFree !== null) mergedSettings.handsFreeWake = optimisticHandsFree;
             return {
                 daemonUp: !!s,
@@ -323,13 +285,12 @@ mgu.run({
                 host: s ? hostOf(s.url) : '192.168.10.1:8140',
                 pin: s ? s.pin : '2468',
                 ipCount: s && Array.isArray(s.ips) ? s.ips.length : 1,
-                assistantState: (liveState && liveState !== 'idle') ? liveState : (pendingState || liveState),
+                assistantState: effState,
                 wakeStatus: s ? s.wakeStatus : 'off',
                 followUpActive: !!(s && s.followUpActive),
                 activeSpeakerZone: s ? s.activeSpeakerZone : 'driver',
                 micLevels: (s && s.micLevels) || { leftDb: -32, rightDb: -54 },
                 settings: mergedSettings,
-                asd: currentAsdState(),
                 telemetry: (s && s.telemetry) || {
                     speedKmh: 0,
                     rpm: 820,
@@ -354,26 +315,43 @@ mgu.run({
             const m = buildModel();
             const cv = ctx.canvas(UI.W, UI.H) || new Recorder(UI.W, UI.H);
             UI.draw(cv, G, ctx.theme(), m, acts);
+
+            // Software RHMI fast-skip: avoid `new Canvas(1600, 520)` + `play()` when recorded words are unchanged!
+            const gpuActive = !!(ctx.display && typeof ctx.display.active === 'function' && ctx.display.active('MAIN'));
+            if (!gpuActive && typeof cv.words === 'function') {
+                const now = Date.now();
+                const w = cv.words();
+                const wBuf = Buffer.from(w.buffer, w.byteOffset, w.byteLength);
+                if (lastSoftWords && (now - lastSoftPushAt) < 4500 && wBuf.length === lastSoftWords.length && wBuf.equals(lastSoftWords)) {
+                    return;
+                }
+                lastSoftWords = Buffer.from(wBuf);
+                lastSoftPushAt = now;
+            }
             await ui.image('MAIN_GFX', cv);
         };
 
-        loop = ctx.loop('MAIN', 10, render);
-        if (ctx.onLayout) ctx.onLayout(repaint);
+        readInitialStatusSync();
+        const statusTimer = setInterval(pollStatusAsync, 450);
+        if (statusTimer.unref) statusTimer.unref();
+
+        loop = ctx.loop('MAIN', 2, render);
+        if (ctx.onLayout) ctx.onLayout(() => repaint(true));
+        if (ui.onVisible) ui.onVisible(() => repaint(true));
         if (ctx.onTab) {
             ctx.onTab((idx) => {
-                viewMode = idx === 1 ? 'asd' : (idx === 2 ? 'guards' : 'main');
-                return repaint();
+                viewMode = idx === 1 ? 'guards' : 'main';
+                return repaint(true);
             });
         }
 
-        ['BTN_MIC', 'BTN_ASD', 'BTN_SCENE', 'BTN_HEALTH', 'BTN_GUARDS'].forEach((b) => { if (ctx.hideButton) ctx.hideButton(b); });
+        ['BTN_MIC', 'BTN_SCENE', 'BTN_HEALTH', 'BTN_GUARDS'].forEach((b) => { if (ctx.hideButton) ctx.hideButton(b); });
         ui.onClick('BTN_MIC', acts.triggerMic);
-        ui.onClick('BTN_ASD', acts.openAsd);
         ui.onClick('BTN_SCENE', acts.cycleScene);
         ui.onClick('BTN_HEALTH', acts.healthCheck);
         ui.onClick('BTN_GUARDS', acts.toggleView);
 
         await render();
-        log.info('bimmer_ai v0.6.0 ready');
+        log.info('bimmer_ai v0.6.1 ready');
     },
 });

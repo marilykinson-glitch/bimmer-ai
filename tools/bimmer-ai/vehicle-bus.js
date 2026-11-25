@@ -338,7 +338,6 @@ class VehicleController {
             vietmapRun: VIETMAP_RUN,
             onTelemetry: null,
             onPttEvent: null,
-            onAsdCommand: null,
             onLog: null,
         }, opts || {});
 
@@ -351,6 +350,10 @@ class VehicleController {
         this.observedTempRaw = null;
         this.lockSeq = 1;
         this.lastTpmsPollAt = 0;
+        this.lastProxyRefreshAt = 0;
+        this.lastRpmEmitAt = 0;
+        this.lastSpeedEmitAt = 0;
+        this._nativeChain = Promise.resolve();
         this.preCinemaBackup = null;
         this.pttDownAt = 0;
         this.pttLongFired = false;
@@ -374,10 +377,19 @@ class VehicleController {
         this.log(traceMsg);
     }
 
+    nativeTick(fn) {
+        const run = () => new Promise((resolve, reject) => setImmediate(() => {
+            try { Promise.resolve(fn()).then(resolve, reject); } catch (e) { reject(e); }
+        }));
+        const p = this._nativeChain.then(run, run);
+        this._nativeChain = p.catch(() => {});
+        return p;
+    }
+
     emitTelemetry() {
         this.state.updatedAt = Date.now();
         this.checkDeferredWatches();
-        if (this.opts.onTelemetry) this.opts.onTelemetry(this.getSnapshot());
+        if (this.opts.onTelemetry) this.opts.onTelemetry();
     }
 
     getSnapshot() {
@@ -435,13 +447,11 @@ class VehicleController {
 
     pollCompanionApps() {
         const now = Date.now();
-        if (this.proxies.tpms && (now - this.lastTpmsPollAt) > 25000) {
+        if (this.proxies.tpms && (now - this.lastTpmsPollAt) > 60000) {
             this.lastTpmsPollAt = now;
-            try {
-                this.proxies.tpms.getValue('statusTyrePressure', 2000)
-                    .then((v) => this.applyTpmsPressureStruct(v))
-                    .catch(() => {});
-            } catch (e) {}
+            this.nativeTick(() => this.proxies.tpms.getValue('statusTyrePressure', 2000))
+                .then((v) => this.applyTpmsPressureStruct(v))
+                .catch(() => {});
         }
         const bl = readJsonSafe(path.join(this.opts.bimmerlinkRun, 'status.json'));
         if (bl && bl.telemetry) {
@@ -571,14 +581,19 @@ class VehicleController {
 
     /* ---------------- SOME/IP Proxy Helpers with Schema Coercion ---------------- */
 
-    async refreshAvailableProxies() {
+    async refreshAvailableProxies(force) {
+        const now = Date.now();
+        if (!force && this.lastProxyRefreshAt > 0 && (now - this.lastProxyRefreshAt) < 8000) {
+            return this.state.availableProxies;
+        }
+        this.lastProxyRefreshAt = now;
         const avail = [];
         const keys = Object.keys(this.proxies);
         for (let i = 0; i < keys.length; i++) {
             const k = keys[i];
             const px = this.proxies[k];
             if (px && typeof px.isAvailable === 'function') {
-                try { if (await px.isAvailable()) avail.push(k); } catch (e) {}
+                try { if (await this.nativeTick(() => px.isAvailable())) avail.push(k); } catch (e) {}
             }
         }
         this.state.availableProxies = avail;
@@ -589,7 +604,7 @@ class VehicleController {
         if (!this.state.liveCar) return false;
         const px = this.proxies[key];
         if (!px || typeof px.isAvailable !== 'function') return false;
-        try { return !!(await px.isAvailable()); } catch (e) { return false; }
+        try { return !!(await this.nativeTick(() => px.isAvailable())); } catch (e) { return false; }
     }
 
     coerceFieldPayload(key, field, partialPayload) {
@@ -621,7 +636,7 @@ class VehicleController {
         if (!(await this.isProxyAvailable(key))) return { ok: false, unavailable: true };
         try {
             const coercedArgs = this.coerceMethodArgs(key, method, args);
-            const res = await this.proxies[key].callMethod(method, coercedArgs, 3000);
+            const res = await this.nativeTick(() => this.proxies[key].callMethod(method, coercedArgs, 3000));
             this.recordTrace('OK call ' + key + '.' + method);
             return { ok: true, response: res };
         } catch (e) {
@@ -635,7 +650,7 @@ class VehicleController {
         if (!(await this.isProxyAvailable(key))) return { ok: false, unavailable: true };
         try {
             const coerced = this.coerceFieldPayload(key, field, partialPayload);
-            const res = await this.proxies[key].setValue(field, coerced, 3000);
+            const res = await this.nativeTick(() => this.proxies[key].setValue(field, coerced, 3000));
             this.recordTrace('OK set ' + key + '.' + field);
             return { ok: true, response: res };
         } catch (e) {
@@ -659,85 +674,38 @@ class VehicleController {
             this.log('vehicle-bus init warning: ' + e.message);
             return false;
         }
-        if (!db || !gen || !someip) return false;
-        this.db = db;
+        if (!db || !gen || !someip || !db.interfaces) return false;
 
-        let chain = Promise.resolve();
-        const openProxy = (ifaceName, attrs, methods, instanceHint) => {
-            if (!db.interfaces || !db.interfaces[ifaceName]) return Promise.resolve(null);
-            const step = () => new Promise((res) => setImmediate(() => {
-                try {
-                    const spec = { instances: '*' };
-                    if (attrs && Object.keys(attrs).length) spec.attributes = attrs;
-                    if (methods && methods.length) spec.methods = methods;
-                    const proxies = {};
-                    proxies[ifaceName] = spec;
-                    const generated = gen.generate(db, { proxies, services: {} });
-                    const cfg = generated && generated[ifaceName];
-                    if (!cfg) return res(null);
-                    const inst = instanceHint || Object.keys(cfg.instances || { '1': 1 })[0] || '1';
-                    if (cfg.instances && !cfg.instances[inst]) return res(null);
-                    someip.buildProxy(cfg, String(inst))
-                        .then((px) => px.init().then(() => res(px)))
-                        .catch(() => res(null));
-                } catch (e) { res(null); }
-            }));
-            const p = chain.then(step, step);
-            chain = p;
-            return p;
+        // Collect all requested bindings first so `gen.generate(db, ...)` runs ONCE instead of 26 times (saves ~250MB RAM & ~4s CPU)
+        const bindings = [];
+        const addBinding = (key, ifaceName, fieldNames, methodNames, onField, instanceHint, opts) => {
+            bindings.push({ key, ifaceName, fieldNames: fieldNames || [], methodNames: methodNames || [], onField: onField || null, instanceHint, opts: opts || {} });
         };
 
-        const bindService = async (key, ifaceName, fieldNames, methodNames, onField, instanceHint) => {
-            const iv = db.interfaces && db.interfaces[ifaceName];
-            if (!iv) return;
-            const attrs = {};
-            (fieldNames || []).forEach((f) => {
-                const fd = iv.fields && iv.fields[f];
-                if (!fd) return;
-                let fl = '';
-                if (fd.getter && fd.getter.id) fl += 'r';
-                if (fd.notifier && fd.notifier.id) fl += 's';
-                if (fd.setter && fd.setter.id) fl += 'w';
-                if (fl) attrs[f] = fl;
-            });
-            const validMethods = (methodNames || []).filter((m) => iv.methods && iv.methods[m]);
-            if (!Object.keys(attrs).length && !validMethods.length) return;
-            const px = await openProxy(ifaceName, attrs, validMethods, instanceHint);
-            if (!px) return;
-            this.proxies[key] = px;
-            this.proxyIfaceMap[key] = ifaceName;
-            this.state.liveCar = true;
-            Object.keys(attrs).forEach((f) => {
-                if (onField && (attrs[f].indexOf('s') >= 0 || attrs[f].indexOf('r') >= 0)) {
-                    if (attrs[f].indexOf('s') >= 0) {
-                        try { px.subscribe({ name: f, onReceive: (v) => onField(f, v) }); } catch (e) {}
-                    }
-                    if (attrs[f].indexOf('r') >= 0) {
-                        try { px.getValue(f, 2500).then((v) => onField(f, v)).catch(() => {}); } catch (e) {}
-                    }
-                }
-            });
-        };
-
-        // 1. Core Driving, Thermal & Central Locking Telemetry (`CDS`, `Vehicle2`, `VehicleInformation`, `FES`, `AcceleratorPedal`, `TPMS`)
-        await bindService('cds', 'de.bmw.infotainment.vehicle.CDS', ['statusEngineSpeed2', 'statusEngineTemperature', 'statusEngineStatus'], [], (f, v) => {
+        // 1. Core Driving, Thermal & Central Locking Telemetry (throttled to <= 2 Hz so FlexRay packets never flood Node 8)
+        addBinding('cds', 'de.bmw.infotainment.vehicle.CDS', ['statusEngineSpeed2', 'statusEngineTemperature', 'statusEngineStatus'], [], (f, v) => {
             if (!v) return;
             if (f === 'statusEngineSpeed2' && v.actualValueRPMEngineCrankshaft !== undefined && v.actualValueRPMEngineCrankshaft !== 65535) {
-                const rpm = v.actualValueRPMEngineCrankshaft * 0.25;
-                this.patchTelemetry({ rpm: rpm < 400 ? 0 : Math.round(rpm) });
+                const rawRpm = v.actualValueRPMEngineCrankshaft * 0.25;
+                const nextRpm = rawRpm < 400 ? 0 : Math.round(rawRpm);
+                const now = Date.now();
+                if (nextRpm === this.state.rpm) return;
+                if ((nextRpm === 0) === (this.state.rpm === 0) && Math.abs(nextRpm - this.state.rpm) < 35 && (now - this.lastRpmEmitAt) < 450) return;
+                this.lastRpmEmitAt = now;
+                this.patchTelemetry({ rpm: nextRpm });
             } else if (f === 'statusEngineTemperature') {
                 const p = {};
                 if (v.temperatureEngineDrive !== undefined && v.temperatureEngineDrive !== 255) p.coolantTempC = v.temperatureEngineDrive - 48;
                 if (v.temperatureEngineOilDrive !== undefined && v.temperatureEngineOilDrive !== 255) p.oilTempC = v.temperatureEngineOilDrive - 48;
-                this.patchTelemetry(p);
+                if (p.coolantTempC !== this.state.coolantTempC || p.oilTempC !== this.state.oilTempC) this.patchTelemetry(p);
             } else if (f === 'statusEngineStatus' && v.statusEngineRunDrive !== undefined) {
                 const er = v.statusEngineRunDrive;
-                if (er === 2 || er === 'MOTOR_LAEUFT') this.patchTelemetry({ engineRunning: true });
-                else if (er === 0 || er === 'MOTOR_AUS') this.patchTelemetry({ engineRunning: false });
+                const nextRun = (er === 2 || er === 'MOTOR_LAEUFT') ? true : ((er === 0 || er === 'MOTOR_AUS') ? false : null);
+                if (nextRun !== null && nextRun !== this.state.engineRunning) this.patchTelemetry({ engineRunning: nextRun });
             }
         });
 
-        await bindService('vehicle2', 'de.bmw.infotainment.vehicle.Vehicle2', [
+        addBinding('vehicle2', 'de.bmw.infotainment.vehicle.Vehicle2', [
             'statusCarSpeed2',
             'statusZVStatus',
             'remoteControlDoor',
@@ -745,7 +713,12 @@ class VehicleController {
         ], [], (f, v) => {
             if (!v) return;
             if (f === 'statusCarSpeed2' && v.speedVehicleCentreOfGravity !== undefined && v.speedVehicleCentreOfGravity !== 65535) {
-                this.patchTelemetry({ speedKmh: +(v.speedVehicleCentreOfGravity * 0.015625).toFixed(1) });
+                const nextSpd = +(v.speedVehicleCentreOfGravity * 0.015625).toFixed(1);
+                const now = Date.now();
+                if (nextSpd === this.state.speedKmh) return;
+                if ((nextSpd > 2) === (this.state.speedKmh > 2) && Math.abs(nextSpd - this.state.speedKmh) < 0.5 && (now - this.lastSpeedEmitAt) < 450) return;
+                this.lastSpeedEmitAt = now;
+                this.patchTelemetry({ speedKmh: nextSpd });
             } else if (f === 'statusZVStatus') {
                 const patch = {};
                 if (typeof v.statusCentralLockingSystem === 'number') {
@@ -761,42 +734,28 @@ class VehicleController {
             }
         });
 
-        await bindService('vehInfo', 'de.bmw.infrastructure.VehicleInformation', ['DataPowerTrain2', 'statusGearboxDrive'], [], (f, v) => {
+        addBinding('vehInfo', 'de.bmw.infrastructure.VehicleInformation', ['DataPowerTrain2', 'statusGearboxDrive'], [], (f, v) => {
             const g = decodeSp18Gear(f, v, this.state.gear);
-            if (g) this.patchTelemetry({ gear: g });
+            if (g && g !== this.state.gear) this.patchTelemetry({ gear: g });
         });
 
-        await bindService('fes', 'de.bmw.infotainment.drivingexcitement.FES', [
+        addBinding('fes', 'de.bmw.infotainment.drivingexcitement.FES', [
             'statusFESVehicleDynamicSwitchHMI',
-            'statusActualValueTorque2',
             'controlFESDriveStrategy',
         ], [], (f, v) => {
-            if (!v) return;
-            if (f === 'statusFESVehicleDynamicSwitchHMI' && v.actualValueModeDrivingExperience !== undefined) {
+            if (v && f === 'statusFESVehicleDynamicSwitchHMI' && v.actualValueModeDrivingExperience !== undefined) {
                 const dm = decodeFesDriveMode(v.actualValueModeDrivingExperience);
-                if (dm) this.patchTelemetry({ driveMode: dm });
-            } else if (f === 'statusActualValueTorque2' && typeof v.actualValueTorqueCrankshaft === 'number' && v.actualValueTorqueCrankshaft < 4095) {
-                this.patchTelemetry({ torqueNm: +(v.actualValueTorqueCrankshaft * 0.5 - 1023.5).toFixed(1) });
+                if (dm && dm !== this.state.driveMode) this.patchTelemetry({ driveMode: dm });
             }
         });
 
-        await bindService('pedal', 'de.bmw.powertrain.AcceleratorPedal', ['AngleAcceleratorPedal'], [], (f, v) => {
-            if (v && typeof v.actualValueAngleAcceleratorPedal === 'number') {
-                const pct = v.actualValueAngleAcceleratorPedal * 0.025;
-                if (pct >= -2 && pct <= 102) {
-                    this.patchTelemetry({ pedalPct: Math.max(0, Math.min(100, Math.round(pct))) });
-                }
-            }
-        });
-
-        await bindService('tpms', 'de.bmw.infotainment.vehicle.TPMS', ['statusTyrePressure'], [], (f, v) => {
+        // IMPORTANT: BMW's own apps only ever READ `TPMS`, NEVER `subscribe` (`noSubscribe: true`)!
+        addBinding('tpms', 'de.bmw.infotainment.vehicle.TPMS', ['statusTyrePressure'], [], (f, v) => {
             if (f === 'statusTyrePressure') this.applyTpmsPressureStruct(v);
-        });
+        }, undefined, { noSubscribe: true });
 
         // 2. Steering wheel Push-To-Talk button (`SteeringWheelPushButton.statusPTTButton1`)
-        //    IMPORTANT: Enum value `1` = `PTT_MINUS_TASTER_GEDRUECKT` (physical press), while `2` = `PTT_MINUS_TASTER_BERUEHRT`
-        //    (capacitive finger touch sensor on M5 wheel!). Treat `2` / `BERUEHRT` strictly as NOT pressed!
-        await bindService('steering', 'de.bmw.infotainment.controlelements.SteeringWheelPushButton', [
+        addBinding('steering', 'de.bmw.infotainment.controlelements.SteeringWheelPushButton', [
             'statusPTTButton1',
         ], [], (f, v) => {
             if (v === null || v === undefined) return;
@@ -822,8 +781,8 @@ class VehicleController {
             this.handleSteeringPttSignal(f, pressed, raw);
         });
 
-        // 2b. BMW Speech Dialog & Native Prompt Aborter (catches M-wheel PTT edge & silences "Không khả dụng" voice prompt)
-        await bindService('speechDialog', 'de.bmw.infotainment.speech.dialog.Dialog', ['dialogState'], [], (f, v) => {
+        // 2b. BMW Speech Dialog & Native Prompt Aborter
+        addBinding('speechDialog', 'de.bmw.infotainment.speech.dialog.Dialog', ['dialogState'], [], (f, v) => {
             if (v === null || v === undefined) return;
             const prev = this.lastSpeechDialogState;
             this.lastSpeechDialogState = v;
@@ -841,20 +800,20 @@ class VehicleController {
                 }
             }
         }, 'HMISpeechHU');
-        await bindService('speechPrompter', 'de.bmw.infotainment.speech.prompter.Prompter', [], ['abortPrompt'], null, 'PALSpeechHU');
-        await bindService('voicePrompt', 'de.bmw.infotainment.speech.voiceprompt.VoicePrompt', [], ['abort']);
+        addBinding('speechPrompter', 'de.bmw.infotainment.speech.prompter.Prompter', [], ['abortPrompt'], null, 'PALSpeechHU');
+        addBinding('voicePrompt', 'de.bmw.infotainment.speech.voiceprompt.VoicePrompt', [], ['abort']);
 
         // 3. Telephony & CarPlay voice call yield guard
-        await bindService('voiceCall', 'de.bmw.infotainment.connectivity.telephony.VoiceCall', ['state'], [], (f, v) => {
+        addBinding('voiceCall', 'de.bmw.infotainment.connectivity.telephony.VoiceCall', ['state'], [], (f, v) => {
             const active = !!(v && String(v).toUpperCase().indexOf('IDLE') < 0 && String(v).toUpperCase().indexOf('NONE') < 0 && v !== 0);
-            this.patchTelemetry({ callActive: active });
+            if (active !== this.state.callActive) this.patchTelemetry({ callActive: active });
         });
-        await bindService('carplay', 'de.bmw.infotainment.a4a.carplay.CarPlayManager', ['projectedTelephonyActive'], [], (f, v) => {
-            if (typeof v === 'boolean') this.patchTelemetry({ callActive: v });
+        addBinding('carplay', 'de.bmw.infotainment.a4a.carplay.CarPlayManager', ['projectedTelephonyActive'], [], (f, v) => {
+            if (typeof v === 'boolean' && v !== this.state.callActive) this.patchTelemetry({ callActive: v });
         });
 
-        // 4. SP18 Verified Interfaces (`Climate2`, `Climate`, `ComfortFunctionIuK`, `ComfortFunction2`, `WindowLifter`, `SteeringWheelClimate`, `SunProtectionRoofWindows`, `ControlRoofsystem`)
-        await bindService('sp18Climate2', 'de.bmw.infotainment.climate.Climate2', [
+        // 4. SP18 Verified Interfaces
+        addBinding('sp18Climate2', 'de.bmw.infotainment.climate.Climate2', [
             'operationAirConditioningFront',
             'operationStratificationSeatHeating',
             'statusAirConditionDRStatus',
@@ -862,67 +821,160 @@ class VehicleController {
         ], [], (f, v) => {
             if (!v) return;
             if (f === 'statusAirConditionDRStatus') {
+                let changed = false;
                 if (typeof v.temperatureTargetDRIHKA === 'number' && v.temperatureTargetDRIHKA !== 255) {
                     this.observedTempRaw = v.temperatureTargetDRIHKA;
                     const c = decodeSp18TempByte(v.temperatureTargetDRIHKA);
-                    if (c !== null) this.state.climate.tempDriverC = c;
+                    if (c !== null && c !== this.state.climate.tempDriverC) { this.state.climate.tempDriverC = c; changed = true; }
                 }
                 if (typeof v.statusBlowerSettingDR === 'number' && v.statusBlowerSettingDR >= 1 && v.statusBlowerSettingDR <= 9) {
-                    this.state.climate.fanLevel = Math.min(5, v.statusBlowerSettingDR);
+                    const flv = Math.min(5, v.statusBlowerSettingDR);
+                    if (flv !== this.state.climate.fanLevel) { this.state.climate.fanLevel = flv; changed = true; }
                 }
-                this.emitTelemetry();
+                if (changed) this.emitTelemetry();
             } else if (f === 'statusAirConditionPSStatus') {
                 if (typeof v.temperatureTargetPSIHKA === 'number' && v.temperatureTargetPSIHKA !== 255) {
                     const c = decodeSp18TempByte(v.temperatureTargetPSIHKA);
-                    if (c !== null) this.state.climate.tempPassengerC = c;
-                    this.emitTelemetry();
+                    if (c !== null && c !== this.state.climate.tempPassengerC) {
+                        this.state.climate.tempPassengerC = c;
+                        this.emitTelemetry();
+                    }
                 }
             }
         });
 
-        await bindService('sp18Climate1', 'de.bmw.infotainment.climate.Climate', ['acSpecialFunction', 'seatAutoClimateDR', 'seatAutoClimatePS'], []);
-        await bindService('sp18Comfort2', 'de.bmw.infotainment.misc.ComfortFunction2', ['seatMassageFL', 'seatMassageFR'], []);
-        await bindService('sp18WheelHeat', 'de.bmw.body.steeringwheelcomfort.SteeringWheelClimate', [], ['requestHeating']);
-        await bindService('sp18Ambient', 'de.bmw.infotainment.misc.ComfortFunctionIuK', ['ambientLightInteriorColour', 'statusAmbientLightInteriorColour'], []);
-        await bindService('windowLifter', 'de.bmw.body.windowmaster.WindowLifter', [], ['moveWindow']);
-        await bindService('sp18SunRoof', 'de.bmw.body.doorsandwindows.SunProtectionRoofWindows', ['operationSHDMDS', 'controlShadowingPanoramicRoof'], []);
-        await bindService('sp18RoofSys', 'de.bmw.infrastructure.ControlRoofsystem', ['controlRoofSystem'], []);
-        await bindService('sp18LockGw', 'de.bmw.body.centrallockingsystem.CentralLockingSystemGW', ['requestCentralLockingSystem'], []);
-        await bindService('sp18DrivingExcitement', 'de.bmw.infotainment.drivingexcitement.DrivingExcitement', ['controlFESDriveStrategy'], []);
+        addBinding('sp18Climate1', 'de.bmw.infotainment.climate.Climate', ['acSpecialFunction', 'seatAutoClimateDR', 'seatAutoClimatePS'], []);
+        addBinding('sp18Comfort2', 'de.bmw.infotainment.misc.ComfortFunction2', ['seatMassageFL', 'seatMassageFR'], []);
+        addBinding('sp18WheelHeat', 'de.bmw.body.steeringwheelcomfort.SteeringWheelClimate', [], ['requestHeating']);
+        addBinding('sp18Ambient', 'de.bmw.infotainment.misc.ComfortFunctionIuK', ['ambientLightInteriorColour', 'statusAmbientLightInteriorColour'], []);
+        addBinding('windowLifter', 'de.bmw.body.windowmaster.WindowLifter', [], ['moveWindow']);
+        addBinding('sp18SunRoof', 'de.bmw.body.doorsandwindows.SunProtectionRoofWindows', ['operationSHDMDS', 'controlShadowingPanoramicRoof'], []);
+        addBinding('sp18RoofSys', 'de.bmw.infrastructure.ControlRoofsystem', ['controlRoofSystem'], []);
+        addBinding('sp18LockGw', 'de.bmw.body.centrallockingsystem.CentralLockingSystemGW', ['requestCentralLockingSystem'], []);
+        addBinding('sp18DrivingExcitement', 'de.bmw.infotainment.drivingexcitement.DrivingExcitement', ['controlFESDriveStrategy'], []);
 
-        // 5. SP21 Method Interfaces (auto-used when available on iDrive 8 / SP21)
-        await bindService('climateMaster', 'de.bmw.infotainment.climate.climatemaster.ClimateMaster',
+        // 5. SP21 Method Interfaces
+        addBinding('climateMaster', 'de.bmw.infotainment.climate.climatemaster.ClimateMaster',
             ['statusClimateSystemOn'],
             ['requestTemperature', 'requestDeltaTemperature', 'requestAirBlowLevel', 'requestAirCondMaxAC',
                 'requestClimateSystemOn', 'requestAirQualityFresh', 'requestScentOn',
                 'requestSeatClimateSeatHeating', 'requestSeatClimateSeatCooling', 'requestSteeringWheelHeating']);
-        await bindService('windowMaster', 'de.bmw.body.windowmaster.WindowLifterMaster', ['windowStatus'], ['moveWindow', 'cancelLastRequest']);
-        await bindService('sunBlinds', 'de.bmw.body.doorsandwindows.SunBlinds', ['blindStatusList'], ['openSideAndRearBlinds', 'closeSideAndRearBlinds']);
-        await bindService('mirrors', 'de.bmw.body.ExteriorMirrorDynamicControl', [], ['requestExtMirrorFolding']);
-        await bindService('locks', 'de.bmw.body.caraccess.CenterLockingService', [], ['requestLock', 'requestUnlock', 'requestOpenBootlid']);
-        await bindService('ipaLight', 'de.bmw.body.interiorillumination.IpaInteriorLight', [], ['setIpaLightingInterior']);
-        await bindService('flexLight', 'de.bmw.body.interiorillumination.flexlight.FlexLight', ['interiorLightActive'], ['setReadingLight', 'deactivateAllReadingLights']);
+        addBinding('windowMaster', 'de.bmw.body.windowmaster.WindowLifterMaster', ['windowStatus'], ['moveWindow', 'cancelLastRequest']);
+        addBinding('sunBlinds', 'de.bmw.body.doorsandwindows.SunBlinds', ['blindStatusList'], ['openSideAndRearBlinds', 'closeSideAndRearBlinds']);
+        addBinding('mirrors', 'de.bmw.body.ExteriorMirrorDynamicControl', [], ['requestExtMirrorFolding']);
+        addBinding('locks', 'de.bmw.body.caraccess.CenterLockingService', [], ['requestLock', 'requestUnlock', 'requestOpenBootlid']);
+        addBinding('ipaLight', 'de.bmw.body.interiorillumination.IpaInteriorLight', [], ['setIpaLightingInterior']);
+        addBinding('flexLight', 'de.bmw.body.interiorillumination.flexlight.FlexLight', ['interiorLightActive'], ['setReadingLight', 'deactivateAllReadingLights']);
 
         // 6. Audio Manager, Media Players & Park Camera
-        await bindService('audioCmd', 'org.genivi.am.commandinterface.CommandControl', ['listOfMainConnections'],
+        addBinding('audioCmd', 'org.genivi.am.commandinterface.CommandControl', ['listOfMainConnections'],
             ['connect', 'disconnect', 'getListMainSinks', 'getVolume', 'setVolume', 'volumeStep', 'setSinkMuteState'], null, '1');
-        await bindService('mediaPlayer', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
+        addBinding('mediaPlayer', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
             ['playFile', 'sendButtonEvent'], null, 'OapGenericMedia');
-        await bindService('mediaCarPlay', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
+        addBinding('mediaCarPlay', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
             ['sendButtonEvent'], null, 'CarPlayMedia');
-        await bindService('mediaBtA', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
+        addBinding('mediaBtA', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
             ['sendButtonEvent'], null, 'ExternalDeviceBtA');
-        await bindService('mediaAa', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
+        addBinding('mediaAa', 'de.bmw.infotainment.entertainment.mediaplayer.MediaPlayer', ['playerState'],
             ['sendButtonEvent'], null, 'AndroidAutoProjected');
-        await bindService('parkCam', 'de.bmw.dass.parking.parkmenu.userinteraction.UserInteractionParkmenu', ['selectedCamera'],
+        addBinding('parkCam', 'de.bmw.dass.parking.parkmenu.userinteraction.UserInteractionParkmenu', ['selectedCamera'],
             ['hmiSelectCamera', 'requestParkingClosedown']);
 
-        await new Promise((r) => setTimeout(r, 1500));
-        await this.refreshAvailableProxies();
+        // Build unified generator manifest in ONE single pass over `db`
+        const mergedProxies = {};
+        const slimInterfaces = {};
+        for (let bi = 0; bi < bindings.length; bi++) {
+            const b = bindings[bi];
+            const iv = db.interfaces[b.ifaceName];
+            if (!iv) continue;
+            slimInterfaces[b.ifaceName] = iv;
+            const entry = mergedProxies[b.ifaceName] || { instances: '*', attributes: {}, methods: [] };
+            b.resolvedAttrs = {};
+            b.fieldNames.forEach((f) => {
+                const fd = iv.fields && iv.fields[f];
+                if (!fd) return;
+                let fl = '';
+                if (fd.getter && fd.getter.id) fl += 'r';
+                if (!b.opts.noSubscribe && fd.notifier && fd.notifier.id) fl += 's';
+                if (fd.setter && fd.setter.id) fl += 'w';
+                if (fl) {
+                    b.resolvedAttrs[f] = fl;
+                    const prev = entry.attributes[f] || '';
+                    let union = prev;
+                    for (let ci = 0; ci < fl.length; ci++) {
+                        if (union.indexOf(fl.charAt(ci)) < 0) union += fl.charAt(ci);
+                    }
+                    entry.attributes[f] = union;
+                }
+            });
+            b.methodNames.forEach((m) => {
+                if (iv.methods && iv.methods[m] && entry.methods.indexOf(m) < 0) {
+                    entry.methods.push(m);
+                }
+            });
+            if (Object.keys(entry.attributes).length || entry.methods.length) {
+                if (!Object.keys(entry.attributes).length) delete entry.attributes;
+                if (!entry.methods.length) delete entry.methods;
+                mergedProxies[b.ifaceName] = entry;
+            }
+        }
+
+        let allGenerated = {};
+        try {
+            allGenerated = gen.generate(db, { proxies: mergedProxies, services: {} }) || {};
+        } catch (e) {
+            this.log('vehicle-bus generate warning: ' + e.message);
+            return false;
+        }
+        // Release ~450 unused interface trees from memory immediately
+        this.db = { datatypes: db.datatypes, interfaces: slimInterfaces };
+        db = null;
+
+        for (let i = 0; i < bindings.length; i++) {
+            const b = bindings[i];
+            const cfg = allGenerated[b.ifaceName];
+            if (!cfg) continue;
+            const inst = b.instanceHint || Object.keys(cfg.instances || { '1': 1 })[0] || '1';
+            if (cfg.instances && !cfg.instances[inst]) continue;
+            const px = await this.nativeTick(() =>
+                someip.buildProxy(cfg, String(inst))
+                    .then((p) => p.init().then(() => p))
+                    .catch(() => null)
+            );
+            if (!px) continue;
+            this.proxies[b.key] = px;
+            this.proxyIfaceMap[b.key] = b.ifaceName;
+            this.state.liveCar = true;
+            if (b.onField && b.resolvedAttrs) {
+                const attrKeys = Object.keys(b.resolvedAttrs);
+                for (let fk = 0; fk < attrKeys.length; fk++) {
+                    const fname = attrKeys[fk];
+                    const flags = b.resolvedAttrs[fname];
+                    if (flags.indexOf('s') >= 0) {
+                        await this.nativeTick(() => {
+                            try {
+                                return px.subscribe({
+                                    name: fname,
+                                    onReceive: (val) => { try { b.onField(fname, val); } catch (e) {} },
+                                });
+                            } catch (e) { return null; }
+                        });
+                    }
+                    if (flags.indexOf('r') >= 0) {
+                        this.nativeTick(() => px.getValue(fname, 2500))
+                            .then((val) => { try { b.onField(fname, val); } catch (e) {} })
+                            .catch(() => {});
+                    }
+                }
+            }
+        }
+
+        await new Promise((r) => setTimeout(r, 1200));
+        await this.refreshAvailableProxies(true);
 
         if (await this.isProxyAvailable('audioCmd')) {
             try {
-                const sinks = await this.proxies.audioCmd.callMethod('getListMainSinks', {}, 2500);
+                const sinks = await this.nativeTick(() => this.proxies.audioCmd.callMethod('getListMainSinks', {}, 2500));
                 const list = (sinks && sinks.listMainSinks) || [];
                 for (let i = 0; i < list.length; i++) {
                     if (list[i].sinkID === 1) {
@@ -935,7 +987,7 @@ class VehicleController {
             } catch (e) {}
         }
 
-        this.log('vehicle-bus v0.3.2 ready. Available proxies: ' + this.state.availableProxies.join(', '));
+        this.log('vehicle-bus v0.6.1 ready. Available proxies: ' + this.state.availableProxies.join(', '));
         this.emitTelemetry();
         return true;
     }
@@ -995,7 +1047,7 @@ class VehicleController {
     async connectAudioRoute(route) {
         if (!(await this.isProxyAvailable('audioCmd')) || !route) return null;
         const tryPair = async (srcId, snkId) => {
-            const r = await this.proxies.audioCmd.callMethod('connect', { sourceID: srcId, sinkID: snkId }, 2500);
+            const r = await this.nativeTick(() => this.proxies.audioCmd.callMethod('connect', { sourceID: srcId, sinkID: snkId }, 2500));
             if (r && (r.amError === 'E_OK' || r.amError === 'E_ALREADY_EXISTS' || r.amError === 0) && r.mainConnectionID !== undefined) {
                 return {
                     connId: r.mainConnectionID,
@@ -1015,7 +1067,7 @@ class VehicleController {
     async disconnectAudioRoute(mainConnectionID) {
         if (!(await this.isProxyAvailable('audioCmd')) || mainConnectionID === null || mainConnectionID === undefined) return;
         try {
-            await this.proxies.audioCmd.callMethod('disconnect', { mainConnectionID }, 2500);
+            await this.nativeTick(() => this.proxies.audioCmd.callMethod('disconnect', { mainConnectionID }, 2500));
         } catch (e) {}
     }
 
@@ -1044,7 +1096,7 @@ class VehicleController {
                 routeTok = await this.connectAudioRoute({ sourceID: 1046, sinkID: 1024 });
                 if (routeTok) break;
             }
-            const pf = await this.proxies.mediaPlayer.callMethod('playFile', { path: mp3File, languageCode: 7695972 }, 4000);
+            const pf = await this.nativeTick(() => this.proxies.mediaPlayer.callMethod('playFile', { path: mp3File, languageCode: 7695972 }, 4000));
             if (pf && pf.EntError && pf.EntError !== 'OK' && pf.EntError !== 0) {
                 throw new Error('playFile ' + pf.EntError);
             }
@@ -1607,7 +1659,7 @@ class VehicleController {
                     if (this.state.liveCar && !verified && rV2.ok && (await this.isProxyAvailable('vehicle2'))) {
                         await new Promise((r) => setTimeout(r, 850));
                         try {
-                            const zv = await this.proxies.vehicle2.getValue('statusZVStatus', 1500);
+                            const zv = await this.nativeTick(() => this.proxies.vehicle2.getValue('statusZVStatus', 1500));
                             if (zv && typeof zv.statusCentralLockingSystem === 'number') {
                                 const nowLocked = (zv.statusCentralLockingSystem === 2 || zv.statusCentralLockingSystem === 3);
                                 this.state.doorsLocked = nowLocked;
@@ -1637,7 +1689,7 @@ class VehicleController {
                     if (this.state.liveCar && !verified && rV2.ok && (await this.isProxyAvailable('vehicle2'))) {
                         await new Promise((r) => setTimeout(r, 850));
                         try {
-                            const zv = await this.proxies.vehicle2.getValue('statusZVStatus', 1500);
+                            const zv = await this.nativeTick(() => this.proxies.vehicle2.getValue('statusZVStatus', 1500));
                             if (zv && (zv.statusContactBootLid === 1 || zv.statusContactBootLid === 'HK_IST_OFFEN')) {
                                 verified = true;
                             }
@@ -1796,38 +1848,7 @@ class VehicleController {
                     ok,
                     summaryVi: ok
                         ? ('Đã chuyển chế độ âm thanh động cơ / van bô sang ' + label + ' (dầu máy ' + this.state.oilTempC + '°C).')
-                        : 'Van bô vật lý trên xe nối thẳng hộp DME (nếu muốn nghe giả lập tiếng pô qua dàn loa B&W, đại ca nói "Bật giả lập tiếng pô" nhé!).',
-                };
-            }
-
-            case 'control_engine_sound': {
-                const fesEnum = args.enabled === false
-                    ? 'MOTORSOUND_ZURUECKHALTEND'
-                    : (args.modeFollow === false ? 'MOTORSOUND_SPORTLICH' : 'MOTORSOUND_FES_ABHAENGIG');
-                this.setFieldIfAvailable('fes', 'controlFESDriveStrategy', {
-                    operationAdjustEngineSoundVehicle: fesEnum,
-                }).catch(() => {});
-
-                if (typeof this.opts.onAsdCommand === 'function') {
-                    const res = await this.opts.onAsdCommand(args);
-                    this.emitTelemetry();
-                    return res;
-                }
-                const prev = this.state.asd || { enabled: false, engine: 'm5_v8', volumePercent: 75, modeFollow: true, burbles: true };
-                const next = Object.assign({}, prev);
-                if (args.enabled !== undefined) next.enabled = !!args.enabled;
-                else if (args.engine || args.revDemo) next.enabled = true;
-                if (args.engine) next.engine = String(args.engine).toLowerCase();
-                if (args.volumePercent !== undefined) next.volumePercent = Number(args.volumePercent);
-                if (args.modeFollow !== undefined) next.modeFollow = !!args.modeFollow;
-                if (args.burbles !== undefined) next.burbles = !!args.burbles;
-                this.state.asd = next;
-                this.emitTelemetry();
-                return {
-                    ok: true,
-                    summaryVi: next.enabled
-                        ? ('Đã bật giả lập âm thanh ống xả B&W (' + next.engine.toUpperCase() + ', âm lượng ' + next.volumePercent + '%).')
-                        : 'Đã tắt giả lập âm thanh ống xả B&W.',
+                        : 'Van bô thể thao trên BMW nối thẳng hộp DME — đại ca bấm nút ống xả vật lý cạnh cần số nhé.',
                 };
             }
 

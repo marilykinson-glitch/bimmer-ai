@@ -35,7 +35,7 @@ const DOMAIN_LABELS = {
     climateAndSeats: 'Điều hoà, Ghế & 1CR',
     ambientAndLights: 'Đèn viền RGB & Đèn trần',
     mediaAndYoutube: 'Nhạc & YouTube TV',
-    exhaustAndDiag: 'Pô B&W, Van bô & Khám xe',
+    exhaustAndDiag: 'Van bô & Khám xe',
 };
 
 function defaultGuards() {
@@ -89,7 +89,6 @@ function toolDomain(toolName) {
         case 'control_camera_360':
             return 'mediaAndYoutube';
         case 'set_exhaust_flap':
-        case 'control_engine_sound':
         case 'scan_vehicle_health':
             return 'exhaustAndDiag';
         case 'run_scene':
@@ -244,15 +243,6 @@ function evaluateToolCall(toolName, rawArgs, telemetry, rawGuards) {
         if (args.volumePercent !== undefined && args.volumePercent !== null) {
             const v = Math.round(Number(args.volumePercent));
             if (isFinite(v)) args.volumePercent = Math.max(0, Math.min(85, v)); // cap AI sudden blast at 85%
-            else delete args.volumePercent;
-        }
-        return { decision: 'allow', normalizedArgs: args };
-    }
-
-    if (toolName === 'control_engine_sound') {
-        if (args.volumePercent !== undefined && args.volumePercent !== null) {
-            const v = Math.round(Number(args.volumePercent));
-            if (isFinite(v)) args.volumePercent = Math.max(15, Math.min(100, v));
             else delete args.volumePercent;
         }
         return { decision: 'allow', normalizedArgs: args };

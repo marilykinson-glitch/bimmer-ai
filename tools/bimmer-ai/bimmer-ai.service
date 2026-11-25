@@ -1,22 +1,25 @@
 # bimmer-ai: Native Vietnamese In-Car AI Assistant & Vehicle Controller for BMW MGU (iDrive 7)
+# Starts strictly AFTER oapcontroller.service (never during early MGU boot and never in Safe Mode).
 [Unit]
 Description=Bimmer AI Vietnamese Voice Assistant & Vehicle Controller (bimmer-ai)
 RequiresMountsFor=/var/opt
-After=local-fs.target network.target ufipc_daemon.service
+After=network.target oapcontroller.service
 StartLimitIntervalSec=0
 
 [Service]
 User=root
 RuntimeDirectory=bimmer-ai
 RuntimeDirectoryMode=0755
-Nice=5
+Nice=10
+ExecStartPre=/bin/sleep 6
 ExecStart=/bin/sh -c 'exec "$(command -v node || echo /usr/bin/node)" /var/opt/bimmer-ai/current/bimmer-ai.js run'
 ExecStopPost=-/bin/sh -c 'exec "$(command -v node || echo /usr/bin/node)" /var/opt/bimmer-ai/current/bimmer-ai.js fwclose'
 StandardOutput=journal
 StandardError=journal
-Restart=always
+Restart=on-failure
 RestartSec=5
 TimeoutStopSec=5
+LimitCORE=1
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=oapcontroller.service

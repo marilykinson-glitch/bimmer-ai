@@ -833,193 +833,154 @@ async function runAllTests() {
         await new Promise((r) => optGem.close(r));
     });
 
-    await step('v0.6.0 B&W Active Sound Design (ASD): 6 Engines, Driving-Mode Scaling, Overlay Stream, Mic Mute & HMI UI', async () => {
-        const AsdSynth = require('../tools/bimmer-ai/asd-synth');
-        const Module = require('module');
-        const origLoad = Module._load;
-        Module._load = function (reqId, parent, isMain) {
-            if (reqId === './kit/qr') return { draw: () => 180 };
-            return origLoad.apply(this, [reqId, parent, isMain]);
-        };
-        let UI;
-        try {
-            UI = require('../apps/bimmer_ai/ui');
-        } finally {
-            Module._load = origLoad;
-        }
+    await step('v0.6.1 Boot-Safety, Crash Containment, Coalesced IPC & Zero-Lag Cached UI', async () => {
+        const repoRoot = path.resolve(__dirname, '..');
 
-        const pcmRms = (int16) => {
-            let sum = 0;
-            for (let i = 0; i < int16.length; i++) sum += int16[i] * int16[i];
-            return Math.sqrt(sum / Math.max(1, int16.length));
-        };
+        // 1. Systemd unit, MGU Store component.json & ALSA capture-only safety invariants
+        const svcText = fs.readFileSync(path.join(repoRoot, 'tools', 'bimmer-ai', 'bimmer-ai.service'), 'utf8');
+        assert.ok(svcText.indexOf('WantedBy=oapcontroller.service') >= 0, 'Must bind to oapcontroller.service (never runs in Safe Mode)');
+        assert.ok(svcText.indexOf('multi-user.target') < 0, 'Must NEVER hook early multi-user.target');
+        assert.ok(svcText.indexOf('LimitCORE=1') >= 0, 'Must set LimitCORE=1 so kernel crashhandler ignores child aborts');
+        assert.ok(svcText.indexOf('Restart=on-failure') >= 0, 'Must use Restart=on-failure');
 
-        // 1. All 6 engine profiles synthesize clean non-zero PCM audio
-        AsdSynth.ENGINE_ORDER.forEach((engId) => {
-            const dsp = new AsdSynth.AsdDspCore(24000);
-            const cfg = AsdSynth.normalizeAsdConfig({ enabled: true, engine: engId, volumePercent: 80, modeFollow: true, burbles: true });
-            let block = null;
-            for (let b = 0; b < 4; b++) {
-                block = dsp.renderBlock(960, cfg, { rpm: 3200, gear: 'D3', driveMode: 'sport', torqueNm: 190 }, 0);
-            }
-            const rms = pcmRms(block);
-            assert.ok(rms > 800, 'Expected audible RMS for engine ' + engId + ', got ' + rms);
+        const compJson = JSON.parse(fs.readFileSync(path.join(repoRoot, 'tools', 'bimmer-ai', 'component.json'), 'utf8'));
+        assert.strictEqual(compJson.version, '0.6.1');
+        assert.strictEqual(compJson.enable && compJson.enable[0] && compJson.enable[0].target, 'oapcontroller.service');
+        assert.deepStrictEqual(compJson.recmgr, ['bimmer-ai']);
+        assert.strictEqual(fs.existsSync(path.join(repoRoot, 'tools', 'bimmer-ai', 'asd-synth.js')), false);
+
+        const pyText = fs.readFileSync(path.join(repoRoot, 'tools', 'bimmer-ai', 'alsa-smartx.py'), 'utf8');
+        assert.ok(pyText.indexOf('SND_PCM_STREAM_PLAYBACK') < 0, 'alsa-smartx.py must be strictly read-only capture');
+        assert.ok(pyText.indexOf('--play-loop') < 0);
+
+        // 2. AudioIO never touches exclusive `avb:`, `hw:` or `FingerPrintSink` hardware devices & enforces boot grace
+        AudioIO.SMARTX_PROFILES.forEach((p) => {
+            assert.ok(p.hw.indexOf('smartx:') === 0 && p.hw.indexOf('FingerPrint') < 0, 'Disallowed capture device: ' + p.hw);
         });
+        let spawnedDuringBoot = false;
+        const bootMon = new AudioIO.WakeWordMonitor({
+            minUptimeSec: 999999999, // Simulate early MGU boot (`os.uptime() < minUptimeSec`)
+            shouldPause: () => false,
+            smartxHelper: path.join(repoRoot, 'tools', 'bimmer-ai', 'alsa-smartx.py'),
+            onStatusChange: (st) => { if (st === 'armed') spawnedDuringBoot = true; },
+        });
+        await bootMon.tick();
+        assert.strictEqual(spawnedDuringBoot, false);
+        assert.strictEqual(bootMon.child, null);
 
-        // 2. Driving-mode automatic loudness scaling: SPORT+ > SPORT > COMFORT > ECO PRO, and OFF -> 0 RMS
-        const measureModeRms = (driveMode, enabled) => {
-            const dsp = new AsdSynth.AsdDspCore(24000);
-            const cfg = AsdSynth.normalizeAsdConfig({ enabled, engine: 'm5_v8', volumePercent: 80, modeFollow: true, burbles: false });
-            let blk = null;
-            for (let k = 0; k < 5; k++) {
-                blk = dsp.renderBlock(960, cfg, { rpm: 3100, gear: 'D4', driveMode, torqueNm: 175 }, 0);
-            }
-            return pcmRms(blk);
-        };
-        const rmsEco = measureModeRms('eco_pro', true);
-        const rmsComfort = measureModeRms('comfort', true);
-        const rmsSport = measureModeRms('sport', true);
-        const rmsSportPlus = measureModeRms('sport_plus', true);
-        const rmsOff = measureModeRms('sport', false);
-
-        assert.strictEqual(rmsOff, 0);
-        assert.ok(rmsComfort > rmsEco * 1.4, 'Comfort (' + rmsComfort + ') must be louder than Eco Pro (' + rmsEco + ')');
-        assert.ok(rmsSport > rmsComfort * 1.4, 'Sport (' + rmsSport + ') must be louder than Comfort (' + rmsComfort + ')');
-        assert.ok(rmsSportPlus > rmsSport * 1.05, 'Sport+ (' + rmsSportPlus + ') must be louder than Sport (' + rmsSport + ')');
-
-        // Shifting selector to S/M while in Comfort automatically engages Sport exhaust character
-        assert.strictEqual(AsdSynth.resolveEffectiveDriveMode({ driveMode: 'comfort', gear: 'S3' }), 'sport');
-
-        // 3. SP18 FES Driving Mode & Gearbox wire decoders
+        // 3. VehicleBus SP18 decoders, single-pass Franca generation, TPMS `noSubscribe` & serialized `nativeTick` queue
         assert.strictEqual(VehicleBus.decodeFesDriveMode('SPORT_DYNAMIC'), 'sport');
         assert.strictEqual(VehicleBus.decodeFesDriveMode(2), 'sport_plus');
         assert.strictEqual(VehicleBus.decodeFesDriveMode(4), 'comfort');
         assert.strictEqual(VehicleBus.decodeFesDriveMode(7), 'eco_pro');
-        assert.strictEqual(VehicleBus.decodeFesDriveMode(10), 'adaptive');
         assert.strictEqual(VehicleBus.decodeSp18Gear('DataPowerTrain2', { statusGearSelectionDrive: 7 }, 'D'), 'D3');
-        assert.strictEqual(VehicleBus.decodeSp18Gear('statusGearboxDrive', { statusActualStageDrive: 4, statusActualGearDrive: 'G5' }, 'D'), 'D5');
+        const vbSrc = fs.readFileSync(path.join(repoRoot, 'tools', 'bimmer-ai', 'vehicle-bus.js'), 'utf8');
+        assert.ok(vbSrc.indexOf("addBinding('tpms'") >= 0 && vbSrc.indexOf('noSubscribe: true') >= 0, 'TPMS must never call subscribe on MGU');
+        assert.strictEqual(vbSrc.indexOf('AcceleratorPedal'), -1, 'High-frequency AcceleratorPedal must be stripped');
+        assert.ok(vbSrc.indexOf('gen.generate(db, { proxies: mergedProxies') >= 0, 'Must merge all proxies into a single gen.generate(db) pass');
 
-        // 4. End-to-End Daemon + Mock SmartXbar `--play-loop` Stream + Mic Mute + Voice NLU
-        const tmpAsd = fs.mkdtempSync(path.join(os.tmpdir(), 'bimmer-ai-asd-'));
-        const fakeSmartxDir = path.join(tmpAsd, 'smartx');
-        fs.mkdirSync(fakeSmartxDir);
-        fs.writeFileSync(path.join(fakeSmartxDir, 'smartx_HAD_Speech_CF_24_MONO_p'), '');
+        const vcTick = new VehicleBus.VehicleController();
+        const tickOrder = [];
+        await Promise.all([
+            vcTick.nativeTick(() => { tickOrder.push(1); }),
+            vcTick.nativeTick(() => { tickOrder.push(2); }),
+            vcTick.nativeTick(() => { tickOrder.push(3); }),
+        ]);
+        assert.deepStrictEqual(tickOrder, [1, 2, 3]);
 
-        const byteCounterFile = path.join(tmpAsd, 'pcm_bytes.txt');
-        const mockPlayHelper = path.join(tmpAsd, 'mock_play.js');
-        fs.writeFileSync(mockPlayHelper, [
-            'const fs = require("fs");',
-            'let total = 0;',
-            'console.log(JSON.stringify({ event: "play_ready", device: process.argv[3] }));',
-            'process.stdin.on("data", (c) => {',
-            '  total += c.length;',
-            '  fs.writeFileSync(' + JSON.stringify(byteCounterFile) + ', String(total));',
-            '});',
-            'process.on("SIGTERM", () => process.exit(0));',
-        ].join('\n'));
-
-        const routedCalls = [];
+        // 4. Daemon defaults `handsFreeWake: false`, writes compact `hmi.json`, and coalesces 50-packet telemetry bursts!
+        const tmpSafe = fs.mkdtempSync(path.join(os.tmpdir(), 'bimmer-ai-v061-'));
         const dm = new BimmerAiDaemon({
-            run: path.join(tmpAsd, 'run'),
-            state: path.join(tmpAsd, 'state'),
-            oap: path.join(tmpAsd, 'oap'),
+            run: path.join(tmpSafe, 'run'),
+            state: path.join(tmpSafe, 'state'),
+            oap: path.join(tmpSafe, 'oap'),
             host: '127.0.0.1',
             port: 0,
             simMode: true,
             noNft: true,
             quiet: true,
-            asdOpts: {
-                mguPython: process.execPath,
-                smartxHelper: mockPlayHelper,
-                smartxDir: fakeSmartxDir,
-                connectAmRoute: async (r) => { routedCalls.push(r); return { connId: 77, created: true }; },
-            },
         });
+        assert.strictEqual(dm.settings.handsFreeWake, false);
         await dm.start();
-        dm.saveSettings({ ttsEnabled: false });
-        dm.vehicle.patchTelemetry({ rpm: 2400, gear: 'D3', speedKmh: 48, driveMode: 'sport', media: { playing: true, muted: false, volumePercent: 40 } });
 
-        // Turn ON Porsche GT3 engine sound via natural Vietnamese voice command
-        const onTurn = await dm.handleVoiceOrTextTurn({
-            text: 'Bật giả lập tiếng pô Porsche GT3 âm lượng 85%',
-            speakerZone: 'driver',
-        });
-        assert.strictEqual(onTurn.actions.length, 1);
-        assert.strictEqual(onTurn.actions[0].tool, 'control_engine_sound');
-        assert.strictEqual(dm.asd.config.enabled, true);
-        assert.strictEqual(dm.asd.config.engine, 'gt3_flat6');
-        assert.strictEqual(dm.asd.config.volumePercent, 85);
-        assert.ok(routedCalls.length >= 1 && routedCalls[0].sourceID === 292 && routedCalls[0].sinkID === 1);
+        const hmiPath = path.join(tmpSafe, 'run', 'hmi.json');
+        const fullPath = path.join(tmpSafe, 'run', 'status.json');
+        assert.ok(fs.existsSync(hmiPath), 'Compact hmi.json must be written');
+        assert.ok(fs.statSync(hmiPath).size < fs.statSync(fullPath).size, 'hmi.json must be smaller than status.json');
 
-        await new Promise((r) => setTimeout(r, 180));
-        assert.strictEqual(dm.asd.getStatus().streaming, true);
-        const streamedBytes = Number(fs.readFileSync(byteCounterFile, 'utf8') || '0');
-        assert.ok(streamedBytes >= 1920, 'Expected live PCM bytes streamed to B&W overlay sink, got ' + streamedBytes);
+        // Engine start triggers 1 urgent Startup Briefing write; subsequent 50 driving packets do ZERO sync writes!
+        dm.vehicle.patchTelemetry({ rpm: 900, gear: 'D', speedKmh: 10 });
+        const writesBeforeBurst = dm.statusWriteCount;
+        for (let i = 0; i < 50; i++) {
+            dm.vehicle.patchTelemetry({ rpm: 1000 + i * 25, speedKmh: 20 + (i % 15) });
+        }
+        assert.strictEqual(dm.statusWriteCount, writesBeforeBurst, 'Zero synchronous disk writes during 50-packet telemetry burst');
+        await new Promise((r) => setTimeout(r, 480));
+        const writesDelta = dm.statusWriteCount - writesBeforeBurst;
+        assert.ok(writesDelta >= 1 && writesDelta <= 2, 'Expected 50 telemetry packets to coalesce into 1-2 writes, got ' + writesDelta);
 
-        // Entering ceiling-mic `listening` state MUST immediately tear down B&W speaker stream!
-        dm.assistantState = 'listening';
-        await dm.asd.syncLifecycle();
-        assert.strictEqual(dm.asd.getStatus().streaming, false);
-        dm.assistantState = 'idle';
-        await dm.asd.syncLifecycle();
-        assert.strictEqual(dm.asd.getStatus().streaming, true);
-
-        // "Tắt tiếng pô" MUST turn off ASD cleanly WITHOUT muting CarPlay/Media!
-        const offTurn = await dm.handleVoiceOrTextTurn({
-            text: 'Tắt tiếng pô',
-            speakerZone: 'driver',
-        });
-        assert.strictEqual(offTurn.actions.length, 1);
-        assert.strictEqual(offTurn.actions[0].tool, 'control_engine_sound');
-        assert.strictEqual(dm.asd.config.enabled, false);
-        assert.strictEqual(dm.asd.getStatus().streaming, false);
-        assert.strictEqual(dm.vehicle.state.media.muted, false);
-
-        // Settings file persisted `gt3_flat6` + `85%`
-        const savedDisk = JSON.parse(fs.readFileSync(path.join(tmpAsd, 'state', 'settings.json'), 'utf8'));
-        assert.strictEqual(savedDisk.asd.engine, 'gt3_flat6');
-        assert.strictEqual(savedDisk.asd.volumePercent, 85);
-
-        // 5. HMI `ui.js` ASD Cockpit screen registers all 6 engine cards + Power + Rev Demo + ModeFollow + Burbles
-        const asdTargets = {};
-        const mockCv = {
-            clear: () => {},
-            roundRect: () => {},
-            strokeRoundRect: () => {},
-            fillRect: () => {},
-            circle: () => {},
-            text: () => {},
-            textWidth: (s) => String(s || '').length * 8,
-            target: (_x, _y, _w, _h, fn, key) => { asdTargets[key] = fn; },
+        // 5. Zero-Lag UI: `QR.encode` runs ONCE across 30 frames & consecutive idle frames produce 100% identical `Recorder.words()`!
+        const realQr = require('../kit/runtime/qr');
+        const realG = require('../kit/runtime/gauges');
+        const { Recorder } = require('../kit/runtime/record');
+        const themes = require('../kit/runtime/themes');
+        let qrEncodeCalls = 0;
+        const wrappedQr = {
+            encode: (txt, opts) => { qrEncodeCalls++; return realQr.encode(txt, opts); },
+            draw: realQr.draw,
         };
-        const mockG = {
-            TOP: 64,
-            MARGIN: 24,
-            withAlpha: (c) => c,
-            frame: () => {},
-            stripes: () => {},
-            button: (_cv, _t, _x, _y, _w, _h, _lbl, fn, opts) => { if (opts && opts.key) asdTargets[opts.key] = fn; },
-            pageBottom: () => 500,
+        const Module = require('module');
+        const origLoad = Module._load;
+        delete require.cache[require.resolve('../apps/bimmer_ai/ui')];
+        Module._load = function (reqId, parent, isMain) {
+            if (reqId === './kit/qr') return wrappedQr;
+            return origLoad.apply(this, [reqId, parent, isMain]);
         };
-        let pickedEng = '';
-        UI.draw(mockCv, mockG, { bg: '#000', text: '#fff', dim: '#888' }, {
-            viewMode: 'asd',
-            asd: dm.asd.getStatus(),
+        let FastUI;
+        try {
+            FastUI = require('../apps/bimmer_ai/ui');
+        } finally {
+            Module._load = origLoad;
+        }
+
+        const theme = themes.theme();
+        const model = {
+            daemonUp: true,
+            viewMode: 'main',
+            animTick: 0,
+            url: 'http://192.168.10.1:8140/?pin=4826',
+            host: '192.168.10.1:8140',
+            pin: '4826',
+            ipCount: 2,
+            assistantState: 'idle',
+            wakeStatus: 'off',
+            followUpActive: false,
+            activeSpeakerZone: 'driver',
+            micLevels: { leftDb: -36, rightDb: -54 },
+            settings: { hasApiKey: true, handsFreeWake: false },
             telemetry: dm.vehicle.state,
-        }, {
-            asdSelectEngine: (id) => { pickedEng = id; },
-            asdToggle: () => {},
-            asdRevDemo: () => {},
-            asdToggleModeFollow: () => {},
-            asdToggleBurbles: () => {},
-        });
-        AsdSynth.ENGINE_ORDER.forEach((id) => {
-            assert.strictEqual(typeof asdTargets['asdEng_' + id], 'function');
-        });
-        assert.strictEqual(typeof asdTargets.asdBtnPower, 'function');
-        assert.strictEqual(typeof asdTargets.asdBtnRev, 'function');
-        asdTargets.asdEng_amg_v8();
-        assert.strictEqual(pickedEng, 'amg_v8');
+            guards: dm.vehicle.guards,
+            deferredCount: 0,
+            lastTurn: dm.lastTurn,
+        };
+
+        const rec1 = new Recorder(FastUI.W, FastUI.H);
+        FastUI.draw(rec1, realG, theme, model, {});
+        const words1 = Buffer.from(Buffer.from(rec1.words().buffer, rec1.words().byteOffset, rec1.words().byteLength));
+
+        const tStart = Date.now();
+        let wordsLast = null;
+        for (let f = 0; f < 25; f++) {
+            const recN = new Recorder(FastUI.W, FastUI.H);
+            FastUI.draw(recN, realG, theme, model, {});
+            if (f === 24) {
+                wordsLast = Buffer.from(Buffer.from(recN.words().buffer, recN.words().byteOffset, recN.words().byteLength));
+            }
+        }
+        const elapsed25 = Date.now() - tStart;
+        assert.strictEqual(qrEncodeCalls, 1, 'QR.encode must be memoized and called ONLY ONCE across 26 frames');
+        assert.strictEqual(words1.equals(wordsLast), true, 'Idle frames must produce 100% identical Recorder words for zero-CPU frame skip');
+        assert.ok(elapsed25 < 150, '25 cached frames must record in <150ms total, took ' + elapsed25 + 'ms');
 
         await dm.stop();
     });

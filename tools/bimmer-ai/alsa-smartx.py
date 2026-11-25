@@ -21,7 +21,6 @@ import sys
 import time
 import wave
 
-SND_PCM_STREAM_PLAYBACK = 0
 SND_PCM_STREAM_CAPTURE = 1
 SND_PCM_NONBLOCK = 1
 SND_PCM_FORMAT_S16_LE = 2
@@ -64,8 +63,6 @@ def _load_asound():
     asound.snd_pcm_start.restype = ctypes.c_int
     asound.snd_pcm_readi.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
     asound.snd_pcm_readi.restype = ctypes.c_long
-    asound.snd_pcm_writei.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_ulong]
-    asound.snd_pcm_writei.restype = ctypes.c_long
     asound.snd_pcm_recover.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int]
     asound.snd_pcm_recover.restype = ctypes.c_int
     asound.snd_pcm_close.argtypes = [ctypes.c_void_p]
@@ -528,79 +525,7 @@ def run_vad_loop(device, out_wav, rate=24000, hw_channels=1):
             pass
 
 
-def run_play_loop(device, rate=24000, hw_channels=1):
-    """
-    Low-latency (<65ms) continuous ALSA / SmartXbar PCM playback streamer for B&W Active Sound Design (ASD).
-    Reads raw S16_LE PCM blocks from stdin and writes them directly to SmartXbar overlay pipe with XRUN recovery.
-    """
-    asound = _load_asound()
-    hw_rate = int(rate)
-    hw_ch = max(1, int(hw_channels))
-    pcm = ctypes.c_void_p()
-    rc = asound.snd_pcm_open(ctypes.byref(pcm), device.encode("utf-8"), SND_PCM_STREAM_PLAYBACK, 0)
-    if rc < 0:
-        err = asound.snd_strerror(rc).decode("utf-8", "replace")
-        raise RuntimeError(f"snd_pcm_open_play({device}): {err} ({rc})")
-    try:
-        rc = asound.snd_pcm_set_params(
-            pcm,
-            SND_PCM_FORMAT_S16_LE,
-            SND_PCM_ACCESS_RW_INTERLEAVED,
-            hw_ch,
-            hw_rate,
-            1,
-            85000,
-        )
-        if rc < 0:
-            err = asound.snd_strerror(rc).decode("utf-8", "replace")
-            raise RuntimeError(f"snd_pcm_set_params_play({device}): {err} ({rc})")
-        asound.snd_pcm_prepare(pcm)
-        emit_json({"event": "play_ready", "device": device, "sampleRate": hw_rate, "channels": hw_ch})
-
-        bytes_per_frame = hw_ch * 2
-        chunk_bytes = max(480, int(hw_rate * 0.04)) * bytes_per_frame
-        stdin_fd = sys.stdin.fileno()
-
-        while not STOP_FLAG:
-            data = os.read(stdin_fd, chunk_bytes)
-            if not data:
-                break
-            rem = len(data) % bytes_per_frame
-            if rem:
-                data = data[: len(data) - rem]
-            if not data:
-                continue
-            frames = len(data) // bytes_per_frame
-            cbuf = ctypes.create_string_buffer(data, len(data))
-            offset_frames = 0
-            while offset_frames < frames and not STOP_FLAG:
-                ptr = ctypes.cast(ctypes.addressof(cbuf) + offset_frames * bytes_per_frame, ctypes.c_void_p)
-                wrote = asound.snd_pcm_writei(pcm, ptr, frames - offset_frames)
-                if wrote == EAGAIN or wrote == 0:
-                    time.sleep(0.004)
-                    continue
-                if wrote < 0:
-                    rec = asound.snd_pcm_recover(pcm, int(wrote), 1)
-                    if rec < 0:
-                        asound.snd_pcm_prepare(pcm)
-                    continue
-                offset_frames += wrote
-    finally:
-        asound.snd_pcm_close(pcm)
-
-
 def main():
-    if len(sys.argv) >= 3 and sys.argv[1] == "--play-loop":
-        dev = sys.argv[2]
-        rate = int(sys.argv[3]) if len(sys.argv) > 3 else 24000
-        ch = int(sys.argv[4]) if len(sys.argv) > 4 else 1
-        try:
-            run_play_loop(dev, rate, ch)
-        except Exception as exc:
-            emit_json({"event": "error", "error": str(exc)})
-            sys.exit(1)
-        sys.exit(0)
-
     if len(sys.argv) >= 4 and sys.argv[1] == "--vad-loop":
         dev = sys.argv[2]
         out_wav = sys.argv[3]

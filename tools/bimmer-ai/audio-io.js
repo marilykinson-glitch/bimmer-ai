@@ -1,17 +1,17 @@
 'use strict';
 /**
- * audio-io.js - OEM BMW MGU SmartXbar / AVB Ceiling Microphone Capture, Auto-Failover, 2-Zone Localization & TTS (`v0.3.2`).
+ * audio-io.js - OEM BMW MGU SmartXbar Ceiling Microphone Capture, Auto-Failover, 2-Zone Localization & TTS (`v0.6.1`).
  *
- * Key upgrades in `v0.3.2`:
- *   1. Automatic multi-pipe failover across `VoiceNotesSink` (Harman ECNR 24kHz), `SpeechSink` (2-Mic Stereo 24kHz),
- *      `AndroidAutoSink` (Harman ECNR 24kHz), and `avb:MGU_GW_3_SOURCE_CF_2MIC_6REF` (2-Mic 48->16kHz), remembering
- *      the last working non-zero pipe (`lastWorkingHw`) so subsequent PTT presses open instantaneously.
- *   2. Unlinks stale `capture.wav` before every recording so crashed/busy attempts can never reuse an old file.
+ * Key safety & audio invariants:
+ *   1. Uses ONLY shared virtual SmartXbar capture pipes (`SpeechSink` 2-Mic Stereo 24kHz & `VoiceNotesSink`),
+ *      NEVER opening exclusive `avb:` or kernel `hw:` devices that could contend with BMW `AudioManager`/`SmartXbar`.
+ *   2. Enforces a 45s MGU boot-grace guard and exponential backoff (`3.5s -> 7s -> 25s`) on `WakeWordMonitor`.
  *   3. Only disconnects GENIVI AudioManager routes that were newly created by us (`routeToken.created === true`),
  *      never tearing down BMW's persistent `129 -> 387` (`SpeechSink`) connection.
  *
  * Node 8 compatible, zero external npm dependencies.
  */
+const os = require('os');
 const fs = require('fs');
 const path = require('path');
 const cp = require('child_process');
@@ -46,33 +46,6 @@ const SMARTX_PROFILES = [
         amRoute: { sourceID: 129, sinkID: 387 },
         label: 'Mic trần SpeechSink 6-Ref (1MIC_6REF · 24kHz)',
         score: 95,
-    },
-    {
-        match: 'smartx_FingerPrintSink_CF_48_STEREO_c',
-        hw: 'smartx:FingerPrintSink_CF_48_STEREO',
-        rate: 48000,
-        hwChannels: 2,
-        amRoute: { sourceID: 129, sinkID: 256 },
-        label: 'Cổng Mic nhận diện âm thanh FingerPrintSink (48->16kHz Stereo)',
-        score: 93,
-    },
-    {
-        match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_6REF_c',
-        hw: 'avb:MGU_GW_3_SOURCE_CF_2MIC_6REF',
-        rate: 24000,
-        hwChannels: 8,
-        amRoute: null,
-        label: 'Cặp Mic trần 2 vùng trực tiếp RAM AVB (2MIC_6REF · 24kHz)',
-        score: 91,
-    },
-    {
-        match: 'avb_MGU_GW_3_SOURCE_CF_2MIC_1REF_SPEECH_c',
-        hw: 'avb:MGU_GW_3_SOURCE_CF_2MIC_1REF_SPEECH',
-        rate: 24000,
-        hwChannels: 3,
-        amRoute: null,
-        label: 'Cặp Mic trần 2 vùng trực tiếp RAM AVB (2MIC_1REF · 24kHz)',
-        score: 89,
     },
     {
         match: 'smartx_VoiceNotesSink_CF_24_MONO_c',
@@ -126,30 +99,6 @@ function probeOemAudioStack(opts) {
                 label: p.label,
                 backend: 'smartx-libasound',
                 score: p.hw === lastWorkingHw ? p.score + 10 : p.score,
-            });
-        }
-    });
-
-    pcmRaw.split('\n').forEach((line) => {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.toLowerCase().indexOf('capture') < 0) return;
-        const m = /^(\d+)-(\d+):\s*([^:]+):/.exec(trimmed);
-        if (m) {
-            const card = Number(m[1]), dev = Number(m[2]);
-            const label = m[3].trim();
-            let score = 15;
-            if (/mic|speech|voice|harman|i2s|smartx/i.test(label)) score += 30;
-            captureStreams.push({
-                hw: 'hw:' + card + ',' + dev,
-                rawHw: 'hw:' + card + ',' + dev,
-                card,
-                device: dev,
-                rate: 24000,
-                hwChannels: 1,
-                amRoute: null,
-                label,
-                backend: hasMguPython ? 'smartx-libasound' : 'arecord',
-                score,
             });
         }
     });
@@ -493,12 +442,14 @@ async function synthesizeVietnameseMp3(text, uplinkOpts, uplinkModule) {
 
 class WakeWordMonitor {
     constructor(opts) {
+        const isCustomBin = !!(opts && opts.mguPython && opts.mguPython !== MGU_PYTHON);
         this.opts = Object.assign({
             mguPython: MGU_PYTHON,
             smartxHelper: SMARTX_HELPER,
             smartxDir: '/run/smartx',
             outFile: '/run/bimmer-ai/vad_utt.wav',
             swapChannels: false,
+            minUptimeSec: isCustomBin ? 0 : 45,
             connectAmRoute: null,
             disconnectAmRoute: null,
             shouldPause: () => false,
@@ -515,6 +466,7 @@ class WakeWordMonitor {
         this.activeDevice = '';
         this.status = 'off'; // off | paused | armed | speech
         this.profileIdx = 0;
+        this.consecutiveFails = 0;
         this.cooldownUntil = 0;
         this.watchTimer = null;
         this.stdoutBuf = '';
@@ -560,7 +512,7 @@ class WakeWordMonitor {
         this.running = true;
         this.watchTimer = setInterval(() => {
             this.tick().catch((e) => this.log('wake monitor tick err: ' + e.message));
-        }, 450);
+        }, 1200);
         this.tick().catch(() => {});
     }
 
@@ -598,7 +550,8 @@ class WakeWordMonitor {
         if (!this.running || this.tickInFlight) return;
         this.tickInFlight = true;
         try {
-            const paused = !!this.opts.shouldPause() || Date.now() < this.cooldownUntil;
+            const bootSettling = this.opts.minUptimeSec > 0 && os.uptime() < this.opts.minUptimeSec;
+            const paused = bootSettling || !!this.opts.shouldPause() || Date.now() < this.cooldownUntil;
             if (paused) {
                 if (this.child) await this.killWorker();
                 this.setStatus('paused');
@@ -662,7 +615,9 @@ class WakeWordMonitor {
                     this.child = null;
                     if (code !== 0 && this.running && !this.opts.shouldPause()) {
                         this.profileIdx++;
-                        this.holdCooldown(700);
+                        this.consecutiveFails++;
+                        const backoffMs = this.consecutiveFails >= 3 ? 25000 : (3500 * this.consecutiveFails);
+                        this.holdCooldown(backoffMs);
                     }
                 }
             });
@@ -670,7 +625,8 @@ class WakeWordMonitor {
                 if (this.child === child) {
                     this.child = null;
                     this.profileIdx++;
-                    this.holdCooldown(900);
+                    this.consecutiveFails++;
+                    this.holdCooldown(10000);
                 }
             });
         } finally {
@@ -682,6 +638,7 @@ class WakeWordMonitor {
         if (!ev || !ev.event) return;
         if (ev.event === 'ready') {
             lastWorkingHw = prof.hw;
+            this.consecutiveFails = 0;
             this.setStatus('armed');
             this.log('hands-free "Hey Bimmer" armed on ' + prof.hw);
         } else if (ev.event === 'speech_start') {
